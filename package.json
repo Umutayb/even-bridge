@@ -1,0 +1,29 @@
+{
+  "name": "even-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Extended Even Terminal bridge: local Claude Code sessions + Claude Code Remote Control sessions + pi agent sessions, one phone pairing",
+  "license": "MIT",
+  "bin": {
+    "even-bridge": "bin/even-bridge.mjs"
+  },
+  "scripts": {
+    "start": "node bin/even-bridge.mjs",
+    "dev": "node --watch bin/even-bridge.mjs",
+    "check": "node scripts/check-upstream.mjs && node scripts/smoke-import.mjs",
+    "test": "node --test 'test/*.test.mjs'"
+  },
+  "dependencies": {
+    "@evenrealities/even-terminal": "0.10.4",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "yargs": "^18.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "allowScripts": {
+    "@evenrealities/even-terminal@0.10.4": true,
+    "node-pty@1.1.0": true
+  }
+}
