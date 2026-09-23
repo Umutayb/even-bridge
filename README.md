@@ -66,16 +66,37 @@ stack — idempotent, safe to re-run:
   it doesn't exist — existing tokens are kept, so re-runs never break a phone
   pairing;
 - writes `even-bridge.service` (and `claude-remote-bridge.service` when the RC
-  fork binary is present) — existing unit files are left untouched;
+  fork binary is present, and `even-pi-tmux.service` when `tmux` is on PATH) —
+  existing unit files are left untouched;
 - disables the old official `even-terminal.service` if it is active (port 3456
   conflict); set `KEEP_OFFICIAL=1` to opt out;
-- `systemctl enable --now` both and prints a status summary.
+- `systemctl enable --now` them and prints a status summary.
 
 ```sh
 sudo scripts/install-services.sh
 # overrides: HOST_USER, EVEN_BRIDGE_DIR, NODE_BIN, TOKEN_ENV_FILE,
-#            RC_BRIDGE_BIN, RC_BRIDGE_PORT, KEEP_OFFICIAL
+#            RC_BRIDGE_BIN, RC_BRIDGE_PORT, KEEP_OFFICIAL,
+#            EVEN_PI_CWD, EVEN_PI_TMUX_SESSION
 ```
+
+### Reboot persistence (all three units are `enabled`)
+
+- **`even-bridge`** and **`claude-remote-bridge`** come back at boot on their
+  own (`Restart=always` if they crash mid-run).
+- **`even-pi-tmux`** (oneshot, `RemainAfterExit=yes`) re-creates the tmux
+  session that hosts the terminal pi. The glasses can only **inject** prompts
+  into a pi running under tmux — a raw terminal pty isn't injectable from
+  another server-side process — so without this, a reboot leaves the pi
+  conversation terminal-less, and any ad-hoc `pi` opened in a plain terminal
+  makes the single-writer guard block glasses prompts ("driven from a terminal
+  that is not in tmux"). `scripts/ensure-pi-tmux.sh` resumes the **newest**
+  conversation in `EVEN_PI_CWD` (default `~/github`) via `pi --session <file>`,
+  and **refuses to start a second driver** while a live (non-stopped) pi
+  already runs in that cwd outside tmux — so `enable --now` is always safe.
+
+After a reboot: the bridge is up; the tmux pi is up and has resumed your last
+conversation; `tmux attach -t even` to see it. If the pi in the pane ever dies,
+`systemctl restart even-pi-tmux` recreates it.
 
 ## Usage
 
@@ -186,7 +207,11 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
   that terminal is running — a cwd can host many pi sessions, so the pane's
   on-screen content is matched against each candidate transcript's recent
   prompt text; with no tmux pane, the freshest transcript in the cwd is
-  used): the terminal owns the conversation.
+  used): the terminal owns the conversation. A **stopped** pi (Ctrl+Z /
+  SIGSTOP, `T` state in `/proc/<pid>/stat`) is suspended — it reads no
+  input and drives nothing — so it never counts as the external driver
+  (a leftover zombie like that would otherwise block every glasses prompt
+  for the session until it is killed).
   - If that terminal is in **tmux**, glasses/phone prompts are delivered
     into the pane with `tmux send-keys`/`paste-buffer` (single writer —
     the terminal pi handles them exactly as if typed). The terminal's

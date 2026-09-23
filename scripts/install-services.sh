@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # install-services.sh — provision and start the even-bridge stack.
 #
-# Spins up the two systemd services that make up the setup:
+# Spins up the systemd services that make up the setup:
 #
 #   1. even-bridge.service        — the phone-facing superserver
 #      (local Claude Code + Claude Remote Control + pi sessions, port 3456)
 #   2. claude-remote-bridge.service — the RC engine (claude-remote-terminal
 #      fork; spawns `claude --remote-control`, glasses TUI, port 8790)
+#   3. even-pi-tmux.service       — reboot-persistent tmux session hosting the
+#      pi terminal (the glasses can only inject prompts into a tmux pi)
 #
 # Idempotent: safe to re-run. Existing unit files and the token env file are
 # left untouched (they win); missing pieces are created.
@@ -21,6 +23,8 @@
 #   TOKEN_ENV_FILE   token file for systemd            (default: /etc/even-terminal.env)
 #   RC_BRIDGE_BIN    RC bridge binary                  (default: ~/.local/bin/claude-remote-terminal-bridge)
 #   RC_BRIDGE_PORT   RC bridge port                    (default: 8790)
+#   EVEN_PI_CWD      project dir the persistent tmux pi runs in (default: ~/github)
+#   EVEN_PI_TMUX_SESSION  tmux session name            (default: even)
 #   KEEP_OFFICIAL=1  do not disable the old official even-terminal.service
 
 set -euo pipefail
@@ -224,6 +228,43 @@ EOF
   RC_UNIT=1
 fi
 
+# ── 6b. even-pi-tmux.service (reboot-persistent terminal pi) ────────────────
+# The glasses can only INJECT prompts into a pi running under tmux, so the
+# terminal pi surface must survive reboots. The script is idempotent and
+# refuses to start a second driver while a live pi already runs in the cwd.
+UNIT_PT=/etc/systemd/system/even-pi-tmux.service
+say "unit: even-pi-tmux.service"
+if ! command -v tmux >/dev/null 2>&1; then
+  note "tmux not found — terminal-pi persistence disabled (install tmux and re-run)"
+  PI_UNIT=0
+elif [ -f "$UNIT_PT" ]; then
+  note "already present — not modified"
+  PI_UNIT=1
+else
+  mkdir -p "$(dirname "$UNIT_PT")"
+  cat > "$UNIT_PT" <<EOF
+[Unit]
+Description=Reboot-persistent tmux session '${EVEN_PI_TMUX_SESSION:-even}' hosting the pi terminal (glasses-injectable surface)
+Wants=even-bridge.service
+After=even-bridge.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=$HOST_USER
+Group=$HOST_USER
+Environment=HOME=$HOME_DIR
+Environment=EVEN_PI_CWD=${EVEN_PI_CWD:-$HOME_DIR/github}
+Environment=PATH=$HOME_DIR/.local/bin:$("$NODE_BIN" -e 'console.log(require("path").dirname(process.execPath))'):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$EVEN_BRIDGE_DIR/scripts/ensure-pi-tmux.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  note "created"
+  PI_UNIT=1
+fi
+
 # ── 7. old official service replacement ──────────────────────────────────────
 if [ "${KEEP_OFFICIAL:-0}" != "1" ] && [ "$(systemctl is-active even-terminal 2>/dev/null || true)" = "active" ]; then
   say "disabling the old official even-terminal.service (port 3456 conflict)"
@@ -235,11 +276,14 @@ say "starting services"
 systemctl daemon-reload
 systemctl enable --now even-bridge.service
 [ "${RC_UNIT:-0}" = "1" ] && systemctl enable --now claude-remote-bridge.service
+# --now is safe here: the script no-ops when a live pi already runs in the cwd.
+[ "${PI_UNIT:-0}" = "1" ] && systemctl enable --now even-pi-tmux.service
 
 # ── 9. summary ───────────────────────────────────────────────────────────────
 say "status"
 printf '   %-32s %s\n' "even-bridge:"        "$(systemctl is-active even-bridge 2>/dev/null || echo n/a)"
 [ "${RC_UNIT:-0}" = "1" ] && printf '   %-32s %s\n' "claude-remote-bridge:" "$(systemctl is-active claude-remote-bridge 2>/dev/null || echo n/a)"
+[ "${PI_UNIT:-0}" = "1" ] && printf '   %-32s %s\n' "even-pi-tmux (tmux pi):"  "$(systemctl is-active even-pi-tmux 2>/dev/null || echo n/a)"
 sleep 2
 ss -tln 2>/dev/null | grep -E ':3456 |:8790 |:8791 ' | sed 's/^/   /' || true
 printf '\n'

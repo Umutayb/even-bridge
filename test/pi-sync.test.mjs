@@ -78,10 +78,12 @@ exit 0
 }
 
 /** Fake /proc root with one pi process at the given cwd. */
-async function makeProcRoot(dir, pid, cwd) {
+async function makeProcRoot(dir, pid, cwd, { state = "S" } = {}) {
   const proc = join(dir, "proc");
   await mkdir(join(proc, String(pid)), { recursive: true });
   await writeFile(join(proc, String(pid), "comm"), "pi\n");
+  // /proc/PID/stat: "pid (comm) state ..." — state after the last close-paren
+  await writeFile(join(proc, String(pid), "stat"), `${pid} (pi) ${state} 1\n`);
   await symlink(cwd, join(proc, String(pid), "cwd"));
   return proc;
 }
@@ -105,6 +107,16 @@ test("findExternalPi finds pi processes by cwd", async () => {
   assert.deepEqual(hit, [{ pid: 4242, cwd: "/home/ay/github" }]);
   const miss = await findExternalPi("/other/cwd", { procRoot: proc, myPid: 1 });
   assert.deepEqual(miss, []);
+});
+
+test("findExternalPi ignores a STOPPED (Ctrl+Z) pi — a zombie can't drive a session", async () => {
+  const dir = await tmp();
+  const proc = join(dir, "proc");
+  // one live + one stopped pi in the same cwd (the observed zombie case)
+  await makeProcRoot(dir, 4242, "/home/ay/github", { state: "S" });
+  await makeProcRoot(dir, 4243, "/home/ay/github", { state: "T" });
+  const hit = await findExternalPi("/home/ay/github", { procRoot: proc, myPid: 1 });
+  assert.deepEqual(hit, [{ pid: 4242, cwd: "/home/ay/github" }], "stopped pi must not count as the external driver");
 });
 
 // ── detect: tmux pane lookup + delivery ─────────────────────────────────────

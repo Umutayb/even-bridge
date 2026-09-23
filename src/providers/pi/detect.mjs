@@ -46,6 +46,23 @@ export async function findExternalPi(cwd, { excludePids = [], procRoot = "/proc"
       continue;
     }
     if (comm !== "pi") continue;
+    // A STOPPED pi (Ctrl+Z / SIGSTOP, state T) is suspended: it reads no
+    // input and drives nothing, so it must not count as the external driver.
+    // (Observed: a stopped duplicate pi in the same cwd made the bridge
+    // believe a non-tmux terminal owned the session and blocked every
+    // glasses prompt until the zombie was killed.)
+    let stat;
+    try {
+      stat = await readFile(join(procRoot, name, "stat"), "utf8");
+    } catch {
+      continue;
+    }
+    // comm in /proc/PID/stat is parenthesized and may itself contain " )",
+    // so anchor on the LAST close-paren; the state is the char after the
+    // following space ("pid (comm) STATE ppid ...").
+    const closeParen = stat.lastIndexOf(")");
+    const state = closeParen >= 0 ? stat.slice(closeParen + 2, closeParen + 3) : "";
+    if (state === "T" || state === "t") continue;
     let pcwd;
     try {
       pcwd = await readlink(join(procRoot, name, "cwd"));
