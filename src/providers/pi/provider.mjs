@@ -85,6 +85,12 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
   const probeTmuxPane = pi.tmuxPaneProbe ?? findPiTmuxPane;
   const deliverTmux = pi.tmuxDeliver ?? tmuxDeliver;
 
+  // Serialize rapid deliveries per pane: back-to-back glasses prompts would
+  // otherwise merge into one line in the terminal reader's input buffer.
+  const paneLastDelivery = new Map(); // paneId -> ts
+  const PANE_DELIVERY_GAP_MS = 1500;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   async function probeExternalCached(cwd) {
     const hit = extCache.get(cwd);
     if (hit && Date.now() - hit.at < 3000) return hit.ext;
@@ -288,7 +294,11 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
           if (cfg.tmuxEnabled) {
             const pane = await probeTmuxPane(cwd0).catch(() => null);
             if (pane) {
+              const last = paneLastDelivery.get(pane);
+              const wait = last ? PANE_DELIVERY_GAP_MS - (Date.now() - last) : 0;
+              if (wait > 0) await sleep(wait);
               await deliverTmux(pane, text);
+              paneLastDelivery.set(pane, Date.now());
               emit(sessionId, { type: "user_prompt", text }); // echo the phone's own message
               console.log(`[bridge] prompt -> tmux pane ${pane} (external pi pid ${ext[0].pid}) session=${sessionId}`);
               return { sessionId, provider: WIRE_PROVIDER };
