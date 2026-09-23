@@ -216,6 +216,49 @@ test("watcher skips healthy sessions (events already flow over RPC)", async () =
   assert.equal(emit.get(id).length, 0, "nothing fed from the file while healthy");
 });
 
+test("watcher delivers tool results across ticks (persistent toolCall bookkeeping)", async () => {
+  const dir = await tmp();
+  const agentDir = join(dir, "agent");
+  const id = "00011111-2222-3333-4444-555566667777";
+  const file = await makeSessionFile(agentDir, "/home/ay/github", id, [
+    // assistant message with a toolCall lands in the baseline (not delivered)
+    msgEntry("e1", "assistant", [
+      { type: "text", text: "doing it" },
+      { type: "toolCall", id: "tc-1", name: "Bash", arguments: { command: "ls" } },
+    ]),
+  ]);
+
+  const emit = collectEmit();
+  const w = new TranscriptWatcher({
+    emit,
+    findFile: (sid) => (sid === id ? file : null),
+    healthy: async () => false,
+    active: () => true,
+    intervalMs: 25,
+  });
+  w.watch(id);
+  await new Promise((r) => setTimeout(r, 60)); // settle baseline
+
+  // toolResult arrives in a LATER batch than its toolCall (the real case)
+  await appendFile(
+    file,
+    JSON.stringify({
+      type: "message",
+      id: "e2",
+      timestamp: "2026-01-01T00:00:02.000Z",
+      message: { role: "toolResult", toolCallId: "tc-1", toolName: "Bash", isError: false, content: [{ type: "text", text: "total 0" }] },
+    }) + "\n"
+  );
+  await new Promise((r) => setTimeout(r, 80));
+  w.stopAll();
+
+  const msgs = emit.get(id);
+  const end = msgs.find((m) => m.type === "tool_end");
+  assert.ok(end, "tool_end delivered despite cross-batch toolCall");
+  assert.equal(end.name, "Bash");
+  assert.equal(end.toolId, "tc-1");
+});
+
 // ── provider prompt routing (single-writer rule) ────────────────────────────
 
 test("prompt routes to tmux when an external terminal pi drives the session", async () => {

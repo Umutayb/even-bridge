@@ -7,11 +7,16 @@ import { summarizePiToolCall } from "./summarize.mjs";
 
 /**
  * @param {object[]} entries parsed transcript entries (any types).
+ * @param {{ pending?: Map }} [state] — persistent toolCall -> {name, args}
+ *   bookkeeping. seedTranscript passes a fresh one; the live watcher keeps a
+ *   per-session one across ticks (toolResult entries land in later batches
+ *   than their toolCall).
  * @returns {object[]} wire messages in transcript order.
  */
-export function transcriptEntriesToWire(entries) {
+export function transcriptEntriesToWire(entries, state = {}) {
   const out = [];
-  const pending = new Map(); // toolCallId -> {name, args}
+  const pending = state.pending ?? new Map(); // toolCallId -> {name, args}
+  state.pending = pending;
   for (const e of entries) {
     if (e?.type !== "message") continue;
     const m = e.message;
@@ -30,9 +35,11 @@ export function transcriptEntriesToWire(entries) {
         // thinking blocks: no wire equivalent; skipped.
       }
     } else if (m.role === "toolResult") {
-      const t = pending.get(m.toolCallId);
+      const t =
+        pending.get(m.toolCallId) ??
+        (m.toolName ? { name: m.toolName, args: {} } : null); // cross-batch: use the entry's own toolName
+      if (m.toolCallId && t) pending.delete(m.toolCallId);
       if (!t) continue;
-      pending.delete(m.toolCallId);
       out.push({
         type: "tool_end",
         name: t.name,

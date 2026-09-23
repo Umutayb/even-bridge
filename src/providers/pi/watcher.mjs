@@ -149,7 +149,11 @@ export class TranscriptWatcher {
         }
         entries.push(e);
       }
-      const msgs = transcriptEntriesToWire(entries);
+      // Persistent toolCall bookkeeping: toolResult entries usually land in
+      // later ticks than the assistant message carrying their toolCall.
+      const state = (w.state ??= { pending: new Map() });
+      if (state.pending.size > 1000) state.pending.clear();
+      const msgs = transcriptEntriesToWire(entries, state);
       for (const m of msgs) this.emit(sessionId, m);
       if (msgs.length) this.log(`[pi-watch] ${sessionId}: +${msgs.length} wire msg(s) from transcript`);
     } finally {
