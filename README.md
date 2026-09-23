@@ -167,7 +167,11 @@ local session again.
   wire shapes the live provider emits (`user_prompt` / `text_delta` /
   `tool_start` / `tool_end`), once per session, no-op when the session is
   already live or the ring is populated. The ring's 500-message cap applies,
-  so very long sessions surface their most recent context.
+  so very long sessions surface their most recent context. Merged
+  `/api/sessions` rows for the extended lists also carry a **live status**
+  (filled from each provider's `getSessionStatus`, mirroring the official
+  local list), so the phone shows a running pi session as `busy` instead of
+  a stale `null`/`idle`.
 
 ### Pi cross-surface sync (single-writer routing)
 
@@ -225,8 +229,14 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
   radio down, OS still ACKing), so the watermark advances past bytes the
   phone never saw and a reply looks "cut off mid-sentence" until the session
   is re-opened. A stream-only reconnect therefore replays the **whole
-  most-recent turn** (busy start → ring tail, cap 1500) from the shared ring;
-  the app merges by message id, so re-sent frames don't duplicate. An 8s
+  most-recent turn** from the shared ring (cap 1500). The turn's start is the
+  entry right after the **last `status: idle`** frame — if entries follow
+  that idle the turn is still running (replay begins at its prompt),
+  otherwise its terminal idle sits at the ring tail and the start is the
+  idle before it. (An earlier version anchored on the *last non-idle*
+  status, which lands on `text_end` near the tail and silently dropped the
+  prompt + reply body.) The app merges by message id, so re-sent frames
+  don't duplicate. An 8s
   `:heartbeat` (plus idle re-assertion and aggressive socket keepalive) keeps
   the stream from going idle in the first place.
 

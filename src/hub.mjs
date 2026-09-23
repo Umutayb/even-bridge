@@ -42,7 +42,6 @@
 import { pushMessage, getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 
 const HEARTBEAT_MS = 8000; // fork: HEARTBEAT_S = 8
-const GAP_REPLAY_CAP = 400; // fallback window when the ring holds no turn start
 const TURN_REPLAY_CAP = 1500; // max messages replayed on a stream-only reconnect
 
 function tuneSocket(res) {
@@ -100,25 +99,46 @@ class SessionStream {
 
   /**
    * Replay window for a stream-only reconnect (no Last-Event-ID, no
-   * needReplay): the whole most-recent turn — from its busy start (last
-   * non-idle status marker) to the ring tail, capped. This covers the
-   * black-holed tail the watermark can't (see file header, point 2).
-   * Ring entries are flattened: {id, ...msg}.
+   * needReplay): the whole most-recent turn. A turn runs
+   * `user_prompt -> busy -> think_start -> text_start -> deltas -> think_end
+   * -> text_end -> running_stats -> result -> idle`, so its start is NOT the
+   * last non-idle status (that is `text_end`, deep in the tail — the old
+   * window started there and dropped the reply body: the "reply cut off
+   * mid-sentence" symptom). Instead: the turn starts right after the last
+   * idle status — if entries follow that idle the turn is still running,
+   * otherwise its terminal idle sits at the ring tail and the start is after
+   * the idle before it. Capped.
    */
   reconnectWindow() {
     const ring = getMessages(this.sid, 0);
     if (ring.length === 0) return [];
-    let turnStart = -1;
+    const isIdle = (m) =>
+      (m.type ?? m.msg?.type) === "status" && (m.state ?? m.msg?.state) === "idle";
+    let lastIdle = -1;
     for (let i = ring.length - 1; i >= 0; i--) {
-      const m = ring[i];
-      if ((m.type ?? m.msg?.type) !== "status") continue;
-      if ((m.state ?? m.msg?.state) !== "idle") {
-        turnStart = i;
+      if (isIdle(ring[i])) {
+        lastIdle = i;
         break;
       }
     }
-    const from = turnStart === -1 ? Math.max(0, ring.length - GAP_REPLAY_CAP) : turnStart;
-    return ring.slice(Math.max(from, ring.length - TURN_REPLAY_CAP));
+    let turnStart;
+    if (lastIdle === -1) {
+      turnStart = 0; // no idle yet: single turn (in progress) — everything
+    } else if (lastIdle < ring.length - 1) {
+      turnStart = lastIdle + 1; // entries after the idle: turn in progress
+    } else {
+      // Turn completed (terminal idle at the ring tail): start after the
+      // idle that preceded it (0 when this is the only turn in the ring).
+      let prevIdle = -1;
+      for (let i = lastIdle - 1; i >= 0; i--) {
+        if (isIdle(ring[i])) {
+          prevIdle = i;
+          break;
+        }
+      }
+      turnStart = prevIdle + 1;
+    }
+    return ring.slice(Math.max(turnStart, ring.length - TURN_REPLAY_CAP));
   }
 
   async handleEvents(req, res) {

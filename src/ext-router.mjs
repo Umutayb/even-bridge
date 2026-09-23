@@ -87,12 +87,14 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       console.warn(`[bridge] local session list failed: ${err.message}`);
     }
 
-    // Fetch the extended lists, keyed by provider name.
+    // Fetch the extended lists, keyed by provider name (with live status for
+    // running sessions, the same way the local list is filled above).
     const extLists = new Map();
     for (const p of ext) {
       let list = [];
       try {
         list = await p.listSessions(limit, cwd);
+        await fillStatus(p, list);
       } catch (err) {
         console.warn(`[bridge] ${p.name} session list failed: ${err.message}`);
       }

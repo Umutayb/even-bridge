@@ -55,7 +55,7 @@ function stubPi() {
     listSessions: async () => [
       { id: "pi-1", title: "Pi session", timestamp: "2025-06-01T00:00:00Z", cwd: "/pi", provider: "claude", status: null },
     ],
-    getSessionStatus: async () => "idle",
+    getSessionStatus: async () => "busy",
     getInfo: async () => ({ account: {}, model: "pi", version: "0.1", provider: "claude" }),
     getHistory: async () => [{ role: "user", text: "hey" }],
     prompt: async (sid, text) => {
@@ -202,6 +202,9 @@ test("merged /api/sessions: local + rc + pi, newest first, all provider claude",
   assert.equal(body.sessions.find((s) => s.id === "local-1").status, "idle");
   // RC status comes through as the upstream reported it.
   assert.equal(body.sessions.find((s) => s.id === "rc-1").status, "busy");
+  // pi's live status is filled from the provider (the disk list says null):
+  // the phone can show a running pi session as busy instead of stale idle.
+  assert.equal(body.sessions.find((s) => s.id === "pi-1").status, "busy");
 });
 
 test("merged /api/sessions hides the local twin of a live RC session", async (t) => {

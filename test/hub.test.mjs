@@ -91,6 +91,73 @@ test("stream-only reconnect (sole client) replays the most recent turn", () => {
   second.req.emit("close");
 });
 
+test("stream-only reconnect after a COMPLETED turn replays its full body (not just the tail)", () => {
+  // The real pi turn shape: busy -> think_start -> text_start -> deltas ->
+  // think_end -> text_end -> running_stats -> result -> idle. The old window
+  // ("from the last non-idle status") started at text_end and dropped the
+  // prompt + reply body — the "reply cut off mid-sentence" symptom.
+  const hub = new Hub();
+  const sid = "sess-completed";
+  const turn = (n0, q, body) => {
+    hub.feed(sid, { type: "user_prompt", text: q, n: n0 });
+    hub.feed(sid, { type: "status", state: "busy", n: n0 + 1 });
+    hub.feed(sid, { type: "status", state: "think_start", n: n0 + 2 });
+    hub.feed(sid, { type: "status", state: "text_start", n: n0 + 3 });
+    hub.feed(sid, { type: "text_delta", text: body, n: n0 + 4 });
+    hub.feed(sid, { type: "status", state: "think_end", n: n0 + 5 });
+    hub.feed(sid, { type: "status", state: "text_end", n: n0 + 6 });
+    hub.feed(sid, { type: "running_stats", n: n0 + 7 });
+    hub.feed(sid, { type: "result", n: n0 + 8 });
+    hub.feed(sid, { type: "status", state: "idle", n: n0 + 9 });
+  };
+  turn(1, "q1", "first answer");
+  turn(11, "q2", "the reply body"); // the phone was offline for this whole turn
+
+  const conn = makeConn(); // stream-only, no resume point
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  const replayed = parseFrames(conn.frames);
+  assert.deepEqual(
+    replayed.map((m) => m.msg.n),
+    [11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+    "replays the whole most-recent completed turn, body included"
+  );
+  conn.req.emit("close");
+});
+
+test("stream-only reconnect MID-TURN replays from the in-progress turn's start", () => {
+  const hub = new Hub();
+  const sid = "sess-midturn";
+  const turn = (n0, q, body) => {
+    hub.feed(sid, { type: "user_prompt", text: q, n: n0 });
+    hub.feed(sid, { type: "status", state: "busy", n: n0 + 1 });
+    hub.feed(sid, { type: "status", state: "think_start", n: n0 + 2 });
+    hub.feed(sid, { type: "status", state: "text_start", n: n0 + 3 });
+    hub.feed(sid, { type: "text_delta", text: body, n: n0 + 4 });
+    hub.feed(sid, { type: "status", state: "think_end", n: n0 + 5 });
+    hub.feed(sid, { type: "status", state: "text_end", n: n0 + 6 });
+    hub.feed(sid, { type: "running_stats", n: n0 + 7 });
+    hub.feed(sid, { type: "result", n: n0 + 8 });
+    hub.feed(sid, { type: "status", state: "idle", n: n0 + 9 });
+  };
+  turn(1, "q1", "first answer");
+  // Second turn, still running (no terminal idle yet):
+  hub.feed(sid, { type: "user_prompt", text: "q2", n: 11 });
+  hub.feed(sid, { type: "status", state: "busy", n: 12 });
+  hub.feed(sid, { type: "status", state: "think_start", n: 13 });
+  hub.feed(sid, { type: "status", state: "text_start", n: 14 });
+  hub.feed(sid, { type: "text_delta", text: "partial", n: 15 });
+
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  const replayed = parseFrames(conn.frames);
+  assert.deepEqual(
+    replayed.map((m) => m.msg.n),
+    [11, 12, 13, 14, 15],
+    "replays the in-progress turn from its prompt"
+  );
+  conn.req.emit("close");
+});
+
 test("black-holed connection: bytes that never reached the phone are recovered on reconnect", () => {
   const hub = new Hub();
   const sid = "sess-blackhole";
