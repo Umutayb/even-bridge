@@ -20,11 +20,12 @@ import {
   readHistory,
   readSessionCwd,
   readRecentModel,
-  textOf,
 } from "./session-files.mjs";
 import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
-import { summarizePiToolCall } from "./summarize.mjs";
+import { transcriptEntriesToWire } from "./wire.mjs";
+import { TranscriptWatcher, defaultFindFile } from "./watcher.mjs";
+import { findExternalPi, findPiTmuxPane, tmuxDeliver } from "./detect.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -40,6 +41,10 @@ export function resolvePiConfig(flags = {}) {
     model: flags.piModel ?? process.env.EVEN_BRIDGE_PI_MODEL ?? "",
     allCwds: !isFlag(flags.piAllCwds ?? process.env.EVEN_BRIDGE_PI_ALL_CWDS ?? "1"),
     agentDir: flags.piAgentDir ?? process.env.EVEN_BRIDGE_PI_AGENT_DIR ?? undefined,
+    tmuxEnabled: !isFlag(flags.piTmux ?? process.env.EVEN_BRIDGE_PI_TMUX ?? "1"),
+    watchIntervalMs: Number(
+      flags.piWatchIntervalMs ?? process.env.EVEN_BRIDGE_PI_WATCH_MS ?? 1000
+    ) || 1000,
   };
 }
 
@@ -72,6 +77,66 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
   const seeding = new Set(); // session ids whose transcript seed is in flight
   const liveByFile = new Map(); // resume file -> PiSession
   let cachedVersion = null;
+  const extCache = new Map(); // cwd -> {at, ext: [{pid,cwd}]}
+
+  // DI hooks (tests inject fakes): probe external terminal pi processes for a
+  // cwd, find a matching tmux pane, and deliver text into it.
+  const probeExternal = pi.externalProbe ?? findExternalPi;
+  const probeTmuxPane = pi.tmuxPaneProbe ?? findPiTmuxPane;
+  const deliverTmux = pi.tmuxDeliver ?? tmuxDeliver;
+
+  async function probeExternalCached(cwd) {
+    const hit = extCache.get(cwd);
+    if (hit && Date.now() - hit.at < 3000) return hit.ext;
+    let ext = [];
+    try {
+      ext = await probeExternal(cwd, { excludePids: childPids() });
+    } catch {
+      ext = [];
+    }
+    extCache.set(cwd, { at: Date.now(), ext });
+    return ext;
+  }
+
+  /** PIDs of our own bridge-spawned pi children (excluded from driver probes). */
+  function childPids() {
+    const pids = [];
+    for (const s of sessions.values()) if (s.childPid) pids.push(s.childPid);
+    return pids;
+  }
+
+  /** True when this session has a live bridge child that is still the sole
+   *  writer (no external terminal pi for its cwd). */
+  async function isSoleWriter(sessionId) {
+    const s = sessions.get(sessionId);
+    if (!s || !s.client?.running) return false;
+    const file = findSessionFile(sessionId, cfg.agentDir);
+    if (!file) return true; // fresh in-memory session: nothing else can write it
+    const cwd = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
+    const ext = await probeExternalCached(cwd);
+    return ext.length === 0;
+  }
+
+  const watcher = new TranscriptWatcher({
+    emit: (sid, msg) => {
+      if (sid) emit(sid, msg);
+    },
+    findFile: defaultFindFile(cfg.agentDir),
+    healthy: async (sid) => isSoleWriter(sid),
+    active: (sid) => hub?.clientCount(sid) > 0 || sessions.has(sid),
+    intervalMs: cfg.watchIntervalMs,
+  });
+  // The watcher's healthy/active are async-friendly (tick awaits nothing; the
+  // healthy callback may return a promise — tick treats falsy as unhealthy).
+  // Wrap so a rejected probe never kills the timer.
+  const origTick = watcher.tick.bind(watcher);
+  watcher.tick = async (sid) => {
+    try {
+      await origTick(sid);
+    } catch (err) {
+      console.warn(`[pi-watch] tick failed for ${sid}: ${err.message}`);
+    }
+  };
 
   async function piVersion() {
     if (cachedVersion) return cachedVersion;
@@ -161,7 +226,7 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
       }
       seeding.add(sessionId);
       try {
-        const pending = new Map(); // toolCallId -> {name, args}
+        const entries = [];
         for (const line of raw.split("\n")) {
           if (!line.trim()) continue;
           let e;
@@ -170,41 +235,34 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
           } catch {
             continue;
           }
-          if (e.type !== "message") continue;
-          const m = e.message;
-          if (!m || !Array.isArray(m.content)) continue;
-          if (m.role === "user") {
-            const text = textOf(m.content);
-            if (text) emit(sessionId, { type: "user_prompt", text });
-          } else if (m.role === "assistant") {
-            for (const b of m.content) {
-              if (b.type === "text" && b.text) {
-                emit(sessionId, { type: "text_delta", text: b.text });
-              } else if (b.type === "toolCall") {
-                pending.set(b.id, { name: b.name, args: b.arguments ?? {} });
-                emit(sessionId, { type: "tool_start", name: b.name, toolId: b.id });
-              }
-              // thinking blocks: no wire equivalent; skipped.
-            }
-          } else if (m.role === "toolResult") {
-            const t = pending.get(m.toolCallId);
-            if (!t) continue;
-            pending.delete(m.toolCallId);
-            emit(sessionId, {
-              type: "tool_end",
-              name: t.name,
-              toolId: m.toolCallId,
-              summary: summarizePiToolCall(t.name, t.args),
-              detail: { input: t.args, output: textOf(m.content) },
-            });
-          }
+          entries.push(e);
         }
+        for (const m of transcriptEntriesToWire(entries)) emit(sessionId, m);
         claim(sessionId, NAME);
       } finally {
         seeding.delete(sessionId);
       }
     },
 
+    /** Watch a session's transcript for EXTERNAL writers (terminal pi). */
+    watchTranscript(sessionId) {
+      watcher.watch(sessionId);
+    },
+
+    /** Stop watching once no clients remain and no live session. */
+    unwatchTranscript(sessionId) {
+      watcher.unwatch(sessionId);
+    },
+
+    /**
+     * Send a prompt. Single-writer routing (the crux of pi sync):
+     *  1. External terminal pi alive for the session's cwd? That terminal
+     *     owns the conversation: deliver via tmux send-keys (single writer),
+     *     or report clearly if the terminal isn't under tmux — NEVER spawn a
+     *     second instance (it wedges and silently drops prompts).
+     *  2. Otherwise a live bridge child (sole writer) gets steer/run.
+     *  3. Otherwise spawn/resume our own `pi --mode rpc --session <file>`.
+     */
     async prompt(sessionId, text, phoneCwd) {
       let session = null;
       let file = null;
@@ -213,13 +271,47 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
       };
 
       if (sessionId) {
-        session = sessions.get(sessionId);
         file = findSessionFile(sessionId, cfg.agentDir);
+        const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? phoneCwd ?? cwd;
+        session = sessions.get(sessionId);
+
+        // External terminal driver for this cwd? The terminal owns the
+        // conversation — route to it, never to a second instance.
+        const ext = file ? await probeExternalCached(cwd0) : [];
+        if (ext.length > 0) {
+          if (session) {
+            // Drop our wedged/superseded child (it would eat prompts).
+            console.log(`[pi] ${sessionId}: external pi pid ${ext[0].pid} active — dropping bridge child`);
+            await session.stop().catch(() => {});
+            this.forgetSession(sessionId);
+          }
+          if (cfg.tmuxEnabled) {
+            const pane = await probeTmuxPane(cwd0).catch(() => null);
+            if (pane) {
+              await deliverTmux(pane, text);
+              emit(sessionId, { type: "user_prompt", text }); // echo the phone's own message
+              console.log(`[bridge] prompt -> tmux pane ${pane} (external pi pid ${ext[0].pid}) session=${sessionId}`);
+              return { sessionId, provider: WIRE_PROVIDER };
+            }
+          }
+          emit(sessionId, { type: "user_prompt", text });
+          emit(sessionId, {
+            type: "error",
+            message:
+              "This pi session is being driven from a terminal that is not in tmux. " +
+              "The glasses can watch it live, but can't send to it. Run the terminal " +
+              "session under tmux (tmux new; pi --resume) to send prompts from the glasses.",
+          });
+          console.log(`[bridge] prompt -> BLOCKED (external pi pid ${ext[0].pid} in non-tmux terminal) session=${sessionId}`);
+          return { sessionId, provider: WIRE_PROVIDER };
+        }
+
         if (!session && file) {
           session = new PiSession(directEmit, {
             resume: file,
-            cwd: readSessionCwd(sessionId, cfg.agentDir) ?? phoneCwd ?? cwd,
+            cwd: cwd0,
             ...rpcOpts(),
+            onExit: (s) => this.forgetSession(s.sessionId ?? sessionId),
           });
           await session.start();
           noteLive(session, file);
@@ -227,7 +319,13 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
         if (!session) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
       } else {
         const startCwd = phoneCwd ?? cwd ?? defaultCwd;
-        session = new PiSession(directEmit, { cwd: startCwd, ...rpcOpts() });
+        session = new PiSession(directEmit, {
+          cwd: startCwd,
+          ...rpcOpts(),
+          onExit: (s) => {
+            if (s.sessionId) this.forgetSession(s.sessionId);
+          },
+        });
         await session.start();
       }
 
@@ -290,6 +388,7 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
 
     /** Kill every live pi subprocess (bridge shutdown). */
     async stopAll() {
+      watcher.stopAll();
       const all = new Set(sessions.values());
       for (const s of all) {
         try {

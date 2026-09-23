@@ -286,6 +286,8 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     p.ensurePump?.(sessionId); // RC: ensure the relay is pumping into the ring
     await p.seedTranscript?.(sessionId); // pi: seed the ring before the replay reads it
     hub.streamFor(sessionId).handleEvents(req, res);
+    p.watchTranscript?.(sessionId); // pi: tail the transcript for external (terminal) writers
+    res.on("close", () => p.unwatchTranscript?.(sessionId));
   });
 
   return router;

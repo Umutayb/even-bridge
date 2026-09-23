@@ -163,6 +163,42 @@ local session again.
   already live or the ring is populated. The ring's 500-message cap applies,
   so very long sessions surface their most recent context.
 
+### Pi cross-surface sync (single-writer routing)
+
+A pi session file is a shared append-only log, but only **one** driver can
+process prompts for it at a time: if a terminal pi TUI and a bridge-spawned
+`pi --mode rpc` both attach to the same session, the second one wedges and
+silently drops prompts. The bridge therefore enforces a single-writer rule
+(`src/providers/pi/provider.mjs` + `detect.mjs`):
+
+- **Terminal pi driving the session** (detected by probing `/proc` for a
+  `pi` process in the session's cwd): the terminal owns the conversation.
+  - If that terminal is in **tmux**, glasses/phone prompts are delivered
+    into the pane with `tmux send-keys`/`paste-buffer` (single writer —
+    the terminal pi handles them exactly as if typed). The terminal's
+    responses then flow back to the phone through the transcript watcher
+    below.
+  - If it is **not** in tmux, the phone gets a clear error ("driven from a
+    terminal that is not in tmux — run it under tmux to send") instead of
+    a silent drop. **To send to a terminal pi from the glasses, run the
+    terminal session under tmux:** `tmux new; cd <project>; pi --resume`.
+  - A bridge child that got superseded this way is killed on the next
+    prompt (it is wedged and would eat prompts).
+- **No terminal pi for that cwd:** the bridge spawns/resumes its own
+  `pi --mode rpc --session <file>` and drives it directly (the phone is the
+  sole driver).
+- **Transcript watcher** (`src/providers/pi/watcher.mjs`): while a session
+  has an open SSE stream (or a live bridge session), the bridge tails the
+  transcript file (1s poll) and feeds NEW entries written by an external
+  driver into the ring — so terminal activity appears on the glasses in
+  near-real time even though the bridge's ring normally only sees its own
+  `emit()`. History is never re-fed by the watcher (seeding owns that);
+  entries are deduped by transcript id, and healthy bridge-driven sessions
+  skip the file entirely (their events already arrive over RPC).
+
+  Tuning: `EVEN_BRIDGE_PI_WATCH_MS` (poll interval), `EVEN_BRIDGE_PI_TMUX=0`
+  (disable tmux delivery), `EVEN_BRIDGE_PI_BIN` (pi binary).
+
 ## Architecture map
 
 ```
@@ -211,7 +247,9 @@ npm run dev                 # node --watch
   fork is down, RC entries drop out of the merged list with a log warning
   (local + pi are unaffected).
 - Pi sessions are spawned with `pi --mode rpc` in the project cwd; session
-  files live under `~/.pi/agent/sessions/`.
+  files live under `~/.pi/agent/sessions/`. When a terminal pi is driving a
+  session, the bridge routes to it via tmux instead of spawning a second
+  instance — see "Pi cross-surface sync" above.
 - On the wire, extended sessions are all `provider: "claude"` — the phone
   filters its list to known providers, so a `"pi"` tag would make pi sessions
   invisible.

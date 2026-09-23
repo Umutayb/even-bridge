@@ -125,6 +125,10 @@ export class PiSession {
     this.opts = opts;
     this.client = null;
     this.sessionId = undefined;
+    /** Epoch ms when the RPC child was spawned (external-write detection). */
+    this.spawnedAtMs = 0;
+    /** PID of the spawned `pi` child (so driver probes can exclude it). */
+    this.childPid = 0;
     this._busy = false;
     this.turnStartMs = 0;
     this.inputTokens = 0;
@@ -170,12 +174,26 @@ export class PiSession {
     this.client = client;
     client.on("event", (e) => this.onEvent(e));
     client.on("ui_request", (r) => this.onUiRequest(r));
-    client.on("exit", () => {
+    client.on("exit", ({ code, signal }) => {
+      const wasBusy = this._busy;
       this._busy = false;
+      console.log(`[pi] session ${this.sessionId ?? "?"} child exited (code=${code} signal=${signal})`);
+      if (wasBusy) {
+        // The turn is over and will never finish — say so instead of letting
+        // the glasses wait on a dead turn.
+        this.send({ type: "error", message: "pi process exited mid-turn" });
+      }
       this.send({ type: "status", state: "idle", sessionId: this.sessionId });
+      this.opts.onExit?.(this, { code, signal });
     });
-    client.on("error", (err) => this.send({ type: "error", message: err.message }));
+    client.on("error", (err) => {
+      console.error(`[pi] spawn error: ${err.message}`);
+      this.send({ type: "error", message: `pi failed to start: ${err.message}` });
+      this.opts.onExit?.(this, { code: null, signal: null, error: err.message });
+    });
     client.start();
+    this.spawnedAtMs = Date.now();
+    this.childPid = client.child?.pid ?? 0;
 
     // Learn the session id up front (get_state always reports it; session
     // persistence is on by default in pi).
@@ -183,8 +201,13 @@ export class PiSession {
       const res = await client.send({ type: "get_state" });
       const data = res.data;
       if (data?.sessionId) this.sessionId = data.sessionId;
-    } catch {
-      /* non-fatal; id may arrive with events */
+    } catch (err) {
+      // If the child is gone, a live session is impossible — fail loudly so
+      // the caller (and the phone) see an error instead of a phantom 202.
+      if (!client.running) {
+        throw Object.assign(new Error(`pi exited during start: ${err.message}`), { statusCode: 502 });
+      }
+      /* otherwise non-fatal; id may arrive with events */
     }
   }
 
