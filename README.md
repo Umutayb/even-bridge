@@ -257,11 +257,14 @@ npm run dev                 # node --watch
   session, the bridge routes to it via tmux instead of spawning a second
   instance — see "Pi cross-surface sync" above.
 - **Model auth env:** a bridge-spawned pi inherits the **systemd** environment,
-  not your interactive shell's. If your pi model provider needs a token from
-  the environment (e.g. `lets-code` uses `$LETS_CODE_TOKEN` in
-  `~/.pi/agent/models.json`), add that variable to the unit's env file
-  (`/etc/even-terminal.env`, root:root 600 — the unit's `EnvironmentFile`)
-  and restart, or bridge sessions hang silently before their first model call.
+  not your interactive shell's. pi refuses to call a provider whose `$VAR`
+  apiKey (see `~/.pi/agent/models.json`) resolves to nothing, so the session
+  hangs silently before its first model call. `install-services.sh` handles
+  this: it copies `LETS_CODE_TOKEN` from the host user's environment when it
+  can, otherwise writes a placeholder (the vllm endpoint on this network does
+  not validate keys — any non-empty value works). If you set up the unit by
+  hand, add the variable to `/etc/even-terminal.env` (root:root 600) and
+  restart; use the real key if your endpoint validates it.
 - On the wire, extended sessions are all `provider: "claude"` — the phone
   filters its list to known providers, so a `"pi"` tag would make pi sessions
   invisible.

@@ -92,12 +92,30 @@ else
   note "existing file kept (phone pairing unchanged)"
 fi
 # Model auth: bridge-spawned pi sessions inherit THIS env file, not your
-# interactive shell. If your pi model provider reads a token from the
-# environment (check ~/.pi/agent/models.json for "$VAR" apiKey values,
-# e.g. LETS_CODE_TOKEN), append it here or new pi sessions will hang before
-# their first model call:
-#   echo "LETS_CODE_TOKEN=<value>" >> /etc/even-terminal.env && systemctl restart even-bridge
-note "if pi sessions hang before replying: add the model provider's env token (e.g. LETS_CODE_TOKEN) to $TOKEN_ENV_FILE and restart"
+# interactive shell. pi refuses to call a provider whose "$VAR" apiKey resolves
+# to nothing (the request hangs before the first model call). The endpoint here
+# (vllm.example.com) does NOT validate the key — any non-empty value works — so
+# we best-effort copy the host user's value and fall back to a placeholder.
+# For a validating endpoint, put the real value in this file instead.
+MODEL_TOKEN_VAR="LETS_CODE_TOKEN"
+MODEL_TOKEN_VAL=""
+if [ -n "${HOST_USER:-}" ]; then
+  MODEL_TOKEN_VAL="$(su -s /bin/sh -c 'printenv '"$MODEL_TOKEN_VAR"'' "$HOST_USER" 2>/dev/null | tail -1)"
+fi
+if [ -z "$MODEL_TOKEN_VAL" ]; then
+  MODEL_TOKEN_VAL="lets-code-local"
+  MODEL_TOKEN_PLACEHOLDER=1
+fi
+if grep -q "^${MODEL_TOKEN_VAR}=\$" "$TOKEN_ENV_FILE" 2>/dev/null; then
+  note "$MODEL_TOKEN_VAR already in env file — left untouched"
+else
+  printf '%s=%s\n' "$MODEL_TOKEN_VAR" "$MODEL_TOKEN_VAL" >> "$TOKEN_ENV_FILE"
+  if [ "${MODEL_TOKEN_PLACEHOLDER:-0}" = "1" ]; then
+    note "$MODEL_TOKEN_VAR set to placeholder (endpoint does not validate keys; use a real value if yours does)"
+  else
+    note "$MODEL_TOKEN_VAR copied from $HOST_USER's environment"
+  fi
+fi
 
 # ── 4. network flags (Tailscale wg0 when present) ────────────────────────────
 if ip link show wg0 >/dev/null 2>&1; then
