@@ -40,7 +40,7 @@ export function encodeCwdDir(cwd) {
   return `--${stripped.replace(/\//g, "-")}--`;
 }
 
-function textOf(content) {
+export function textOf(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content

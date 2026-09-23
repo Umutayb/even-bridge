@@ -12,6 +12,7 @@
 //  * messages emitted before the session id is known are buffered per session
 //    and flushed when the id resolves (the reference dropped them).
 
+import { readFileSync } from "node:fs";
 import { PiSession } from "./session.mjs";
 import {
   listSessionFiles,
@@ -19,8 +20,11 @@ import {
   readHistory,
   readSessionCwd,
   readRecentModel,
+  textOf,
 } from "./session-files.mjs";
 import { claim, forget } from "../../ownership.mjs";
+import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
+import { summarizePiToolCall } from "./summarize.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -61,8 +65,11 @@ function waitForId(session, ms = 10_000) {
  * @param {{ hub, pi?: object, cwd?: string, defaultCwd?: string }} deps
  */
 export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
-  const cfg = resolvePiConfig();
+  // Env/flag defaults, with the injected config taking precedence (tests DI a
+  // temporary agentDir here).
+  const cfg = { ...resolvePiConfig(), ...pi };
   const sessions = new Map(); // sessionId -> PiSession
+  const seeding = new Set(); // session ids whose transcript seed is in flight
   const liveByFile = new Map(); // resume file -> PiSession
   let cachedVersion = null;
 
@@ -127,6 +134,75 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
       const items = readHistory(sessionId, limit, cfg.agentDir);
       if (items.length) claim(sessionId, NAME);
       return items.map((h) => ({ role: h.role, text: h.text }));
+    },
+
+    /**
+     * Seed the shared ring with this session's on-disk transcript so that
+     * /messages and SSE needReplay can serve the conversation even for
+     * sessions never loaded live in this bridge instance (e.g. right after a
+     * restart). Mirrors the RC pump, which rebuilds its ring from upstream
+     * history. No-op when the session is already live, the ring is already
+     * populated, or no transcript exists. The official ring's 500-message cap
+     * applies, so very long sessions surface their most recent context
+     * (same as the fork's behavior).
+     */
+    async seedTranscript(sessionId) {
+      if (!sessionId) return;
+      if (sessions.has(sessionId)) return; // live: its messages already flow into the ring
+      if (seeding.has(sessionId)) return;
+      if (getMessages(sessionId, 0).length > 0) return;
+      const file = findSessionFile(sessionId, cfg.agentDir);
+      if (!file) return;
+      let raw;
+      try {
+        raw = readFileSync(file, "utf8");
+      } catch {
+        return;
+      }
+      seeding.add(sessionId);
+      try {
+        const pending = new Map(); // toolCallId -> {name, args}
+        for (const line of raw.split("\n")) {
+          if (!line.trim()) continue;
+          let e;
+          try {
+            e = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (e.type !== "message") continue;
+          const m = e.message;
+          if (!m || !Array.isArray(m.content)) continue;
+          if (m.role === "user") {
+            const text = textOf(m.content);
+            if (text) emit(sessionId, { type: "user_prompt", text });
+          } else if (m.role === "assistant") {
+            for (const b of m.content) {
+              if (b.type === "text" && b.text) {
+                emit(sessionId, { type: "text_delta", text: b.text });
+              } else if (b.type === "toolCall") {
+                pending.set(b.id, { name: b.name, args: b.arguments ?? {} });
+                emit(sessionId, { type: "tool_start", name: b.name, toolId: b.id });
+              }
+              // thinking blocks: no wire equivalent; skipped.
+            }
+          } else if (m.role === "toolResult") {
+            const t = pending.get(m.toolCallId);
+            if (!t) continue;
+            pending.delete(m.toolCallId);
+            emit(sessionId, {
+              type: "tool_end",
+              name: t.name,
+              toolId: m.toolCallId,
+              summary: summarizePiToolCall(t.name, t.args),
+              detail: { input: t.args, output: textOf(m.content) },
+            });
+          }
+        }
+        claim(sessionId, NAME);
+      } finally {
+        seeding.delete(sessionId);
+      }
     },
 
     async prompt(sessionId, text, phoneCwd) {

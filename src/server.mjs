@@ -12,6 +12,7 @@
 // untouched; extended sessions are served from the shared ring by the hub.
 
 import http from "node:http";
+import { readFileSync } from "node:fs";
 import express from "express";
 import cors from "cors";
 
@@ -52,6 +53,20 @@ export async function startServer({ flags = {}, cwd } = {}) {
   const TOKEN = process.env.BRIDGE_TOKEN;
   if (!TOKEN) {
     throw new Error("BRIDGE_TOKEN is not set (run via bin/even-bridge.mjs, which applies the config)");
+  }
+  // Compatibility: also accept the claude-remote-terminal fork's bridge
+  // token, so phones already paired with the fork's terminal host
+  // (e.g. via the cterm.* nginx vhost on port 8791) keep working against
+  // the unified bridge without re-pairing.
+  const ALLOWED_TOKENS = new Set([TOKEN]);
+  try {
+    const rc = readFileSync(
+      `${process.env.HOME ?? ""}/.config/claude-remote-terminal/bridge-token`,
+      "utf8",
+    ).trim();
+    if (rc) ALLOWED_TOKENS.add(rc);
+  } catch {
+    /* no fork token file */
   }
   const HOST = resolveHost();
   const BIND_ADDRESS = HOST.address || "127.0.0.1";
@@ -109,7 +124,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
     const header = req.headers.authorization;
     const queryToken = req.query.token;
     const provided = header?.startsWith("Bearer ") ? header.slice(7) : queryToken;
-    if (provided !== TOKEN) {
+    if (!ALLOWED_TOKENS.has(provided)) {
       console.warn(`[auth] 401 ${req.method} ${redactTokenQueryParam(req.originalUrl)} (ip=${req.ip})`);
       res.status(401).json(INFO_AUTH_ERROR);
       return;

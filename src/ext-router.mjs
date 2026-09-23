@@ -239,6 +239,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!sessionId) return res.status(400).json({ error: "Missing 'sessionId'" });
     const p = byName(req.query.provider) ?? (await ownProvider(sessionId));
     if (!p) return next();
+    await p.seedTranscript?.(sessionId); // pi: seed the ring from the on-disk transcript
     const status = await p.getStatus(sessionId);
     if (!status) return res.status(404).json({ error: "Session not found" });
     res.json({ state: status.state, sessionId, provider: status.provider });
@@ -251,6 +252,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     const p = byName(req.query.provider) ?? (await ownProvider(sessionId));
     if (!p) return next();
     p.ensurePump?.(sessionId); // keep the RC relay warm while the client reads
+    await p.seedTranscript?.(sessionId); // pi: make the transcript available to the ring
     const after = parseInt(req.query.after) || 0;
     const status = await p.getStatus(sessionId);
     res.json({
@@ -282,6 +284,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     const p = byName(req.query.provider) ?? (await ownProvider(sessionId));
     if (!p) return next();
     p.ensurePump?.(sessionId); // RC: ensure the relay is pumping into the ring
+    await p.seedTranscript?.(sessionId); // pi: seed the ring before the replay reads it
     hub.streamFor(sessionId).handleEvents(req, res);
   });
 

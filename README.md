@@ -153,6 +153,15 @@ local session again.
   stream open, dedups by monotonic upstream id (re-baselining after an
   upstream generation reset), and feeds frames into the local ring + hub.
   The pump stops when the session goes idle with no local clients.
+- **Pi** additionally seeds its ring from the on-disk transcript on first
+  open (`seedTranscript` in `src/providers/pi/provider.mjs`): the bridge's
+  ring is in-memory, so after a restart an unloaded pi session would
+  otherwise appear empty in the phone until the next prompt. The seeder
+  parses `~/.pi/agent/sessions/**/<id>.jsonl` and feeds the ring the same
+  wire shapes the live provider emits (`user_prompt` / `text_delta` /
+  `tool_start` / `tool_end`), once per session, no-op when the session is
+  already live or the ring is populated. The ring's 500-message cap applies,
+  so very long sessions surface their most recent context.
 
 ## Architecture map
 
@@ -206,6 +215,13 @@ npm run dev                 # node --watch
 - On the wire, extended sessions are all `provider: "claude"` — the phone
   filters its list to known providers, so a `"pi"` tag would make pi sessions
   invisible.
+- **Fork-token compatibility:** the bridge also accepts the
+  `claude-remote-terminal` fork's bridge token
+  (`~/.config/claude-remote-terminal/bridge-token`, read at startup) in
+  addition to its own `BRIDGE_TOKEN`. Phones already paired with the fork's
+  terminal host (e.g. through an nginx vhost pointing at port 8791) keep
+  working against the unified bridge without re-pairing; point that vhost's
+  `proxy_pass` at the bridge (port 3456) to get the merged session list.
 
 ## Attribution
 
