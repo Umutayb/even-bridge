@@ -277,6 +277,54 @@ test("explicit extended provider param routes directly", async (t) => {
   assert.equal((await r.json()).fellThrough, true);
 });
 
+test("new-session prompts default to pi (the phone's provider=claude is an app default)", async (t) => {
+  const rc = stubRc();
+  const pi = stubPi();
+  const { app, fellThrough } = await buildApp(t, { rc, pi });
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => { server.close(); server.closeAllConnections(); });
+
+  // Exact phone shape for "new session": no sessionId, provider "claude"
+  // (app-level default from the pairing URL), cwd picked in the app.
+  const r = await fetch(`${base}/api/prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: "claude", cwd: "/newproj", text: "start a pi session" }),
+  });
+  assert.equal(r.status, 202);
+  assert.deepEqual(await r.json(), { ok: true, sessionId: "pi-new", provider: "claude" });
+  assert.equal(pi.calls.prompt.length, 1, "routed to the pi provider");
+  assert.equal(pi.calls.prompt[0].text, "start a pi session");
+  assert.equal(rc.calls.prompt.length, 0);
+  assert.equal(fellThrough.length, 0, "did not fall through to official Claude Code");
+});
+
+test("EVEN_BRIDGE_NEW_SESSION_PROVIDER=official keeps stock behavior for new sessions", async (t) => {
+  const rc = stubRc();
+  const pi = stubPi();
+  const { app, fellThrough } = await buildApp(t, { rc, pi });
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const prev = process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER;
+  process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER = "official";
+  t.after(() => {
+    if (prev === undefined) delete process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER;
+    else process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER = prev;
+    server.close(); server.closeAllConnections();
+  });
+
+  const r = await fetch(`${base}/api/prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider: "claude", cwd: "/newproj", text: "stock session" }),
+  });
+  assert.equal((await r.json()).fellThrough, true, "new session went to the official router");
+  assert.deepEqual(fellThrough, ["POST /api/prompt"]);
+  assert.equal(pi.calls.prompt.length, 0);
+  assert.equal(rc.calls.prompt.length, 0);
+});
+
 test("/api/events serves the hub SSE stream for owned sessions", async (t) => {
   const rc = stubRc();
   const pi = stubPi();

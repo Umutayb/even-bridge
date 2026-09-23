@@ -169,7 +169,21 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       return res.status(400).json({ error: "Missing 'text' field" });
     }
     const explicit = byName(provider);
-    const p = explicit ?? (sessionId ? await ownProvider(sessionId) : null);
+    let p = explicit;
+    if (!p) {
+      if (sessionId) {
+        p = await ownProvider(sessionId);
+      } else {
+        // NEW session. The phone sends provider="claude" as an app-level
+        // default (from the pairing URL), not a user choice — so it can't be
+        // honored here. New sessions go to pi by default (local Claude Code
+        // spawns are broken on this box: org disabled subscription access).
+        // EVEN_BRIDGE_NEW_SESSION_PROVIDER: "pi" (default), another ext name,
+        // or "official"/"claude" for stock Claude Code behavior.
+        const want = String(process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER ?? "pi").trim().toLowerCase();
+        if (want !== "official" && want !== "claude") p = byName(want);
+      }
+    }
     if (!p) return next();
     console.log(`[bridge] prompt -> ${p.name} session=${sessionId ?? "(new)"}`);
     try {

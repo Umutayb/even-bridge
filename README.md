@@ -114,6 +114,12 @@ official routers and claims a request when:
      providers, claimed as sessions are listed/created;
    - pi probes from disk (`~/.pi/agent/sessions/**/<id>` file lookup);
    - RC probes the upstream (`/api/status`) and caches the answer.
+3. the prompt creates a **new session** (no `sessionId`): it routes to pi
+   by default. The phone sends `provider: "claude"` as an app-level default
+   (from the pairing URL's `defaultProvider`), not a user choice, so it is
+   deliberately not honored for new sessions. Override with
+   `EVEN_BRIDGE_NEW_SESSION_PROVIDER` (`pi` default; `claude-remote` for an
+   RC session; `official`/`claude` for stock Claude Code).
 
 Everything else calls `next()` and is handled by the official routers —
 local Claude Code and Codex behave exactly as stock.
