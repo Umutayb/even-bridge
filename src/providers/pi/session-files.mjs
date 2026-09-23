@@ -199,6 +199,54 @@ export function newestSessionForCwd(cwd, agentDir) {
   return best;
 }
 
+/**
+ * Normalized text fragments of the session's last `n` user messages.
+ * Used to match a terminal pane's visible screen against a transcript:
+ * the pi TUI shows the conversation it is driving, so its recent prompt
+ * text on screen is ground truth for "which session does this terminal run".
+ *
+ * @returns {string[]} whitespace-stripped leading fragments (longest first)
+ */
+export function recentPromptFragments(sessionId, agentDir, n = 3, fragLen = 24) {
+  const file = findSessionFile(sessionId, agentDir);
+  if (!file) return [];
+  let raw;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const lines = raw.split("\n").filter((l) => l.trim());
+  const out = [];
+  for (let i = lines.length - 1; i >= 0 && out.length < n; i--) {
+    let e;
+    try {
+      e = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    if (e?.type !== "message") continue;
+    const m = e.message;
+    if (!m || m.role !== "user") continue;
+    const t = textOf(m.content).trim();
+    const frag = t.replace(/\s+/g, "").slice(0, fragLen);
+    if (frag.length >= 8) out.push(frag);
+  }
+  return out;
+}
+
+/**
+ * Session ids in a cwd's directory, most recently updated first (bounded).
+ * Candidate set for the pane-matching disambiguation.
+ */
+export function recentSessionsInCwd(cwd, agentDir, n = 5) {
+  try {
+    return listSessionFiles(n, cwd, agentDir).map((s) => s.id);
+  } catch {
+    return [];
+  }
+}
+
 /** Find a session file by id (scan all cwd dirs). */
 export function findSessionFile(sessionId, agentDir) {
   const root = sessionsRoot(agentDir);

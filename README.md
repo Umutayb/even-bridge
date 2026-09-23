@@ -178,9 +178,11 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
 (`src/providers/pi/provider.mjs` + `detect.mjs`):
 
 - **Terminal pi driving the session** (detected by probing `/proc` for a
-  `pi` process in the session's cwd **and** confirming it is the conversation
-  that terminal is actually running — the freshest transcript in that cwd,
-  since a cwd can host many pi sessions): the terminal owns the conversation.
+  `pi` process in the session's cwd **and** identifying which conversation
+  that terminal is running — a cwd can host many pi sessions, so the pane's
+  on-screen content is matched against each candidate transcript's recent
+  prompt text; with no tmux pane, the freshest transcript in the cwd is
+  used): the terminal owns the conversation.
   - If that terminal is in **tmux**, glasses/phone prompts are delivered
     into the pane with `tmux send-keys`/`paste-buffer` (single writer —
     the terminal pi handles them exactly as if typed). The terminal's
@@ -207,9 +209,11 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
   transcript file (1s poll) and feeds NEW entries written by an external
   driver into the ring — so terminal activity appears on the glasses in
   near-real time even though the bridge's ring normally only sees its own
-  `emit()`. History is never re-fed by the watcher (seeding owns that);
-  entries are deduped by transcript id, and healthy bridge-driven sessions
-  skip the file entirely (their events already arrive over RPC).
+  `emit()`. A session whose bridge child is mid-turn is skipped (its file
+  growth is the RPC turn already streaming into the ring); external-driver
+  attribution is the same pane-content/freshest-transcript test used for
+  routing. History is never re-fed by the watcher (seeding owns that);
+  entries are deduped by transcript id.
 
   Tuning: `EVEN_BRIDGE_PI_WATCH_MS` (poll interval), `EVEN_BRIDGE_PI_TMUX=0`
   (disable tmux delivery), `EVEN_BRIDGE_PI_BIN` (pi binary).

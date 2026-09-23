@@ -121,3 +121,30 @@ function runTmux(tmuxBin, args) {
     execFile(tmuxBin, args, { timeout: 5000 }, (err) => (err ? reject(err) : resolve()))
   );
 }
+
+/**
+ * Capture a pane's visible screen as text (for deciding which conversation
+ * the terminal TUI is actually showing).
+ * @returns {Promise<string|null>}
+ */
+export async function capturePane(paneId, { tmuxBin = "tmux" } = {}) {
+  const { stdout } = await new Promise((resolve, reject) =>
+    execFile(tmuxBin, ["capture-pane", "-p", "-t", paneId], { timeout: 5000 }, (err, stdout) =>
+      err ? reject(err) : resolve({ stdout: String(stdout ?? "") })
+    )
+  );
+  return stdout;
+}
+
+/**
+ * Does a captured pane screen show one of the session's recent prompt
+ * fragments? Whitespace-normalized both sides (the TUI wraps/indents).
+ * @param {string} screen raw capturePane output
+ * @param {string[]} fragments from recentPromptFragments()
+ */
+export function screenShowsFragments(screen, fragments) {
+  if (!screen) return false;
+  const s = screen.replace(/\s+/g, "");
+  for (const f of fragments ?? []) if (f && s.includes(f)) return true;
+  return false;
+}

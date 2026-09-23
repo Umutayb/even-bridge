@@ -21,12 +21,14 @@ import {
   readSessionCwd,
   readRecentModel,
   newestSessionForCwd,
+  recentPromptFragments,
+  recentSessionsInCwd,
 } from "./session-files.mjs";
 import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { transcriptEntriesToWire } from "./wire.mjs";
 import { TranscriptWatcher, defaultFindFile } from "./watcher.mjs";
-import { findExternalPi, findPiTmuxPane, tmuxDeliver } from "./detect.mjs";
+import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments } from "./detect.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -70,10 +72,19 @@ function waitForId(session, ms = 10_000) {
  *   PiSession by the per-session buffering done here before calling emit).
  * @param {{ hub, pi?: object, cwd?: string, defaultCwd?: string }} deps
  */
-export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
+export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}) {
   // Env/flag defaults, with the injected config taking precedence (tests DI a
   // temporary agentDir here).
   const cfg = { ...resolvePiConfig(), ...pi };
+
+  // Track when OUR last emit per session happened: while an RPC turn streams,
+  // transcript-file growth is ours (already flowing over RPC) — the watcher
+  // uses this instead of guessing who wrote the file.
+  const lastEmitAt = new Map(); // sessionId -> ms
+  function emit(sid, msg) {
+    if (sid) lastEmitAt.set(sid, Date.now());
+    emitRaw(sid, msg);
+  }
   const sessions = new Map(); // sessionId -> PiSession
   const seeding = new Set(); // session ids whose transcript seed is in flight
   const liveByFile = new Map(); // resume file -> PiSession
@@ -86,13 +97,46 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
   const probeTmuxPane = pi.tmuxPaneProbe ?? findPiTmuxPane;
   const deliverTmux = pi.tmuxDeliver ?? tmuxDeliver;
   const newestForCwd = pi.newestForCwd ?? ((c) => newestSessionForCwd(c, cfg.agentDir));
+  const recentInCwd = pi.recentInCwd ?? ((c) => recentSessionsInCwd(c, cfg.agentDir));
+  const paneScreen = pi.paneScreenProbe ?? ((pane) => capturePane(pane));
+  const screenShows = pi.screenShowsProbe ?? screenShowsFragments;
 
-  /** Is an external terminal driver the one running THIS session? A cwd can
-   *  host many pi sessions; the terminal drives the one it is actively
-   *  writing — the freshest transcript in its cwd. Undecidable -> no.
-   *  (Injecting into a terminal that runs a DIFFERENT conversation is the
-   *  destructive case, so err safe.) */
-  function externalDrivesSession(sessionId, file, cwd0) {
+  /**
+   * Is the external terminal driver for `cwd0` the one running THIS session?
+   * A cwd can host many pi sessions; the terminal drives one of them.
+   * Ground truth = the pane's screen (the TUI shows its conversation's
+   * recent messages); without a tmux pane, or when the screen is
+   * indeterminate, fall back to "freshest transcript in the cwd". Undecidable
+   * -> no (injecting into a terminal that runs a DIFFERENT conversation is
+   * the destructive case, so err safe).
+   */
+  async function externalOwnsSession(sessionId, file, cwd0) {
+    const frags = (sid) => {
+      try {
+        return recentPromptFragments(sid, cfg.agentDir);
+      } catch {
+        return [];
+      }
+    };
+    if (cfg.tmuxEnabled) {
+      const pane = await probeTmuxPane(cwd0).catch(() => null);
+      if (pane) {
+        const cap = await paneScreen(pane).catch(() => null);
+        if (cap) {
+          if (screenShows(cap, frags(sessionId))) return true;
+          let cands = [];
+          try {
+            cands = recentInCwd(cwd0);
+          } catch {
+            /* ignore */
+          }
+          for (const sid of cands) {
+            if (sid === sessionId) continue;
+            if (screenShows(cap, frags(sid))) return false; // a different conversation is clearly on screen
+          }
+        }
+      }
+    }
     try {
       const newest = newestForCwd(cwd0);
       return Boolean(newest && (newest.id === sessionId || newest.file === file));
@@ -128,18 +172,21 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
   }
 
   /** True when this session has a live bridge child that is still the sole
-   *  writer (no external terminal pi for its cwd). */
+   *  writer of its transcript (so the watcher can skip the file — its events
+   *  already flow over RPC). */
   async function isSoleWriter(sessionId) {
     const s = sessions.get(sessionId);
     if (!s || !s.client?.running) return false;
+    // Our child is mid-turn: file growth right now is ours.
+    if ((lastEmitAt.get(sessionId) ?? 0) > Date.now() - 5000) return true;
     const file = findSessionFile(sessionId, cfg.agentDir);
     if (!file) return true; // fresh in-memory session: nothing else can write it
     const cwd = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
     const ext = await probeExternalCached(cwd);
     if (ext.length === 0) return true;
-    // An external driver in the cwd only threatens this file if it is the
-    // one actively running it; otherwise our child is still the sole writer.
-    return !externalDrivesSession(sessionId, file, cwd);
+    // An external driver in the cwd only threatens this file if it is the one
+    // running it; otherwise our child is still the sole writer here.
+    return !(await externalOwnsSession(sessionId, file, cwd));
   }
 
   const watcher = new TranscriptWatcher({
@@ -306,7 +353,7 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
         // does not block us: transcripts differ, so a bridge instance for
         // this session is safe alongside it.
         const ext = file ? await probeExternalCached(cwd0) : [];
-        if (ext.length > 0 && externalDrivesSession(sessionId, file, cwd0)) {
+        if (ext.length > 0 && (await externalOwnsSession(sessionId, file, cwd0))) {
           if (session) {
             // Drop our wedged/superseded child (it would eat prompts).
             console.log(`[pi] ${sessionId}: external pi pid ${ext[0].pid} active — dropping bridge child`);

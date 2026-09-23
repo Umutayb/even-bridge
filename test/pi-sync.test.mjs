@@ -392,8 +392,76 @@ test("prompt for a non-newest session in an external driver's cwd spawns its own
   await provider.stopAll();
 });
 
+test("pane screen content identifies the conversation the terminal drives (beats mtime)", async () => {
+  // Two sessions share /home/ay/github. The prompted (older) one is what the
+  // terminal TUI is actually SHOWING on screen — so route to the pane even
+  // though mtime would say the other conversation is fresher.
+  const dir = await tmp();
+  const agentDir = join(dir, "agent");
+  const other = "cccc1111-2222-3333-4444-555566669999"; // fresher on disk
+  const target = "cccc1111-2222-3333-4444-555566668888"; // on screen (older file)
+  const otherFile = await makeSessionFile(agentDir, "/home/ay/github", other, [
+    msgEntry("e1", "user", [{ type: "text", text: "some other recent conversation text" }]),
+  ]);
+  const targetFile = await makeSessionFile(agentDir, "/home/ay/github", target, [
+    msgEntry("e2", "user", [{ type: "text", text: "the conversation the terminal shows right now" }]),
+  ]);
+  const now = Date.now() / 1000;
+  utimesSync(targetFile, now - 3600, now - 3600);
+  utimesSync(otherFile, now, now);
+
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const delivered = [];
+  const emitted = collectEmit();
+  // The screen shows the TARGET session's recent prompt text.
+  const provider = createPiProxy({
+    emitted,
+    agentDir,
+    tmux,
+    delivered,
+    screen: "\u2500\u2500 USER: the conversation the terminal shows right now \u2500\u2500\n~ assistant thinking ~",
+  });
+
+  const res = await provider.prompt(target, "hi", undefined);
+  assert.equal(res.sessionId, target);
+  assert.deepEqual(delivered, ["%9", "hi"], "routed to the pane — screen is ground truth");
+});
+
+test("pane clearly showing a sibling conversation -> spawn own instance for the prompted one", async () => {
+  const dir = await tmp();
+  const agentDir = join(dir, "agent");
+  const sibling = "dddd1111-2222-3333-4444-555566669999"; // on screen
+  const target = "dddd1111-2222-3333-4444-555566668888"; // prompted (not on screen)
+  const fakeSid = "ffff1111-2222-3333-4444-555566661111";
+  await makeSessionFile(agentDir, "/home/ay/github", sibling, [
+    msgEntry("e1", "user", [{ type: "text", text: "sibling conversation visible on the screen here" }]),
+  ]);
+  await makeSessionFile(agentDir, "/home/ay/github", target, [
+    msgEntry("e2", "user", [{ type: "text", text: "the prompted conversation that is NOT on screen" }]),
+  ]);
+
+  const fakePi = await makeFakePi(dir, fakeSid);
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const delivered = [];
+  const emitted = collectEmit();
+  const provider = createPiProxy({
+    emitted,
+    agentDir,
+    tmux,
+    delivered,
+    bin: fakePi,
+    screen: "USER: sibling conversation visible on the screen here ...",
+    recentInCwd: () => [sibling, target],
+  });
+
+  const res = await provider.prompt(target, "hi", undefined);
+  assert.equal(res.sessionId, fakeSid, "own instance spawned (screen shows a DIFFERENT conversation)");
+  assert.equal(delivered.length, 0, "nothing injected into the terminal pane");
+  await provider.stopAll();
+});
+
 /** Provider with DI'd probes (external driver, tmux pane, tmux delivery). */
-function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, external, bin }) {
+function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, external, bin, screen, recentInCwd }) {
   const pi = {
     agentDir,
     bin,
@@ -404,6 +472,9 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
     tmuxDeliver: async (pane, text) => {
       delivered.push(pane, text);
     },
+    // Pane screen capture (null = indeterminate -> mtime fallback).
+    paneScreenProbe: async () => (screen ?? null),
+    recentInCwd: recentInCwd ?? (() => []),
     // Mirror the real "freshest transcript in the cwd" signal against the
     // tests' loose session-dir layout.
     newestForCwd: (c) => {
