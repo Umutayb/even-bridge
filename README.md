@@ -256,6 +256,12 @@ npm run dev                 # node --watch
   files live under `~/.pi/agent/sessions/`. When a terminal pi is driving a
   session, the bridge routes to it via tmux instead of spawning a second
   instance — see "Pi cross-surface sync" above.
+- **Model auth env:** a bridge-spawned pi inherits the **systemd** environment,
+  not your interactive shell's. If your pi model provider needs a token from
+  the environment (e.g. `lets-code` uses `$LETS_CODE_TOKEN` in
+  `~/.pi/agent/models.json`), add that variable to the unit's env file
+  (`/etc/even-terminal.env`, root:root 600 — the unit's `EnvironmentFile`)
+  and restart, or bridge sessions hang silently before their first model call.
 - On the wire, extended sessions are all `provider: "claude"` — the phone
   filters its list to known providers, so a `"pi"` tag would make pi sessions
   invisible.

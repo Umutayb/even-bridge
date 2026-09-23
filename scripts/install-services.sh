@@ -91,6 +91,13 @@ if [ ! -f "$TOKEN_ENV_FILE" ]; then
 else
   note "existing file kept (phone pairing unchanged)"
 fi
+# Model auth: bridge-spawned pi sessions inherit THIS env file, not your
+# interactive shell. If your pi model provider reads a token from the
+# environment (check ~/.pi/agent/models.json for "$VAR" apiKey values,
+# e.g. LETS_CODE_TOKEN), append it here or new pi sessions will hang before
+# their first model call:
+#   echo "LETS_CODE_TOKEN=<value>" >> /etc/even-terminal.env && systemctl restart even-bridge
+note "if pi sessions hang before replying: add the model provider's env token (e.g. LETS_CODE_TOKEN) to $TOKEN_ENV_FILE and restart"
 
 # ── 4. network flags (Tailscale wg0 when present) ────────────────────────────
 if ip link show wg0 >/dev/null 2>&1; then
