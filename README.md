@@ -57,6 +57,26 @@ even-bridge                 # start (default port 3456)
 Pair the Even phone with the token printed at startup (or the QR code on
 re-start). One pairing covers all three session types.
 
+## Provisioning (system services)
+
+`scripts/install-services.sh` installs and starts the systemd units for this
+stack — idempotent, safe to re-run:
+
+- creates `/etc/even-terminal.env` with a fresh `BRIDGE_TOKEN` (shown once) if
+  it doesn't exist — existing tokens are kept, so re-runs never break a phone
+  pairing;
+- writes `even-bridge.service` (and `claude-remote-bridge.service` when the RC
+  fork binary is present) — existing unit files are left untouched;
+- disables the old official `even-terminal.service` if it is active (port 3456
+  conflict); set `KEEP_OFFICIAL=1` to opt out;
+- `systemctl enable --now` both and prints a status summary.
+
+```sh
+sudo scripts/install-services.sh
+# overrides: HOST_USER, EVEN_BRIDGE_DIR, NODE_BIN, TOKEN_ENV_FILE,
+#            RC_BRIDGE_BIN, RC_BRIDGE_PORT, KEEP_OFFICIAL
+```
+
 ## Usage
 
 ```sh
