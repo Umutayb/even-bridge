@@ -158,6 +158,38 @@ test("stream-only reconnect MID-TURN replays from the in-progress turn's start",
   conn.req.emit("close");
 });
 
+test("turn-window anchor survives SEEDED history (no status frames in the ring)", () => {
+  // After a restart the ring is seeded from the pi transcript: seeded turns
+  // carry only user_prompt/text_delta — no status frames — so the idle-based
+  // anchor degrades to "whole ring". The user_prompt anchor must keep the
+  // window at the most recent turn.
+  const hub = new Hub();
+  const sid = "sess-seeded";
+  hub.feed(sid, { type: "user_prompt", text: "q1", n: 1 });
+  hub.feed(sid, { type: "text_delta", text: "a", n: 2 });
+  hub.feed(sid, { type: "user_prompt", text: "q2", n: 3 });
+  hub.feed(sid, { type: "text_delta", text: "b", n: 4 });
+  hub.feed(sid, { type: "user_prompt", text: "q3", n: 5 }); // live turn:
+  hub.feed(sid, { type: "status", state: "busy", n: 6 });
+  hub.feed(sid, { type: "status", state: "think_start", n: 7 });
+  hub.feed(sid, { type: "status", state: "text_start", n: 8 });
+  hub.feed(sid, { type: "text_delta", text: "c", n: 9 });
+  hub.feed(sid, { type: "status", state: "think_end", n: 10 });
+  hub.feed(sid, { type: "status", state: "text_end", n: 11 });
+  hub.feed(sid, { type: "running_stats", n: 12 });
+  hub.feed(sid, { type: "result", n: 13 });
+  hub.feed(sid, { type: "status", state: "idle", n: 14 });
+
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  assert.deepEqual(
+    parseFrames(conn.frames).map((m) => m.msg.n),
+    [5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    "window = the most recent turn, not the whole seeded ring"
+  );
+  conn.req.emit("close");
+});
+
 test("black-holed connection: bytes that never reached the phone are recovered on reconnect", () => {
   const hub = new Hub();
   const sid = "sess-blackhole";

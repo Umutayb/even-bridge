@@ -99,44 +99,57 @@ class SessionStream {
 
   /**
    * Replay window for a stream-only reconnect (no Last-Event-ID, no
-   * needReplay): the whole most-recent turn. A turn runs
+   * needReplay): the whole most-recent turn, capped. A turn's live shape is
    * `user_prompt -> busy -> think_start -> text_start -> deltas -> think_end
-   * -> text_end -> running_stats -> result -> idle`, so its start is NOT the
-   * last non-idle status (that is `text_end`, deep in the tail — the old
-   * window started there and dropped the reply body: the "reply cut off
-   * mid-sentence" symptom). Instead: the turn starts right after the last
-   * idle status — if entries follow that idle the turn is still running,
-   * otherwise its terminal idle sits at the ring tail and the start is after
-   * the idle before it. Capped.
+   * -> text_end -> running_stats -> result -> idle`; SEEDED turns (history
+   * loaded from a pi transcript after a restart) carry only
+   * `user_prompt`/`text_delta` — no status frames — so the anchor must not
+   * rely on statuses. It starts at the last `user_prompt` (every turn, live
+   * or seeded, begins with exactly one); with no prompt marker in the ring
+   * (foreign wire shape) it falls back to the last-idle logic: entries after
+   * the last idle are an in-progress turn, otherwise its terminal idle sits
+   * at the ring tail and the start is after the idle before it.
+   * (The original version anchored on the *last non-idle* status, which
+   * lands on `text_end` near the tail and silently dropped the prompt +
+   * reply body — the "reply cut off mid-sentence" symptom.)
    */
   reconnectWindow() {
     const ring = getMessages(this.sid, 0);
     if (ring.length === 0) return [];
+    const typeOf = (m) => m.type ?? m.msg?.type;
     const isIdle = (m) =>
-      (m.type ?? m.msg?.type) === "status" && (m.state ?? m.msg?.state) === "idle";
-    let lastIdle = -1;
+      typeOf(m) === "status" && (m.state ?? m.msg?.state) === "idle";
+    let turnStart = -1;
     for (let i = ring.length - 1; i >= 0; i--) {
-      if (isIdle(ring[i])) {
-        lastIdle = i;
+      if (typeOf(ring[i]) === "user_prompt") {
+        turnStart = i;
         break;
       }
     }
-    let turnStart;
-    if (lastIdle === -1) {
-      turnStart = 0; // no idle yet: single turn (in progress) — everything
-    } else if (lastIdle < ring.length - 1) {
-      turnStart = lastIdle + 1; // entries after the idle: turn in progress
-    } else {
-      // Turn completed (terminal idle at the ring tail): start after the
-      // idle that preceded it (0 when this is the only turn in the ring).
-      let prevIdle = -1;
-      for (let i = lastIdle - 1; i >= 0; i--) {
+    if (turnStart === -1) {
+      let lastIdle = -1;
+      for (let i = ring.length - 1; i >= 0; i--) {
         if (isIdle(ring[i])) {
-          prevIdle = i;
+          lastIdle = i;
           break;
         }
       }
-      turnStart = prevIdle + 1;
+      if (lastIdle === -1) {
+        turnStart = 0; // no anchor at all: everything, capped
+      } else if (lastIdle < ring.length - 1) {
+        turnStart = lastIdle + 1; // entries after the idle: turn in progress
+      } else {
+        // Turn completed (terminal idle at the ring tail): start after the
+        // idle that preceded it (0 when this is the only turn in the ring).
+        let prevIdle = -1;
+        for (let i = lastIdle - 1; i >= 0; i--) {
+          if (isIdle(ring[i])) {
+            prevIdle = i;
+            break;
+          }
+        }
+        turnStart = prevIdle + 1;
+      }
     }
     return ring.slice(Math.max(turnStart, ring.length - TURN_REPLAY_CAP));
   }

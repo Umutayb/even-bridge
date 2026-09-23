@@ -229,14 +229,14 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
   radio down, OS still ACKing), so the watermark advances past bytes the
   phone never saw and a reply looks "cut off mid-sentence" until the session
   is re-opened. A stream-only reconnect therefore replays the **whole
-  most-recent turn** from the shared ring (cap 1500). The turn's start is the
-  entry right after the **last `status: idle`** frame — if entries follow
-  that idle the turn is still running (replay begins at its prompt),
-  otherwise its terminal idle sits at the ring tail and the start is the
-  idle before it. (An earlier version anchored on the *last non-idle*
-  status, which lands on `text_end` near the tail and silently dropped the
-  prompt + reply body.) The app merges by message id, so re-sent frames
-  don't duplicate. An 8s
+  most-recent turn** from the shared ring (cap 1500), starting at the last
+  `user_prompt` frame (every turn — live or seeded from the transcript after
+  a restart — begins with exactly one; seeded turns carry no status frames,
+  which is why the anchor must not be status-based; the last-`status:idle`
+  logic remains only as a fallback for rings without a prompt marker).
+  (An earlier version anchored on the *last non-idle* status, which lands on
+  `text_end` near the tail and silently dropped the prompt + reply body.)
+  The app merges by message id, so re-sent frames don't duplicate. An 8s
   `:heartbeat` (plus idle re-assertion and aggressive socket keepalive) keeps
   the stream from going idle in the first place.
 
