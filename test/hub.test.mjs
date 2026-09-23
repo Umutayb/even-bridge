@@ -66,7 +66,7 @@ test("Last-Event-ID resume replays only the missed tail", () => {
   conn.req.emit("close");
 });
 
-test("stream-only reconnect (sole client) gap-replays after the watermark", () => {
+test("stream-only reconnect (sole client) replays the most recent turn", () => {
   const hub = new Hub();
   const sid = "sess-gap";
   const first = makeConn();
@@ -76,7 +76,7 @@ test("stream-only reconnect (sole client) gap-replays after the watermark", () =
   hub.feed(sid, { type: "status", state: "idle", n: 3 });
   // Client drops.
   first.req.emit("close");
-  // While offline, two more messages.
+  // While offline, two more messages (the next turn).
   hub.feed(sid, { type: "status", state: "busy", n: 4 });
   hub.feed(sid, { type: "text_delta", text: "b", n: 5 });
 
@@ -86,9 +86,37 @@ test("stream-only reconnect (sole client) gap-replays after the watermark", () =
   assert.deepEqual(
     replayed.map((m) => m.msg.n),
     [4, 5],
-    "replays exactly what arrived after the delivery watermark — not 1..3 again"
+    "replays the whole most-recent turn, from its busy start"
   );
   second.req.emit("close");
+});
+
+test("black-holed connection: bytes that never reached the phone are recovered on reconnect", () => {
+  const hub = new Hub();
+  const sid = "sess-blackhole";
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  hub.feed(sid, { type: "status", state: "busy", n: 1 });
+  hub.feed(sid, { type: "text_delta", text: "head", n: 2 });
+  // The phone now black-holes: res.write() still returns true (kernel buffer
+  // accepted it) but the phone never receives anything from here on.
+  hub.feed(sid, { type: "text_delta", text: "lost-1", n: 3 });
+  hub.feed(sid, { type: "text_delta", text: "lost-2", n: 4 });
+  hub.feed(sid, { type: "status", state: "idle", n: 5 });
+  conn.req.emit("close");
+
+  // The phone's auto-reconnect: stream-only, no resume point. The old
+  // watermark rule replayed nothing (watermark advanced past 1..5); the
+  // turn-window rule recovers the whole turn including the lost middle.
+  const re = makeConn();
+  hub.streamFor(sid).handleEvents(re.req, re.res);
+  const replayed = parseFrames(re.frames);
+  assert.deepEqual(
+    replayed.map((m) => m.msg.n),
+    [1, 2, 3, 4, 5],
+    "the full turn is replayed, black-holed middle included"
+  );
+  re.req.emit("close");
 });
 
 test("watermark does NOT advance for a client that dropped mid-write", () => {
@@ -110,16 +138,16 @@ test("watermark does NOT advance for a client that dropped mid-write", () => {
   };
   hub.feed(sid, { type: "text_delta", text: "b" }); // write fails -> client removed
   assert.equal(hub.clientCount(sid), 0);
-  // Watermark is the last SUCCESSFULLY flushed id (1), so a reconnect
-  // replays the failed message, not drops it.
+  // Reconnect: the un-flushed message is recovered; the flushed one is
+  // re-sent too (the app merges by message id — same as needReplay=true).
   hub.feed(sid, { type: "text_delta", text: "c" });
   const re = makeConn();
   hub.streamFor(sid).handleEvents(re.req, re.res);
   const replayed = parseFrames(re.frames);
   assert.deepEqual(
     replayed.map((m) => m.msg.text),
-    ["b", "c"],
-    "the un-flushed message is recovered, the flushed one is not re-sent"
+    ["a", "b", "c"],
+    "the whole recent window replays (id-merged by the app); the un-flushed message is recovered"
   );
   re.req.emit("close");
 });

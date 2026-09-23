@@ -218,6 +218,18 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
   Tuning: `EVEN_BRIDGE_PI_WATCH_MS` (poll interval), `EVEN_BRIDGE_PI_TMUX=0`
   (disable tmux delivery), `EVEN_BRIDGE_PI_BIN` (pi binary).
 
+- **Live-stream gap recovery** (`src/hub.mjs`): the phone reaps its idle SSE
+  sockets (~4 min) and reconnects stream-only with **no** Last-Event-ID. A
+  plain delivery-watermark replay is unsafe — `res.write()` succeeds into the
+  kernel buffer of a black-holed (half-open) connection (phone screen asleep,
+  radio down, OS still ACKing), so the watermark advances past bytes the
+  phone never saw and a reply looks "cut off mid-sentence" until the session
+  is re-opened. A stream-only reconnect therefore replays the **whole
+  most-recent turn** (busy start → ring tail, cap 1500) from the shared ring;
+  the app merges by message id, so re-sent frames don't duplicate. An 8s
+  `:heartbeat` (plus idle re-assertion and aggressive socket keepalive) keeps
+  the stream from going idle in the first place.
+
 ## Architecture map
 
 ```

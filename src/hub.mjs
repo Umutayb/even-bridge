@@ -8,17 +8,24 @@
 //
 //   * the phone reconnects with NO Last-Event-ID and needReplay=false —
 //     a stream-only reconnect. Messages streamed during the offline window
-//     are lost forever unless we replay them.
+//     are lost forever unless we replay them. (Observed live: the phone
+//     reaps its idle SSE sockets ~4 minutes in and reconnects ~1 minute
+//     later, stream-only, no resume point.)
 //
 // So this handler implements the fork's proven resume semantics on top of
 // the official ring buffer (pushMessage/getMessages from dist/routes/events.js):
 //
 //   1. Last-Event-ID resume — replay exactly what the client missed.
-//   2. Delivery-watermark gap replay — a per-session watermark of the last id
-//      actually FLUSHED to a client; a stream-only reconnect (sole client)
-//      replays exactly the messages after it (capped). The in-flight message
-//      that never flushed is after the watermark (recovered); delivered ones
-//      are not re-sent (no duplicates).
+//   2. Turn-window gap replay — a stream-only reconnect (sole client) replays
+//      the whole most-recent turn (its busy start -> ring tail, capped). The
+//      old "replay only after the delivery watermark" rule was unsafe:
+//      res.write() succeeds into the kernel buffer of a BLACK-HOLED
+//      (half-open) connection — the phone's screen sleeps, the radio drops,
+//      the OS keeps ACKing — so the watermark advances past bytes the phone
+//      never saw and those bytes were lost until the user manually re-opened
+//      the session (the reported "reply cut off mid-sentence" bug). The app
+//      merges by message id (it already tolerates the needReplay=true
+//      full-ring overlap), so re-sent frames don't duplicate.
 //   3. 8s heartbeat + idle re-assertion — when idle, re-emit status:idle so a
 //      dropped turn-end can't leave the phone stuck on "thinking". Never
 //      re-send busy (would restart the thinking animation mid-turn).
@@ -35,7 +42,8 @@
 import { pushMessage, getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 
 const HEARTBEAT_MS = 8000; // fork: HEARTBEAT_S = 8
-const GAP_REPLAY_CAP = 400; // fork: RC_BRIDGE_TERMINAL_GAP_CAP default
+const GAP_REPLAY_CAP = 400; // fallback window when the ring holds no turn start
+const TURN_REPLAY_CAP = 1500; // max messages replayed on a stream-only reconnect
 
 function tuneSocket(res) {
   const sock = res.socket;
@@ -91,11 +99,26 @@ class SessionStream {
   }
 
   /**
-   * The fork's `missed_since_delivered`: everything after the delivery
-   * watermark, capped — exactly what a stream-only reconnect missed.
+   * Replay window for a stream-only reconnect (no Last-Event-ID, no
+   * needReplay): the whole most-recent turn — from its busy start (last
+   * non-idle status marker) to the ring tail, capped. This covers the
+   * black-holed tail the watermark can't (see file header, point 2).
+   * Ring entries are flattened: {id, ...msg}.
    */
-  missedSinceDelivered() {
-    return getMessages(this.sid, this.lastDeliveredId).slice(-GAP_REPLAY_CAP);
+  reconnectWindow() {
+    const ring = getMessages(this.sid, 0);
+    if (ring.length === 0) return [];
+    let turnStart = -1;
+    for (let i = ring.length - 1; i >= 0; i--) {
+      const m = ring[i];
+      if ((m.type ?? m.msg?.type) !== "status") continue;
+      if ((m.state ?? m.msg?.state) !== "idle") {
+        turnStart = i;
+        break;
+      }
+    }
+    const from = turnStart === -1 ? Math.max(0, ring.length - GAP_REPLAY_CAP) : turnStart;
+    return ring.slice(Math.max(from, ring.length - TURN_REPLAY_CAP));
   }
 
   async handleEvents(req, res) {
@@ -115,10 +138,12 @@ class SessionStream {
     res.write(":ok\n\n");
     tuneSocket(res);
 
-    // Resume policy (mirrors the fork): Last-Event-ID wins; else full replay
-    // when the client asks; else stream-only with watermark gap replay — but
-    // only for a SOLE client (another live client means the watermark reflects
-    // that client; replaying would re-send what this reconnect already had —
+    // Resume policy (mirrors the fork, hardened): Last-Event-ID wins; else
+    // full replay when the client asks; else a stream-only (sole-client)
+    // reconnect gets the turn-window replay — the watermark alone is unsafe
+    // against black-holed connections (see header, point 2). A reconnect
+    // while ANOTHER client is live gets no replay (its watermark reflects
+    // that client; replaying would re-send what the newcomer already had —
     // the fork's 206-duplicate bug).
     let replay = [];
     let mode;
@@ -128,11 +153,11 @@ class SessionStream {
     } else if (needReplay) {
       mode = "full replay (needReplay)";
       replay = getMessages(this.sid, 0);
-    } else if (this.clients.size === 0 && this.lastDeliveredId > 0) {
-      mode = "stream-only reconnect -> gap replay";
-      replay = this.missedSinceDelivered();
+    } else if (this.clients.size === 0) {
+      replay = this.reconnectWindow();
+      mode = "stream-only reconnect -> turn-window replay";
     } else {
-      mode = "stream-only (no resume point)";
+      mode = "stream-only (multi-client, no replay)";
     }
     console.log(
       `[hub] ${this.sid.slice(0, 8)}: /events connect Last-Event-ID=${req.headers["last-event-id"] ?? ""} ` +
