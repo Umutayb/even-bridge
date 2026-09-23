@@ -20,6 +20,7 @@ import {
   readHistory,
   readSessionCwd,
   readRecentModel,
+  newestSessionForCwd,
 } from "./session-files.mjs";
 import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
@@ -84,6 +85,21 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
   const probeExternal = pi.externalProbe ?? findExternalPi;
   const probeTmuxPane = pi.tmuxPaneProbe ?? findPiTmuxPane;
   const deliverTmux = pi.tmuxDeliver ?? tmuxDeliver;
+  const newestForCwd = pi.newestForCwd ?? ((c) => newestSessionForCwd(c, cfg.agentDir));
+
+  /** Is an external terminal driver the one running THIS session? A cwd can
+   *  host many pi sessions; the terminal drives the one it is actively
+   *  writing — the freshest transcript in its cwd. Undecidable -> no.
+   *  (Injecting into a terminal that runs a DIFFERENT conversation is the
+   *  destructive case, so err safe.) */
+  function externalDrivesSession(sessionId, file, cwd0) {
+    try {
+      const newest = newestForCwd(cwd0);
+      return Boolean(newest && (newest.id === sessionId || newest.file === file));
+    } catch {
+      return false;
+    }
+  }
 
   // Serialize rapid deliveries per pane: back-to-back glasses prompts would
   // otherwise merge into one line in the terminal reader's input buffer.
@@ -120,7 +136,10 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
     if (!file) return true; // fresh in-memory session: nothing else can write it
     const cwd = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
     const ext = await probeExternalCached(cwd);
-    return ext.length === 0;
+    if (ext.length === 0) return true;
+    // An external driver in the cwd only threatens this file if it is the
+    // one actively running it; otherwise our child is still the sole writer.
+    return !externalDrivesSession(sessionId, file, cwd);
   }
 
   const watcher = new TranscriptWatcher({
@@ -281,10 +300,13 @@ export function createPiProvider(emit, { hub, pi = {}, cwd, defaultCwd } = {}) {
         const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? phoneCwd ?? cwd;
         session = sessions.get(sessionId);
 
-        // External terminal driver for this cwd? The terminal owns the
-        // conversation — route to it, never to a second instance.
+        // External terminal driver actively running THIS conversation? The
+        // terminal owns it — route to it, never to a second instance. An
+        // external pi in the same cwd that drives a DIFFERENT conversation
+        // does not block us: transcripts differ, so a bridge instance for
+        // this session is safe alongside it.
         const ext = file ? await probeExternalCached(cwd0) : [];
-        if (ext.length > 0) {
+        if (ext.length > 0 && externalDrivesSession(sessionId, file, cwd0)) {
           if (session) {
             // Drop our wedged/superseded child (it would eat prompts).
             console.log(`[pi] ${sessionId}: external pi pid ${ext[0].pid} active — dropping bridge child`);

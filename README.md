@@ -178,7 +178,9 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
 (`src/providers/pi/provider.mjs` + `detect.mjs`):
 
 - **Terminal pi driving the session** (detected by probing `/proc` for a
-  `pi` process in the session's cwd): the terminal owns the conversation.
+  `pi` process in the session's cwd **and** confirming it is the conversation
+  that terminal is actually running — the freshest transcript in that cwd,
+  since a cwd can host many pi sessions): the terminal owns the conversation.
   - If that terminal is in **tmux**, glasses/phone prompts are delivered
     into the pane with `tmux send-keys`/`paste-buffer` (single writer —
     the terminal pi handles them exactly as if typed). The terminal's
@@ -190,6 +192,13 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
     terminal session under tmux:** `tmux new; cd <project>; pi --resume`.
   - A bridge child that got superseded this way is killed on the next
     prompt (it is wedged and would eat prompts).
+- **Same cwd, but a *different* conversation:** an external terminal pi in
+  the cwd that is *not* actively writing this session's transcript (i.e. the
+  freshest transcript is another one) does **not** block us. The bridge
+  spawns/resumes its own `pi --mode rpc --session <file>` for this session —
+  distinct transcripts, so a second writer is safe and the prompt is not
+  mis-injected into the terminal's conversation (the failure that used to
+  eat glasses prompts).
 - **No terminal pi for that cwd:** the bridge spawns/resumes its own
   `pi --mode rpc --session <file>` and drives it directly (the phone is the
   sole driver).

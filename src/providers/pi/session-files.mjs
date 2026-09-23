@@ -162,6 +162,43 @@ export function listSessionFiles(limit, cwd, agentDir) {
   return out;
 }
 
+/**
+ * The most recently updated session file in a cwd's session directory.
+ *
+ * A cwd can host many pi sessions; an external terminal pi drives exactly
+ * one of them. pi opens its transcript per write (no persistent fd) and does
+ * not publish its session id in the process env, so the freshest file in the
+ * driver's cwd is the best disk-level signal of which conversation that
+ * driver is actually running.
+ *
+ * @returns {{ file: string, id: string, mtimeMs: number } | null}
+ */
+export function newestSessionForCwd(cwd, agentDir) {
+  if (!cwd) return null;
+  const dir = join(sessionsRoot(agentDir), encodeCwdDir(cwd));
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let best = null;
+  for (const n of names) {
+    if (!n.endsWith(".jsonl")) continue;
+    const p = join(dir, n);
+    let st;
+    try {
+      st = statSync(p);
+    } catch {
+      continue;
+    }
+    if (!best || st.mtimeMs > best.mtimeMs) {
+      best = { file: p, id: n.slice(n.lastIndexOf("_") + 1, -6), mtimeMs: st.mtimeMs };
+    }
+  }
+  return best;
+}
+
 /** Find a session file by id (scan all cwd dirs). */
 export function findSessionFile(sessionId, agentDir) {
   const root = sessionsRoot(agentDir);

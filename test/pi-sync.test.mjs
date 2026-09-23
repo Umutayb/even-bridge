@@ -5,6 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, appendFile, symlink, chmod } from "node:fs/promises";
+import { readdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -353,6 +354,44 @@ test("prompt spawns/resumes its own instance when no external driver exists", as
   await provider.stopAll();
 });
 
+test("prompt for a non-newest session in an external driver's cwd spawns its own instance", async () => {
+  // The 12:44 collision: an external terminal pi drives the FRESHEST
+  // conversation in /home/ay/github ("this" session); a prompt to a DIFFERENT
+  // session in the same cwd must NOT be injected into the terminal — the
+  // bridge drives its own instance for it (distinct transcripts are safe).
+  const dir = await tmp();
+  const agentDir = join(dir, "agent");
+  const mine = "aaaa1111-2222-3333-4444-555566660000"; // external pi's conversation
+  const theirs = "bbbb1111-2222-3333-4444-555566660000"; // the prompted (older) session
+  const fakeSid = "ffff1111-2222-3333-4444-555566667777";
+  const myFile = await makeSessionFile(agentDir, "/home/ay/github", mine, [
+    msgEntry("e1", "user", [{ type: "text", text: "terminal convo" }]),
+  ]);
+  const theirFile = await makeSessionFile(agentDir, "/home/ay/github", theirs, [
+    msgEntry("e2", "user", [{ type: "text", text: "phone convo" }]),
+  ]);
+  // The terminal pi is actively writing `mine` -> it is the freshest file.
+  const now = Date.now() / 1000;
+  utimesSync(theirFile, now - 3600, now - 3600);
+  utimesSync(myFile, now, now);
+
+  const fakePi = await makeFakePi(dir, fakeSid);
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const delivered = [];
+  const emitted = collectEmit();
+  const provider = createPiProxy({ emitted, agentDir, tmux, delivered, bin: fakePi });
+
+  const res = await provider.prompt(theirs, "hi to the phone session", undefined);
+  assert.equal(res.sessionId, fakeSid, "bridge spawned its own instance (fake pi's id)");
+  assert.equal(delivered.length, 0, "nothing was injected into the terminal pane");
+  const msgs = emitted.get(fakeSid) ?? [];
+  assert.ok(msgs.some((m) => m.type === "user_prompt" && m.text === "hi to the phone session"));
+  const errs = msgs.filter((m) => m.type === "error");
+  assert.equal(errs.length, 0, "no BLOCKED error — this is not the terminal's conversation");
+  assert.equal(provider._sessions.has(fakeSid), true, "own instance is live in the map");
+  await provider.stopAll();
+});
+
 /** Provider with DI'd probes (external driver, tmux pane, tmux delivery). */
 function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, external, bin }) {
   const pi = {
@@ -364,6 +403,26 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
     tmuxPaneProbe: async (cwd) => findPiTmuxPane(cwd, { tmuxBin: tmux.bin }),
     tmuxDeliver: async (pane, text) => {
       delivered.push(pane, text);
+    },
+    // Mirror the real "freshest transcript in the cwd" signal against the
+    // tests' loose session-dir layout.
+    newestForCwd: (c) => {
+      const dir = join(agentDir, "sessions", enc(c));
+      let names;
+      try {
+        names = readdirSync(dir).filter((n) => n.endsWith(".jsonl"));
+      } catch {
+        return null;
+      }
+      let best = null;
+      for (const n of names) {
+        const p = join(dir, n);
+        const st = statSync(p);
+        if (!best || st.mtimeMs > best.mtimeMs) {
+          best = { file: p, id: n.slice(n.lastIndexOf("_") + 1, -6), mtimeMs: st.mtimeMs };
+        }
+      }
+      return best;
     },
   };
   const provider = createPiProvider(
