@@ -256,6 +256,9 @@ Group=$HOST_USER
 Environment=HOME=$HOME_DIR
 Environment=EVEN_PI_CWD=${EVEN_PI_CWD:-$HOME_DIR/github}
 Environment=PATH=$HOME_DIR/.local/bin:$("$NODE_BIN" -e 'console.log(require("path").dirname(process.execPath))'):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# pi's lets-code provider needs $LETS_CODE_TOKEN (any non-empty value) or it
+# hangs before the first model call; the script passes it into the pane (-e).
+EnvironmentFile=-$TOKEN_ENV_FILE
 ExecStart=$EVEN_BRIDGE_DIR/scripts/ensure-pi-tmux.sh
 
 [Install]

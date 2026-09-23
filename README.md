@@ -93,6 +93,11 @@ sudo scripts/install-services.sh
   conversation in `EVEN_PI_CWD` (default `~/github`) via `pi --session <file>`,
   and **refuses to start a second driver** while a live (non-stopped) pi
   already runs in that cwd outside tmux — so `enable --now` is always safe.
+  The unit also loads `/etc/even-terminal.env` (`EnvironmentFile=`) so the
+  tmux pi gets `LETS_CODE_TOKEN` (the lets-code provider in pi's
+  `models.json` needs a non-empty value or pi hangs before its first model
+  call); the script passes it into the pane explicitly (`tmux -e`), which
+  also covers a pre-existing tmux server started without it.
 
 After a reboot: the bridge is up; the tmux pi is up and has resumed your last
 conversation; `tmux attach -t even` to see it. If the pi in the pane ever dies,

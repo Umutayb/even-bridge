@@ -56,10 +56,22 @@ fi
 # PATH for the pane's shell: pi lives on the nvm node's bin dir.
 PANE_PATH="/home/ay/.local/bin:/home/ay/.nvm/versions/node/v26.7.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# Model auth: pi's models.json lets-code provider needs $LETS_CODE_TOKEN (any
+# non-empty value; the endpoint does not validate keys) or pi hangs before its
+# first model call. The unit loads /etc/even-terminal.env (EnvironmentFile);
+# pass it with -e too, which also covers a pre-existing tmux server whose
+# server-level env lacks the token (-e sets the pane's env directly).
+# POSIX-portable: build the arg list with `set --` INLINE — inside a function
+# it would only set the function's own positional params, lost on return.
+
 if [ -n "$latest" ]; then
   echo "ensure-pi-tmux: starting tmux session '$SESSION_NAME' — resuming $(basename "$latest") in $CWD" >&2
-  exec tmux new-session -d -s "$SESSION_NAME" -c "$CWD" -e "PATH=$PANE_PATH" "pi --session $latest"
+  set -- new-session -d -s "$SESSION_NAME" -c "$CWD" -e "PATH=$PANE_PATH"
+  if [ -n "${LETS_CODE_TOKEN:-}" ]; then set -- "$@" -e "LETS_CODE_TOKEN=$LETS_CODE_TOKEN"; fi
+  exec tmux "$@" "pi --session $latest"
 fi
 
 echo "ensure-pi-tmux: starting tmux session '$SESSION_NAME' — fresh pi in $CWD" >&2
-exec tmux new-session -d -s "$SESSION_NAME" -c "$CWD" -e "PATH=$PANE_PATH" pi
+set -- new-session -d -s "$SESSION_NAME" -c "$CWD" -e "PATH=$PANE_PATH"
+if [ -n "${LETS_CODE_TOKEN:-}" ]; then set -- "$@" -e "LETS_CODE_TOKEN=$LETS_CODE_TOKEN"; fi
+exec tmux "$@" pi
