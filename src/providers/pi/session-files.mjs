@@ -81,7 +81,7 @@ function toolDetail(call) {
  * role/text only, so tool cards live in the live SSE feed; this keeps them
  * visible in the reopen view without extending the wire shape).
  */
-function toolSummaryLine(content) {
+export function toolSummaryLine(content) {
   if (!Array.isArray(content)) return "";
   const calls = content.filter(
     (b) =>
