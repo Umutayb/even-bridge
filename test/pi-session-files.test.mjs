@@ -52,7 +52,26 @@ test.before(() => {
     name: "feature-x",
     messages: [
       { role: "user", content: "build the widget" },
-      { role: "assistant", content: [{ type: "text", text: "On it." }, { type: "toolCall", id: "t1" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", text: "hmm, need tests" },
+          { type: "text", text: "On it." },
+          {
+            type: "tool_use",
+            id: "t1",
+            name: "bash",
+            input: { command: "npm test && npm run build" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "t2", name: "edit", input: { path: "/x/widget.js" } },
+          { type: "tool_use", id: "t3", name: "edit", input: { path: "/x/widget.test.js" } },
+        ],
+      },
       { role: "user", content: [{ type: "text", text: "and make it blue" }] },
       { role: "assistant", content: [{ type: "text", text: "Done." }] },
     ],
@@ -101,15 +120,44 @@ test("findSessionFile / readSessionCwd", () => {
   assert.equal(findSessionFile("nope", agentDir), null);
 });
 
-test("readHistory: user/assistant text turns only", () => {
+test("readHistory: text turns with folded one-line tool summaries", () => {
   const h = readHistory(ID_A, 10, agentDir);
   assert.deepEqual(h, [
     { role: "user", text: "build the widget" },
-    { role: "assistant", text: "On it." },
+    { role: "assistant", text: "On it.\n\n[tool] bash: npm test && npm run build" },
+    { role: "assistant", text: "[tools] edit(2)" },
     { role: "user", text: "and make it blue" },
     { role: "assistant", text: "Done." },
   ]);
   const limited = readHistory(ID_A, 2, agentDir);
   assert.equal(limited.length, 2);
   assert.equal(limited[0].role, "user");
+});
+
+test("readHistory: tool detail is truncated and thinking stays skipped", () => {
+  const id = "44444444-aaaa-bbbb-cccc-00000000000d";
+  const longCmd = `echo ${"x".repeat(200)}`;
+  writeSession(cwdB, id, "2025-04-01T00:00:00.000Z", {
+    messages: [
+      { role: "user", content: "go" },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", text: "hidden reasoning" },
+          {
+            type: "tool_use",
+            id: "t9",
+            name: "bash",
+            input: { command: `${longCmd}\n  | head -5` },
+          },
+        ],
+      },
+    ],
+  });
+  const h = readHistory(id, 10, agentDir);
+  assert.equal(h.length, 2);
+  assert.equal(h[0].text, "go");
+  // "echo " (5) + 65 x = 70 chars truncated, then "..."
+  assert.match(h[1].text, /^\[tool\] bash: echo x{65}\.\.\.$/);
+  assert.ok(!h[1].text.includes("hidden reasoning"));
 });
