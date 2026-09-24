@@ -58,18 +58,18 @@ test.before(() => {
           { type: "thinking", text: "hmm, need tests" },
           { type: "text", text: "On it." },
           {
-            type: "toolCall",
+            type: "tool_use",
             id: "t1",
             name: "bash",
-            arguments: { command: "npm test && npm run build" },
+            input: { command: "npm test && npm run build" },
           },
         ],
       },
       {
         role: "assistant",
         content: [
-          { type: "toolCall", id: "t2", name: "edit", arguments: { path: "/x/widget.js" } },
-          { type: "toolCall", id: "t3", name: "edit", arguments: { path: "/x/widget.test.js" } },
+          { type: "tool_use", id: "t2", name: "edit", input: { path: "/x/widget.js" } },
+          { type: "tool_use", id: "t3", name: "edit", input: { path: "/x/widget.test.js" } },
         ],
       },
       { role: "user", content: [{ type: "text", text: "and make it blue" }] },
@@ -145,10 +145,10 @@ test("readHistory: tool detail is truncated and thinking stays skipped", () => {
         content: [
           { type: "thinking", text: "hidden reasoning" },
           {
-            type: "toolCall",
+            type: "tool_use",
             id: "t9",
             name: "bash",
-            arguments: { command: `${longCmd}\n  | head -5` },
+            input: { command: `${longCmd}\n  | head -5` },
           },
         ],
       },
