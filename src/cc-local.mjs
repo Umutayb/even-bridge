@@ -30,7 +30,6 @@ import {
   recentCcPromptFragments,
 } from "./cc-transcripts.mjs";
 import { createCcWatcher } from "./cc-watch.mjs";
-import { toolSummaryLine } from "./providers/pi/session-files.mjs";
 import {
   capturePane,
   findClaudeTmuxPane,
@@ -195,36 +194,17 @@ export function createCcLocalProvider(
 
     /**
      * History in the official wire shape ({role, text} only — the phone's
-     * history view renders clean conversation; colored tool cards live in
-     * the live SSE feed). Tool activity is folded in as a one-line
-     * "[tool] ..." summary (same treatment as pi /history), so tool calls
-     * stay visible in the reopen view without extending the wire shape.
+     * history view renders clean conversation; tool activity is a live-feed
+     * feature, same as official sessions).
      */
     getHistory(sessionId, limit = 10) {
       const file = fileOf(sessionId);
       if (!file) return [];
-      const entries = parseCcLines(readTail(file, 512 * 1024));
+      const wire = ccEntriesToWire(parseCcLines(readTail(file, 512 * 1024)));
       const out = [];
-      for (const e of entries) {
-        if (e?.type === "user") {
-          const c = e.message?.content;
-          if (typeof c === "string" && !e.isCompactSummary && c.trim()) {
-            out.push({ role: "user", text: c });
-          }
-        } else if (e?.type === "assistant") {
-          const content = e.message?.content;
-          if (!Array.isArray(content)) continue;
-          const text = content
-            .filter((b) => b?.type === "text" && b.text)
-            .map((b) => b.text)
-            .join("\n");
-          const toolLine = toolSummaryLine(content);
-          if (!text && !toolLine) continue;
-          out.push({
-            role: "assistant",
-            text: text && toolLine ? `${text}\n\n${toolLine}` : text || toolLine,
-          });
-        }
+      for (const m of wire) {
+        if (m.type === "user_prompt") out.push({ role: "user", text: m.text });
+        else if (m.type === "text_delta") out.push({ role: "assistant", text: m.text });
       }
       return out.slice(-limit);
     },

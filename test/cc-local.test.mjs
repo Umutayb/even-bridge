@@ -279,11 +279,7 @@ test("watcher baseline = end of the seeded window (no frame duplication)", async
 // ── ext-router integration ──────────────────────────────────────────────────
 test("ext router: disk CC rows in /sessions, prompt guard 409 + pass-through", async (t) => {
   const base = makeBase(t);
-  writeCcSession(base, "/proj/cc", "cc-111", {
-    title: "cc local",
-    prompts: ["original prompt"],
-    tools: [{ id: "t_h1", name: "Bash", input: { command: "ls -la" }, result: "a b c" }],
-  });
+  writeCcSession(base, "/proj/cc", "cc-111", { title: "cc local", prompts: ["original prompt"] });
   writeCcSession(base, "/proj/other", "cc-222", { prompts: ["other prompt"] });
 
   // A terminal claude is alive in /proj/cc (driving cc-111); nothing in /proj/other.
@@ -371,8 +367,6 @@ test("ext router: disk CC rows in /sessions, prompt guard 409 + pass-through", a
     ["user", "assistant"]
   );
   assert.equal(hist.history[0].text, "original prompt");
-  // Tool activity folded into the assistant text (pi /history treatment).
-  assert.equal(hist.history[1].text, "on it\n\n[tool] Bash: ls -la");
 
   // /status: busy (external claude alive) — also seeds the ring from disk.
   r = await fetch(`${baseUrl}/api/status?sessionId=cc-111`);
