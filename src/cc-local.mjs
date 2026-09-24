@@ -115,7 +115,11 @@ export function createCcLocalProvider(
       } catch {
         return;
       }
-      seededOffsets.set(sessionId, Math.max(0, size - SEED_BYTES));
+      // Watcher baseline = the END of the seeded window: seeding already
+      // covered the tail [size - SEED_BYTES .. size], so the watcher must
+      // start at `size` — starting at the window's beginning would re-emit
+      // the seeded frames (duplicating them in the ring).
+      seededOffsets.set(sessionId, size);
       const entries = parseCcLines(readTail(file, SEED_BYTES));
       for (const m of ccEntriesToWire(entries)) emit(sessionId, m);
       claim(sessionId, CC_LOCAL_NAME);

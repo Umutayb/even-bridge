@@ -252,6 +252,30 @@ test("findExternalClaude matches terminal claude, excludes daemon/RC/stopped/bri
   assert.deepEqual(found.map((f) => f.pid), [101]);
 });
 
+// ── seed/watcher baseline ─────────────────────────────────────────────────
+test("watcher baseline = end of the seeded window (no frame duplication)", async (t) => {
+  const base = makeBase(t);
+  const file = writeCcSession(base, "/proj/dup", "id-dup", { prompts: ["seeded prompt"] });
+  const watcher = {
+    startedAt: null,
+    start: (sid, f, from) => { watcher.startedAt = from; },
+    stop: () => {},
+    has: () => false,
+  };
+  const emitted = [];
+  const prov = createCcLocalProvider((sid, m) => emitted.push(m), {
+    base,
+    watcher,
+    procRoot: "/nonexistent-proc-root",
+  });
+  await prov.seedTranscript("id-dup");
+  assert.ok(emitted.length >= 1, "seeded the ring");
+  prov.watchTranscript("id-dup");
+  // A file smaller than the seed window: baseline must be the FULL size
+  // (starting at the window's beginning would re-emit every seeded frame).
+  assert.equal(watcher.startedAt, statSync(file).size);
+});
+
 // ── ext-router integration ──────────────────────────────────────────────────
 test("ext router: disk CC rows in /sessions, prompt guard 409 + pass-through", async (t) => {
   const base = makeBase(t);
