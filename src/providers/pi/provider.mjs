@@ -81,6 +81,20 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
   // transcript-file growth is ours (already flowing over RPC) — the watcher
   // uses this instead of guessing who wrote the file.
   const lastEmitAt = new Map(); // sessionId -> ms
+  /** sessionId -> {text, at} for prompts the bridge itself delivered into a
+   *  terminal (tmux send-keys). The terminal writes the same prompt to the
+   *  transcript right after; the watcher uses this to NOT re-emit the user
+   *  entry (the bridge already echoed it into the ring at delivery time).
+   *  Without it, glasses-sent messages reach the user twice, back to back.
+   *  Single-use: the on-disk copy arrives exactly once; a later identical
+   *  terminal prompt is a NEW message and must not be swallowed. */
+  const recentDelivered = new Map(); // sessionId -> {text, at}
+  function noteDelivered(sid, text) {
+    recentDelivered.set(sid, { text, at: Date.now() });
+    if (recentDelivered.size > 64) {
+      recentDelivered.delete(recentDelivered.keys().next().value);
+    }
+  }
   function emit(sid, msg) {
     if (sid) lastEmitAt.set(sid, Date.now());
     emitRaw(sid, msg);
@@ -194,6 +208,17 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       if (sid) emit(sid, msg);
     },
     findFile: defaultFindFile(cfg.agentDir),
+    skipUserEcho: (sid, text) => {
+      const d = recentDelivered.get(sid);
+      if (!d) return false;
+      if (Date.now() - d.at > 60_000) {
+        recentDelivered.delete(sid); // stale — not our delivery
+        return false;
+      }
+      if (d.text !== text) return false;
+      recentDelivered.delete(sid); // single-use: consume the one on-disk copy
+      return true;
+    },
     healthy: async (sid) => isSoleWriter(sid),
     active: (sid) => hub?.clientCount(sid) > 0 || sessions.has(sid),
     intervalMs: cfg.watchIntervalMs,
@@ -368,11 +393,13 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
               if (wait > 0) await sleep(wait);
               await deliverTmux(pane, text);
               paneLastDelivery.set(pane, Date.now());
+              noteDelivered(sessionId, text);
               emit(sessionId, { type: "user_prompt", text }); // echo the phone's own message
               console.log(`[bridge] prompt -> tmux pane ${pane} (external pi pid ${ext[0].pid}) session=${sessionId}`);
               return { sessionId, provider: WIRE_PROVIDER };
             }
           }
+          noteDelivered(sessionId, text);
           emit(sessionId, { type: "user_prompt", text });
           emit(sessionId, {
             type: "error",
@@ -479,6 +506,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
     },
 
     _sessions: sessions,
+    _watcher: watcher,
   };
 
   function rpcOpts() {

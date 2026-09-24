@@ -515,3 +515,60 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
   if (wedged && wedgedId) provider._sessions.set(wedgedId, wedged);
   return provider;
 }
+
+// ── duplicate-echo guard: delivered prompts must reach the phone once ───────
+
+test("tmux-delivered prompt is echoed once — the terminal's on-disk copy is skipped (single-use)", async () => {
+  const dir = await tmp();
+  const agentDir = join(dir, "agent");
+  const id = "eeee1111-2222-3333-4444-555566667777";
+  const file = await makeSessionFile(agentDir, "/home/ay/github", id, [
+    msgEntry("e1", "user", [{ type: "text", text: "prompt visible on the pane screen" }]),
+  ]);
+  const tmux = await makeFakeTmux(dir, [
+    { session: "t", pane: "%9", command: "pi", path: "/home/ay/github" },
+  ]);
+  const delivered = [];
+  const emitted = collectEmit();
+  const provider = createPiProxy({
+    emitted,
+    agentDir,
+    tmux,
+    delivered,
+    screen: "USER: prompt visible on the pane screen ...",
+  });
+
+  // Watch the session first (as /status does) so the tick baseline predates
+  // the delivery.
+  provider._watcher.watch(id);
+
+  await provider.prompt(id, "glasses says hi", undefined);
+  assert.deepEqual(delivered, ["%9", "glasses says hi"], "routed to the terminal pane");
+  let ups = emitted.get(id).filter((m) => m.type === "user_prompt");
+  assert.equal(ups.length, 1, "exactly one echo at delivery");
+  assert.equal(ups[0].text, "glasses says hi");
+
+  // The terminal pi records the injected prompt in the transcript. The
+  // watcher must swallow that copy — the phone already got the echo.
+  await appendFile(file, JSON.stringify(msgEntry("e2", "user", [{ type: "text", text: "glasses says hi" }])) + "\n");
+  await provider._watcher.tick(id);
+  ups = emitted.get(id).filter((m) => m.type === "user_prompt");
+  assert.equal(ups.length, 1, "the on-disk copy of a delivered prompt must not be re-emitted");
+
+  // A prompt typed BY HAND in the terminal still syncs to the phone.
+  await appendFile(file, JSON.stringify(msgEntry("e3", "user", [{ type: "text", text: "typed by hand in the terminal" }])) + "\n");
+  await provider._watcher.tick(id);
+  ups = emitted.get(id).filter((m) => m.type === "user_prompt");
+  assert.equal(ups.length, 2, "terminal-typed prompts keep flowing");
+  assert.equal(ups[1].text, "typed by hand in the terminal");
+
+  // Single-use: the SAME text typed again in the terminal is a NEW message —
+  // the consumed mark must not swallow it.
+  await appendFile(file, JSON.stringify(msgEntry("e4", "user", [{ type: "text", text: "glasses says hi" }])) + "\n");
+  await provider._watcher.tick(id);
+  ups = emitted.get(id).filter((m) => m.type === "user_prompt");
+  assert.equal(ups.length, 3, "a later identical terminal prompt is not swallowed");
+  assert.equal(ups[2].text, "glasses says hi");
+
+  await provider.stopAll();
+});

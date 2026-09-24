@@ -28,15 +28,17 @@ export class TranscriptWatcher {
    *   findFile: (sessionId: string) => string|null,
    *   healthy: (sessionId: string) => boolean,   // live bridge child with no external writes
    *   active: (sessionId: string) => boolean,    // should keep watching (SSE clients / live)
+   *   skipUserEcho?: (sessionId: string, text: string) => boolean, // user entry is a copy of a prompt the bridge itself just delivered (already echoed into the ring)
    *   intervalMs?: number,
    *   log?: (line: string) => void,
    * }} deps
    */
-  constructor({ emit, findFile, healthy, active, intervalMs = 1000, log = () => {} }) {
+  constructor({ emit, findFile, healthy, active, skipUserEcho, intervalMs = 1000, log = () => {} }) {
     this.emit = emit;
     this.findFile = findFile;
     this.healthy = healthy;
     this.active = active;
+    this.skipUserEcho = skipUserEcho;
     this.intervalMs = intervalMs;
     this.log = log;
     /** sessionId -> {timer, offset, seen: Set, seenOrder: string[]} */
@@ -154,7 +156,14 @@ export class TranscriptWatcher {
       const state = (w.state ??= { pending: new Map() });
       if (state.pending.size > 1000) state.pending.clear();
       const msgs = transcriptEntriesToWire(entries, state);
-      for (const m of msgs) this.emit(sessionId, m);
+      for (const m of msgs) {
+        // The bridge's own tmux-delivered prompt is echoed into the ring at
+        // delivery time; the terminal then writes the same prompt to the
+        // transcript. Without this skip the user's message reaches the
+        // glasses twice, back to back.
+        if (m.type === "user_prompt" && this.skipUserEcho?.(sessionId, m.text)) continue;
+        this.emit(sessionId, m);
+      }
       if (msgs.length) this.log(`[pi-watch] ${sessionId}: +${msgs.length} wire msg(s) from transcript`);
     } finally {
       await fh.close();
