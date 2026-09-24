@@ -52,48 +52,6 @@ export function textOf(content) {
   return "";
 }
 
-/** One-line, ASCII-safe detail for a single tool_use block. */
-function toolDetail(call) {
-  const name = call.name ?? "";
-  const input = (call.input ?? call.args ?? {}) ;
-  let d;
-  if (name === "bash") d = input.command ?? "";
-  else if (name === "read" || name === "write" || name === "edit") d = input.path ?? "";
-  else d = Object.values(input).find((v) => typeof v === "string") ?? "";
-  d = String(d).replace(/\s+/g, " ").trim();
-  if (d.length > 70) d = d.slice(0, 70).trimEnd() + "...";
-  return d;
-}
-
-/**
- * One-line summary of the tool_use blocks in an assistant content array.
- * "[tool] bash: <detail>" for a single call, "[tools] name(n), ..." for
- * several. "" when the content has no tool_use blocks. Used to fold tool
- * activity into /history text (the official history wire shape is
- * role/text only, so tool cards live in the live SSE feed; this keeps them
- * visible in the reopen view without extending the wire shape).
- */
-function toolSummaryLine(content) {
-  if (!Array.isArray(content)) return "";
-  const calls = content.filter(
-    (b) => !!b && typeof b === "object" && b.type === "tool_use"
-  );
-  if (!calls.length) return "";
-  if (calls.length === 1) {
-    const name = calls[0].name ?? "tool";
-    const d = toolDetail(calls[0]);
-    return d ? `[tool] ${name}: ${d}` : `[tool] ${name}`;
-  }
-  const counts = new Map();
-  for (const c of calls) {
-    const n = c.name ?? "tool";
-    counts.set(n, (counts.get(n) ?? 0) + 1);
-  }
-  return `[tools] ${[...counts.entries()]
-    .map(([n, k]) => (k > 1 ? `${n}(${k})` : n))
-    .join(", ")}`;
-}
-
 /** Read just enough of a session file to summarize it (header + name + first prompt). */
 function readSummary(file) {
   let raw;
@@ -355,12 +313,8 @@ export function readHistory(sessionId, limit, agentDir) {
     if (entry.type !== "message") continue;
     const m = entry.message;
     if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
-    let text = textOf(m.content);
-    const toolLine = m.role === "assistant" ? toolSummaryLine(m.content) : "";
-    if (!text && !toolLine) continue;
-    if (text && toolLine) text = `${text}\n\n${toolLine}`;
-    else if (toolLine) text = toolLine;
-    items.push({ role: m.role, text });
+    const text = textOf(m.content);
+    if (text) items.push({ role: m.role, text });
   }
   return items.slice(-limit);
 }
