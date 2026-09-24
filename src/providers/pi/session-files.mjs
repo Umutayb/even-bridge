@@ -52,31 +52,42 @@ export function textOf(content) {
   return "";
 }
 
-/** One-line, ASCII-safe detail for a single tool_use block. */
+/** One-line, ASCII-safe detail for a single tool-call block. */
 function toolDetail(call) {
   const name = call.name ?? "";
-  const input = (call.input ?? call.args ?? {}) ;
+  let input = call.arguments ?? call.input ?? call.args ?? {};
+  if (typeof input === "string") {
+    try {
+      input = JSON.parse(input);
+    } catch {
+      input = { _raw: input };
+    }
+  }
   let d;
   if (name === "bash") d = input.command ?? "";
   else if (name === "read" || name === "write" || name === "edit") d = input.path ?? "";
-  else d = Object.values(input).find((v) => typeof v === "string") ?? "";
+  else d = Object.values(input ?? {}).find((v) => typeof v === "string") ?? "";
   d = String(d).replace(/\s+/g, " ").trim();
   if (d.length > 70) d = d.slice(0, 70).trimEnd() + "...";
   return d;
 }
 
 /**
- * One-line summary of the tool_use blocks in an assistant content array.
- * "[tool] bash: <detail>" for a single call, "[tools] name(n), ..." for
- * several. "" when the content has no tool_use blocks. Used to fold tool
- * activity into /history text (the official history wire shape is
+ * One-line summary of the tool-call blocks in an assistant content array.
+ * pi records them as {type:"toolCall", id, name, arguments} (the Anthropic
+ * tool_use shape is also accepted). "[tool] bash: <detail>" for a single
+ * call, "[tools] name(n), ..." for several. "" when there are none. Used to
+ * fold tool activity into /history text (the official history wire shape is
  * role/text only, so tool cards live in the live SSE feed; this keeps them
  * visible in the reopen view without extending the wire shape).
  */
 function toolSummaryLine(content) {
   if (!Array.isArray(content)) return "";
   const calls = content.filter(
-    (b) => !!b && typeof b === "object" && b.type === "tool_use"
+    (b) =>
+      !!b &&
+      typeof b === "object" &&
+      (b.type === "toolCall" || b.type === "tool_use")
   );
   if (!calls.length) return "";
   if (calls.length === 1) {
