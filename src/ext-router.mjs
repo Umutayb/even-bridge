@@ -1,8 +1,9 @@
 // Extension router — mounted BEFORE the official eventsRouter/coreRouter.
 //
 // Intercepts only requests that belong to EXTENDED sessions (claude-remote,
-// pi); everything else falls through to the official routers unchanged, so
-// local Claude Code and Codex sessions behave exactly as stock even-terminal.
+// pi, cc-local); everything else falls through to the official routers
+// unchanged, so Codex sessions and officially-launched Claude Code sessions
+// behave exactly as stock even-terminal.
 //
 // Routing rule (session-ID ownership, not provider param — the Even phone
 // omits the provider on follow-up calls and only ever knows "claude"/"codex"):
@@ -10,14 +11,17 @@
 //   2. sessionId claimed/probed to an extended provider → that provider
 //   3. otherwise → next() (official router)
 //
-// /api/sessions is merged (default provider + every enabled extension), all
+// /api/sessions is merged (every enabled extension + the local slot), all
 // tagged provider "claude", because the phone filters its list to the provider
-// it thinks it's connected to.
+// it thinks it's connected to. The local slot is served from a disk scan of
+// ~/.claude/projects (ground truth — includes live sessions the official SDK
+// list skips) with live busy/idle status; the SDK list is a fallback only.
 
 import { Router } from "express";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { getOwner } from "./ownership.mjs";
 import { findBridgeSessionId } from "./rc-transcripts.mjs";
+import { listCcSessions, ccProjectsBase } from "./cc-transcripts.mjs";
 
 const STATUS_CHECK_COUNT = 10; // mirrors core.js
 
@@ -34,6 +38,8 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
   const router = Router();
 
   const byName = (name) => ext.find((p) => p.name === name) || null;
+  const ccBaseDir = rcTranscriptBase || ccProjectsBase();
+  const ccProv = ext.find((p) => p.name === "cc-local") || null;
 
   /** Which extended provider (if any) owns this session id? */
   async function ownProvider(sessionId) {
@@ -73,18 +79,42 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     const cwd = req.query.cwd;
     const out = [];
 
-    // Local (official) sessions — the default provider, exactly as core.js does.
-    // Fetched with headroom so RC-twin detection (below) can match transcripts
-    // just outside the phone's limit window; the final slice restores `limit`.
+    // Local sessions — from the disk scan of the CC projects dir (ground
+    // truth; the official SDK list skips in-progress CC sessions and carries
+    // no live status). Fetched with headroom so RC-twin detection (below)
+    // can match transcripts just outside the phone's limit window; the final
+    // slice restores `limit`.
     let local = [];
     let localProvider;
     try {
-      localProvider = getDefaultLocalProvider();
       const localLimit = Math.min(limit + 10, 50);
-      local = await localProvider.listSessions(localLimit, cwd);
-      await fillStatus(localProvider, local);
+      local = listCcSessions({ limit: localLimit, cwd, base: ccBaseDir });
     } catch (err) {
-      console.warn(`[bridge] local session list failed: ${err.message}`);
+      console.warn(`[bridge] cc session scan failed: ${err.message}`);
+    }
+    if (local.length === 0 && !cwd) {
+      // Fallback to the official SDK list only when the scan found nothing
+      // AND there is no cwd filter (a filter legitimately matches zero).
+      try {
+        localProvider = getDefaultLocalProvider();
+        const localLimit = Math.min(limit + 10, 50);
+        local = await localProvider.listSessions(localLimit, cwd);
+        await fillStatus(localProvider, local);
+      } catch (err) {
+        console.warn(`[bridge] local session list failed: ${err.message}`);
+      }
+    }
+    if (!localProvider && ccProv) {
+      // Live status for disk rows (busy while a terminal claude drives the
+      // cwd or the transcript is being written) for the phone's top window.
+      for (const s of local.slice(0, STATUS_CHECK_COUNT)) {
+        if (s.status) continue;
+        try {
+          s.status = (await ccProv.getSessionStatus(s.id)) ?? "idle";
+        } catch {
+          /* leave null */
+        }
+      }
     }
 
     // Fetch the extended lists, keyed by provider name (with live status for
@@ -191,6 +221,9 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     try {
       const effectiveCwd = sessionId ? undefined : cwd ?? process.env.PROJECT_DIR;
       const result = await p.prompt(sessionId, text, effectiveCwd);
+      // cc-local: session not externally driven -> the official router is
+      // the single writer (spawn/resume) for this session.
+      if (result?.passThrough) return next();
       res.status(202).json({ ok: true, sessionId: result.sessionId, provider: result.provider });
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;

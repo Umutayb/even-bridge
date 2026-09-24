@@ -1,4 +1,6 @@
-// External-driver detection for pi sessions.
+// External-driver detection for pi sessions (and, further down, local
+// Claude Code: findExternalClaude / findClaudeTmuxPane reuse the same
+// /proc + tmux patterns).
 //
 // pi session files are shared append-only logs: a terminal TUI (`pi` in a
 // shell) and a bridge-spawned `pi --mode rpc` can both attach to the same
@@ -164,4 +166,118 @@ export function screenShowsFragments(screen, fragments) {
   const s = screen.replace(/\s+/g, "");
   for (const f of fragments ?? []) if (f && s.includes(f)) return true;
   return false;
+}
+
+// ── Claude Code (local, non-RC) ──────────────────────────────────────────────
+
+/**
+ * Find running `claude` (Claude Code) processes whose cwd matches `cwd` —
+ * i.e. a terminal CC that could be driving a session of that project.
+ *
+ * Excluded: the CC background daemon family (`claude daemon run`,
+ * `bg-pty-host`, `bg-spare` — they host, not drive), RC sessions
+ * (`--remote-control` — owned by the claude-remote fork), STOPPED
+ * processes (state T — suspended, driving nothing), and bridge children
+ * (ancestor chain reaching this process — the official dist spawns those,
+ * so they are NOT external drivers).
+ *
+ * @returns {Promise<Array<{pid: number, cwd: string}>>}
+ */
+export async function findExternalClaude(cwd, { excludePids = [], procRoot = "/proc", myPid = process.pid } = {}) {
+  if (!cwd) return [];
+  const skip = new Set([myPid, ...excludePids]);
+  let entries;
+  try {
+    entries = await readdir(procRoot);
+  } catch {
+    return [];
+  }
+  const found = [];
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name);
+    if (skip.has(pid)) continue;
+    let comm, cmdline, stat;
+    try {
+      comm = (await readFile(join(procRoot, name, "comm"), "utf8")).trim();
+      cmdline = (await readFile(join(procRoot, name, "cmdline"), "utf8")).replace(/\0/g, " ");
+    } catch {
+      continue;
+    }
+    if (comm !== "claude") continue;
+    if (/daemon|bg-pty-host|bg-spare|--remote-control/.test(cmdline)) continue;
+    try {
+      stat = await readFile(join(procRoot, name, "stat"), "utf8");
+    } catch {
+      continue;
+    }
+    // Same parsing as findExternalPi: last ")" anchors past a comm that
+    // contains ")"; fields after it are "STATE ppid pgrp ...".
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) continue;
+    const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+    const state = fields[0]?.[0] ?? "";
+    if (state === "T" || state === "t") continue;
+    const ppid = Number(fields[1] ?? 0);
+    let pcwd;
+    try {
+      pcwd = await readlink(join(procRoot, name, "cwd"));
+    } catch {
+      continue;
+    }
+    if (pcwd !== cwd) continue;
+    if (await isBridgeDescendant(ppid, procRoot, myPid)) continue; // bridge-spawned child
+    found.push({ pid, cwd: pcwd });
+  }
+  return found;
+}
+
+/** True when `ppid`'s ancestor chain (<= 32 hops) reaches `myPid`. */
+async function isBridgeDescendant(ppid, procRoot, myPid) {
+  let cur = ppid;
+  for (let i = 0; i < 32 && cur > 1; i++) {
+    if (cur === myPid) return true;
+    let stat;
+    try {
+      stat = await readFile(join(procRoot, String(cur), "stat"), "utf8");
+    } catch {
+      return false; // chain breaks — not ours
+    }
+    const closeParen = stat.lastIndexOf(")");
+    if (closeParen < 0) return false;
+    const next = Number(stat.slice(closeParen + 2).trim().split(/\s+/)[1] ?? 0);
+    if (!next || next === cur) return false;
+    cur = next;
+  }
+  return false;
+}
+
+/**
+ * Find a tmux pane running `claude` with its current path == `cwd`.
+ * @returns {Promise<string|null>} pane id (e.g. "%7") or null.
+ */
+export async function findClaudeTmuxPane(cwd, { tmuxBin = "tmux" } = {}) {
+  if (!cwd) return null;
+  const fmt = "#{session_name} #{window_index} #{pane_id} #{pane_current_command} #{pane_current_path}";
+  let out;
+  try {
+    const { stdout } = await new Promise((resolve, reject) =>
+      execFile(tmuxBin, ["list-panes", "-a", "-F", fmt], { timeout: 5000 }, (err, stdout) =>
+        err ? reject(err) : resolve({ stdout: String(stdout ?? "") })
+      )
+    );
+    out = stdout;
+  } catch {
+    return null; // tmux missing / no server / no panes
+  }
+  for (const line of out.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 5) continue;
+    const paneId = parts[2];
+    const command = parts[3];
+    const path = parts.slice(4).join(" ");
+    if (path !== cwd) continue;
+    if (command === "claude" || command.endsWith("/claude")) return paneId;
+  }
+  return null;
 }

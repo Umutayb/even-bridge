@@ -41,6 +41,7 @@ import { Hub } from "./hub.mjs";
 import { createExtRouter } from "./ext-router.mjs";
 import { resolveRcConfig, createClaudeRemoteProvider } from "./providers/claude-remote.mjs";
 import { resolvePiConfig, createPiProvider } from "./providers/pi/provider.mjs";
+import { createCcLocalProvider } from "./cc-local.mjs";
 import { getProvider } from "@evenrealities/even-terminal/dist/routes/core.js";
 import { getDefaultProvider } from "@evenrealities/even-terminal/dist/session.js";
 
@@ -90,14 +91,19 @@ export async function startServer({ flags = {}, cwd } = {}) {
   const piProvider = piCfg.enabled
     ? createPiProvider(emit, { hub, pi: piCfg, cwd, defaultCwd: cwd })
     : null;
+  // Local (non-RC) Claude Code sessions: disk-listed, streamed from their
+  // transcripts, single-writer prompt guard. Disable with
+  // EVEN_BRIDGE_CC_DISABLED=1.
+  const ccProvider =
+    process.env.EVEN_BRIDGE_CC_DISABLED === "1" ? null : createCcLocalProvider(emit, { hub });
 
   console.log(
-    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}`
+    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}`
   );
 
   const extRouter = createExtRouter({
     hub,
-    providers: [rcProvider, piProvider],
+    providers: [rcProvider, piProvider, ccProvider],
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
   });
 

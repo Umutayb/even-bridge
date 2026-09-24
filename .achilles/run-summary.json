@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "timestamp": "2026-09-24T17:52:32Z",
+    "git_sha": "81e81bfe5167c47aa860737a1cd8e1211338c9d6",
+    "achilles_version": "",
+    "schema": "run-summary/v2"
+  },
+  "phases": [],
+  "scenarios": {
+    "files": []
+  },
+  "bugs": {
+    "ids": [],
+    "by_severity": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    }
+  },
+  "tests": {
+    "passing": null,
+    "failing": null,
+    "flaky": null,
+    "skipped": null,
+    "total": null,
+    "status": null
+  },
+  "journey_map": {
+    "journeys": 0
+  }
+}

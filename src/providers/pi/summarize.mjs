@@ -51,3 +51,37 @@ export function summarizePiToolCall(name, input) {
     }
   }
 }
+
+// Claude Code tool calls: capitalized names (Bash/Edit/Read/...) with
+// different input keys (file_path/command/pattern/url). Same HUD style so
+// local CC tool lines render identically to pi/official lines on the G2.
+export function summarizeCcToolCall(name, input = {}) {
+  switch (String(name ?? "")) {
+    case "Bash":
+      return `Bash ${trunc(input.description ?? input.command ?? "command", 50)}`;
+    case "Read":
+      return `Read ${base(input.file_path) || "file"}`;
+    case "Write":
+    case "Edit":
+    case "MultiEdit":
+      return `Edit ${base(input.file_path) || "file"}`;
+    case "NotebookEdit":
+      return `Edit ${base(input.notebook_path) || "notebook"}`;
+    case "Grep":
+      return `Grep "${trunc(input.pattern, 25)}"`;
+    case "Glob":
+      return `Glob ${trunc(input.pattern, 40)}`;
+    case "LS":
+      return `List ${trunc(input.path, 40)}`;
+    case "Task":
+      return `Agent ${trunc(input.description ?? input.subagent_type ?? "subagent", 40)}`;
+    case "WebFetch":
+      return `Fetch ${trunc(input.url, 40)}`;
+    case "WebSearch":
+      return `Search "${trunc(input.query, 30)}"`;
+    case "TodoWrite":
+      return "Update todos";
+    default:
+      return summarizePiToolCall(name, input); // generic fallback
+  }
+}

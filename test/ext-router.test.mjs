@@ -184,7 +184,11 @@ test("unknown sessions fall through to the official routers", async (t) => {
 test("merged /api/sessions: local + rc + pi, newest first, all provider claude", async (t) => {
   const rc = stubRc();
   const pi = stubPi();
-  const { app } = await buildApp(t, { rc, pi, rcTranscriptBase: tmpdir() });
+  // Empty CC projects base: the disk scan finds nothing, so the official SDK
+  // list (stub) serves the local slot — the fallback path.
+  const emptyBase = mkdtempSync(join(tmpdir(), "ext-router-ccbase-"));
+  t.after(() => rmSync(emptyBase, { recursive: true, force: true }));
+  const { app } = await buildApp(t, { rc, pi, rcTranscriptBase: emptyBase });
   const server = app.listen(0);
   const base = `http://127.0.0.1:${server.address().port}`;
   t.after(() => { server.close(); server.closeAllConnections(); });
@@ -210,7 +214,9 @@ test("merged /api/sessions: local + rc + pi, newest first, all provider claude",
 test("merged /api/sessions hides the local twin of a live RC session", async (t) => {
   // The RC fork's `claude --remote-control` process writes its transcript to
   // ~/.claude/projects/<cwd>/<uuid>.jsonl with a bridge-session marker, so the
-  // same conversation must not appear twice in the merged list.
+  // same conversation must not appear twice in the merged list. The local slot
+  // is served from the disk scan, so the fixtures live on disk here: the twin
+  // transcript AND an unrelated plain local transcript.
   const baseDir = mkdtempSync(join(tmpdir(), "ext-router-dedupe-"));
   t.after(() => rmSync(baseDir, { recursive: true, force: true }));
   const CWD = "/local";
@@ -222,14 +228,21 @@ test("merged /api/sessions hides the local twin of a live RC session", async (t)
     [
       '{"type":"mode","mode":"normal","sessionId":"' + TWIN_ID + '"}',
       '{"type":"bridge-session","sessionId":"' + TWIN_ID + '","bridgeSessionId":"rc-1","lastSequenceNum":0}',
+      '{"type":"user","message":{"role":"user","content":"Local twin title"},"cwd":"' + CWD + '","sessionId":"' + TWIN_ID + '"}',
     ].join("\n") + "\n"
   );
+  // An unrelated plain local session (no bridge-session marker) in another cwd.
+  const otherDir = join(baseDir, "-other");
+  mkdirSync(otherDir, { recursive: true });
+  writeFileSync(
+    join(otherDir, `local-2.jsonl`),
+    '{"type":"user","message":{"role":"user","content":"Plain local"},"cwd":"/other","sessionId":"local-2"}\n'
+  );
 
+  // The SDK stub is NOT used for the local slot (disk scan found files);
+  // kept only so buildApp has something to fall back to.
   const local = {
-    listSessions: async () => [
-      { id: TWIN_ID, title: "Local twin title", timestamp: "2025-05-01T00:00:01Z", cwd: CWD, provider: "claude", status: null },
-      { id: "local-2", title: "Plain local", timestamp: "2025-04-01T00:00:00Z", cwd: "/other", provider: "claude", status: null },
-    ],
+    listSessions: async () => ["local-1"].map((id) => ({ id, title: "stub", timestamp: "2025-05-01T00:00:01Z", cwd: "/stub", provider: "claude", status: null })),
     getSessionStatus: async () => "idle",
   };
   const rc = stubRc();

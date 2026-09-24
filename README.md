@@ -139,7 +139,10 @@ official routers and claims a request when:
    - the ownership registry (`src/ownership.mjs`) maps session IDs to
      providers, claimed as sessions are listed/created;
    - pi probes from disk (`~/.pi/agent/sessions/**/<id>` file lookup);
-   - RC probes the upstream (`/api/status`) and caches the answer.
+   - RC probes the upstream (`/api/status`) and caches the answer;
+   - cc-local probes from disk (`~/.claude/projects/*/<id>.jsonl` file
+     lookup) — local Claude Code sessions the official SDK list would skip
+     while they are live.
 3. the prompt creates a **new session** (no `sessionId`): it routes to pi
    by default. The phone sends `provider: "claude"` as an app-level default
    (from the pairing URL's `defaultProvider`), not a user choice, so it is
@@ -148,12 +151,20 @@ official routers and claims a request when:
    RC session; `official`/`claude` for stock Claude Code).
 
 Everything else calls `next()` and is handled by the official routers —
-local Claude Code and Codex behave exactly as stock.
+codex sessions and Claude Code sessions the official dist launched itself
+behave exactly as stock.
 
 ### Merged `/api/sessions`
 
-For `provider` absent or `"claude"`, the list merges the official default
-provider + RC + pi, all tagged `provider: "claude"`, newest first.
+For `provider` absent or `"claude"`, the list merges the local slot + RC +
+pi, all tagged `provider: "claude"`, newest first. The **local slot is a
+plain disk scan of `~/.claude/projects/`** (`src/cc-transcripts.mjs`):
+the official SDK list skips in-progress Claude Code sessions and carries
+no live status, so the disk is the ground truth — every local CC session
+shows up (title from the newest `ai-title`/`agent-name`, else the first
+prompt; cwd from the entries), with `busy` while a terminal `claude`
+drives its cwd or the transcript is being written. The SDK list is kept
+only as a fallback if the scan finds nothing.
 
 **RC transcript dedupe:** the RC fork runs the real `claude --remote-control`
 CLI, which writes its transcript to `~/.claude/projects/` — so a live RC
@@ -175,6 +186,15 @@ local session again.
 ### Live streaming (SSE)
 
 - **Local/Codex:** the official ring buffer + `/api/events` (untouched).
+- **Local CC (terminal-driven):** same treatment as pi — ring seeded from
+  the on-disk transcript on first open, then a 1s-poll transcript watcher
+  (`src/cc-watch.mjs`) tails `~/.claude/projects/<cwd>/<id>.jsonl` and
+  feeds new entries into the ring as `user_prompt` / `text_delta` /
+  `tool_start` / `tool_end` (converted by `ccEntriesToWire`, with
+  persistent tool-call bookkeeping across batches). The watcher only runs
+  for sessions the bridge seeded — officially-launched sessions stream
+  through the official pipeline, and double-watching would duplicate
+  frames.
 - **Extended sessions:** a shared hub (`src/hub.mjs`) with the same semantics
   the phone expects — `Last-Event-ID` resume, watermark gap replay for a
   returning sole client, full replay on `needReplay=true`, 8s heartbeat, and
@@ -270,6 +290,44 @@ silently drops prompts. The bridge therefore enforces a single-writer rule
   `:heartbeat` (plus idle re-assertion and aggressive socket keepalive) keeps
   the stream from going idle in the first place.
 
+### Local Claude Code sessions (single-writer routing)
+
+The official dist can only stream Claude Code sessions **it** launched (its
+SDK list skips live sessions, it has no external-transcript watcher, and
+`prompt()` would spawn a parallel `claude` child while a terminal one is
+running). The bridge adds the missing pieces for terminal-driven local CC
+sessions, mirroring the pi architecture (`src/cc-local.mjs` provider +
+`cc-transcripts.mjs` + `cc-watch.mjs` + `findExternalClaude` /
+`findClaudeTmuxPane` in `detect.mjs`):
+
+- **Listed:** the `/api/sessions` local slot is a disk scan (above), so a
+  live terminal CC session appears with a `busy` status.
+- **Streamed:** opening the session seeds the ring from the transcript and
+  starts the transcript watcher — terminal activity (text + tool calls,
+  `Bash …` / `Edit …` summaries via `summarizeCcToolCall`) flows to the
+  phone exactly like pi.
+- **Prompt guard:** a phone prompt for a session whose cwd has a running
+  terminal `claude` is **never** answered by spawning a parallel child:
+  - terminal `claude` in the cwd + reachable tmux pane (the pane's screen
+    shows this conversation's recent prompts, or it's the newest CC
+    session in the cwd) → the prompt is delivered into the pane with
+    `tmux send-keys`; the terminal CC processes it and the watcher streams
+    the reply back;
+  - terminal `claude` alive but unreachable → a clear **409** ("running in
+    a terminal the bridge can't reach — reply there or put it in tmux");
+  - nothing external → pass-through to the official router, which owns
+    spawn/resume for dead or officially-launched sessions (and the bridge
+    stops its watcher at that point so frames can't double).
+
+  The `/proc` scan excludes the CC background daemon family
+  (`claude daemon run`, `bg-pty-host`, `bg-spare` — they host, not drive),
+  `--remote-control` processes (owned by the RC fork), STOPPED
+  processes, and bridge children (ancestor chain reaching the bridge pid).
+  Disable the whole extension with `EVEN_BRIDGE_CC_DISABLED=1`.
+- **History:** `/api/sessions/:id/history` is served from the disk
+  transcript in the official wire shape (`{role, text}` only — tool cards
+  are a live-feed feature, matching official sessions).
+
 ## Architecture map
 
 ```
@@ -280,6 +338,9 @@ src/ownership.mjs            session-ID → provider registry (claim/probe/forge
 src/hub.mjs                  phone-facing SSE for extended sessions
 src/upstream-pump.mjs        RC relay pump (upstream SSE → local ring + hub)
 src/rc-transcripts.mjs       bridge-session marker scan (RC twin dedupe)
+src/cc-transcripts.mjs       local CC transcript scan/convert (list, meta, wire)
+src/cc-watch.mjs             local CC transcript tailer (external -> ring)
+src/cc-local.mjs             cc-local provider (seed/watch/single-writer guard)
 src/providers/claude-remote.mjs  RC proxy provider (HTTP → fork terminal host)
 src/providers/pi/            vendored pi provider (MIT — see NOTICE.md)
   framing.mjs                JSONL RPC framing
@@ -288,6 +349,7 @@ src/providers/pi/            vendored pi provider (MIT — see NOTICE.md)
   session-files.mjs          ~/.pi/agent/sessions disk listing/lookup
   summarize.mjs              tool-call summaries (ASCII, official style)
   provider.mjs               pi provider (owns sessions, probes from disk)
+  detect.mjs                 /proc + tmux detection (pi & local CC)
 test/                        node:test suites (hermetic, no real provider state)
 scripts/check-upstream.mjs   asserts the official dist exports we rely on
 scripts/smoke-import.mjs     imports every module (catches bad import paths)
