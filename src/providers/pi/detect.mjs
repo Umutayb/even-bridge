@@ -17,7 +17,7 @@
 
 import { execFile } from "node:child_process";
 import { readdir, readFile, readlink, rm, mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -181,9 +181,18 @@ export function screenShowsFragments(screen, fragments) {
  * (ancestor chain reaching this process — the official dist spawns those,
  * so they are NOT external drivers).
  *
- * @returns {Promise<Array<{pid: number, cwd: string}>>}
+ * Each hit carries the conversation it is driving when Claude Code's own
+ * per-process record (`~/.claude/sessions/<pid>.json`: sessionId + busy/idle
+ * status) is present and its cwd matches (a mismatch means a reused pid /
+ * stale record). No record -> sessionId undefined: the caller must treat the
+ * process as possibly driving ANY session in the cwd.
+ *
+ * @returns {Promise<Array<{pid: number, cwd: string, sessionId?: string, status?: string}>>}
  */
-export async function findExternalClaude(cwd, { excludePids = [], procRoot = "/proc", myPid = process.pid } = {}) {
+export async function findExternalClaude(
+  cwd,
+  { excludePids = [], procRoot = "/proc", myPid = process.pid, sessionsDir = join(homedir(), ".claude", "sessions") } = {}
+) {
   if (!cwd) return [];
   const skip = new Set([myPid, ...excludePids]);
   let entries;
@@ -227,9 +236,20 @@ export async function findExternalClaude(cwd, { excludePids = [], procRoot = "/p
     }
     if (pcwd !== cwd) continue;
     if (await isBridgeDescendant(ppid, procRoot, myPid)) continue; // bridge-spawned child
-    found.push({ pid, cwd: pcwd });
+    found.push({ pid, cwd: pcwd, ...(await readClaudeSessionRecord(sessionsDir, pid, pcwd)) });
   }
   return found;
+}
+
+/** {sessionId, status} from ~/.claude/sessions/<pid>.json, or {} when absent/stale. */
+async function readClaudeSessionRecord(sessionsDir, pid, cwd) {
+  try {
+    const rec = JSON.parse(await readFile(join(sessionsDir, `${pid}.json`), "utf8"));
+    if (rec.pid !== pid || rec.cwd !== cwd || typeof rec.sessionId !== "string") return {};
+    return { sessionId: rec.sessionId, ...(typeof rec.status === "string" ? { status: rec.status } : {}) };
+  } catch {
+    return {};
+  }
 }
 
 /** True when `ppid`'s ancestor chain (<= 32 hops) reaches `myPid`. */
@@ -253,12 +273,14 @@ async function isBridgeDescendant(ppid, procRoot, myPid) {
 }
 
 /**
- * Find a tmux pane running `claude` with its current path == `cwd`.
+ * Find a tmux pane running `claude` with its current path == `cwd`. With
+ * `pid`, only the pane hosting THAT claude process (pane_pid is the process
+ * or one of its ancestors) — several claudes can share a cwd.
  * @returns {Promise<string|null>} pane id (e.g. "%7") or null.
  */
-export async function findClaudeTmuxPane(cwd, { tmuxBin = "tmux" } = {}) {
+export async function findClaudeTmuxPane(cwd, { tmuxBin = "tmux", pid, procRoot = "/proc" } = {}) {
   if (!cwd) return null;
-  const fmt = "#{session_name} #{window_index} #{pane_id} #{pane_current_command} #{pane_current_path}";
+  const fmt = "#{session_name} #{window_index} #{pane_id} #{pane_pid} #{pane_current_command} #{pane_current_path}";
   let out;
   try {
     const { stdout } = await new Promise((resolve, reject) =>
@@ -272,12 +294,14 @@ export async function findClaudeTmuxPane(cwd, { tmuxBin = "tmux" } = {}) {
   }
   for (const line of out.split("\n")) {
     const parts = line.trim().split(/\s+/);
-    if (parts.length < 5) continue;
+    if (parts.length < 6) continue;
     const paneId = parts[2];
-    const command = parts[3];
-    const path = parts.slice(4).join(" ");
+    const panePid = Number(parts[3]);
+    const command = parts[4];
+    const path = parts.slice(5).join(" ");
     if (path !== cwd) continue;
-    if (command === "claude" || command.endsWith("/claude")) return paneId;
+    if (!(command === "claude" || command.endsWith("/claude"))) continue;
+    if (pid == null || (panePid && (await isBridgeDescendant(pid, procRoot, panePid)))) return paneId;
   }
   return null;
 }

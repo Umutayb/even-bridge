@@ -252,6 +252,69 @@ test("findExternalClaude matches terminal claude, excludes daemon/RC/stopped/bri
   assert.deepEqual(found.map((f) => f.pid), [101]);
 });
 
+/** Fake ~/.claude/sessions: records = [{pid, sessionId, cwd, status}]. */
+function fakeSessionsDir(t, records) {
+  const dir = mkdtempSync(join(tmpdir(), "evenbridge-ccsessions-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const r of records) {
+    writeFileSync(join(dir, `${r.pid}.json`), JSON.stringify({ kind: "interactive", ...r }));
+  }
+  return dir;
+}
+
+test("findExternalClaude attaches sessionId/status from ~/.claude/sessions (cwd-checked)", async (t) => {
+  const procRoot = fakeProc(t, [
+    { pid: 101, comm: "claude", cmdline: "claude", state: "S", ppid: 5000, cwd: "/proj/a" },
+    { pid: 102, comm: "claude", cmdline: "claude", state: "S", ppid: 5000, cwd: "/proj/a" },
+    { pid: 103, comm: "claude", cmdline: "claude", state: "S", ppid: 5000, cwd: "/proj/a" },
+  ]);
+  const sessionsDir = fakeSessionsDir(t, [
+    { pid: 101, sessionId: "s-101", cwd: "/proj/a", status: "idle" },
+    { pid: 102, sessionId: "s-stale", cwd: "/proj/elsewhere", status: "busy" }, // pid reused
+  ]);
+  const found = await findExternalClaude("/proj/a", { procRoot, sessionsDir, myPid: process.pid });
+  const byPid = Object.fromEntries(found.map((f) => [f.pid, f]));
+  assert.equal(byPid[101].sessionId, "s-101");
+  assert.equal(byPid[101].status, "idle");
+  assert.equal(byPid[102].sessionId, undefined); // record cwd mismatch -> unknown
+  assert.equal(byPid[103].sessionId, undefined); // no record -> unknown
+});
+
+test("cc-local ownership is per conversation, not per cwd", async (t) => {
+  const base = makeBase(t);
+  const old = new Date(Date.now() - 3600_000);
+  writeCcSession(base, "/proj/cc", "cc-111", { prompts: ["driven"] });
+  const f333 = writeCcSession(base, "/proj/cc", "cc-333", { prompts: ["old convo"] });
+  const f444 = writeCcSession(base, "/proj/cc", "cc-444", { prompts: ["waiting"] });
+  utimesSync(f333, old, old);
+  utimesSync(f444, old, old);
+  const procRoot = fakeProc(t, [
+    { pid: 301, comm: "claude", cmdline: "claude", state: "S", ppid: 4000, cwd: "/proj/cc" },
+    { pid: 302, comm: "claude", cmdline: "claude", state: "S", ppid: 4000, cwd: "/proj/cc" },
+  ]);
+  const sessionsDir = fakeSessionsDir(t, [
+    { pid: 301, sessionId: "cc-111", cwd: "/proj/cc", status: "busy" },
+    { pid: 302, sessionId: "cc-444", cwd: "/proj/cc", status: "idle" },
+  ]);
+  const prov = createCcLocalProvider(() => {}, {
+    base,
+    procRoot,
+    sessionsDir,
+    tmuxBin: "definitely-not-a-tmux-bin",
+  });
+
+  assert.equal(await prov.getSessionStatus("cc-111"), "busy");
+  assert.equal(await prov.getSessionStatus("cc-333"), "idle"); // other claudes in the cwd don't own it
+  assert.equal(await prov.getSessionStatus("cc-444"), "idle"); // owner is waiting at its prompt
+
+  // Nobody drives cc-333: the official router resumes it (no false 409).
+  assert.deepEqual(await prov.prompt("cc-333", "hi"), { passThrough: true });
+  // Owned sessions stay single-writer: no reachable pane -> 409.
+  await assert.rejects(prov.prompt("cc-111", "hi"), (e) => e.statusCode === 409 && /pid 301/.test(e.message));
+  await assert.rejects(prov.prompt("cc-444", "hi"), (e) => e.statusCode === 409 && /pid 302/.test(e.message));
+  assert.deepEqual(await prov.interrupt("cc-333"), { ok: true });
+});
+
 // ── seed/watcher baseline ─────────────────────────────────────────────────
 test("watcher baseline = end of the seeded window (no frame duplication)", async (t) => {
   const base = makeBase(t);

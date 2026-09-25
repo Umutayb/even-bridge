@@ -50,6 +50,7 @@ const FRESH_MS = 15_000; // transcript written within 15s counts as live
  *   base?: string,          // CC projects dir (default ~/.claude/projects)
  *   tmuxBin?: string,
  *   procRoot?: string,
+ *   sessionsDir?: string,   // CC per-process records (default ~/.claude/sessions)
  *   watcher?: object,       // injected createCcWatcher() result (tests)
  *   intervalMs?: number,
  *   log?: (s: string) => void,
@@ -57,7 +58,7 @@ const FRESH_MS = 15_000; // transcript written within 15s counts as live
  */
 export function createCcLocalProvider(
   emit,
-  { base, tmuxBin = "tmux", procRoot = "/proc", watcher, intervalMs = 1000, log = () => {} } = {}
+  { base, tmuxBin = "tmux", procRoot = "/proc", sessionsDir, watcher, intervalMs = 1000, log = () => {} } = {}
 ) {
   const ccBase = base ?? ccProjectsBase();
   const watch = watcher ?? createCcWatcher({ emit, intervalMs, log });
@@ -65,16 +66,30 @@ export function createCcLocalProvider(
 
   const fileOf = (sessionId) => findCcSessionFile(sessionId, ccBase);
 
-  async function stateOf(file) {
-    const meta = ccMeta(file);
-    const external = await findExternalClaude(meta.cwd, { procRoot });
+  /**
+   * Terminal claudes that may be driving THIS conversation. Ownership is per
+   * conversation, not per cwd: a claude whose CC record names another
+   * session is not a driver of this one (several share a cwd routinely).
+   * A claude without a record is unknown and counts, conservatively.
+   */
+  async function driversOf(sessionId, cwd) {
+    const external = await findExternalClaude(cwd, { procRoot, sessionsDir });
+    return external.filter((p) => p.sessionId == null || p.sessionId === sessionId);
+  }
+
+  async function stateOf(sessionId, file) {
+    const drivers = await driversOf(sessionId, ccMeta(file).cwd);
     let fresh = false;
     try {
       fresh = Date.now() - statSync(file).mtimeMs < FRESH_MS;
     } catch {
       /* keep false */
     }
-    return external.length > 0 || fresh ? "busy" : "idle";
+    if (fresh) return "busy";
+    if (drivers.length === 0) return "idle";
+    // The owner's own busy/idle beats "a terminal is attached".
+    const owner = drivers.find((p) => p.sessionId === sessionId && p.status);
+    return owner ? (owner.status === "idle" ? "idle" : "busy") : "busy";
   }
 
   return {
@@ -90,13 +105,13 @@ export function createCcLocalProvider(
 
     getSessionStatus: async (sessionId) => {
       const file = fileOf(sessionId);
-      return file ? stateOf(file) : null;
+      return file ? stateOf(sessionId, file) : null;
     },
 
     async getStatus(sessionId) {
       const file = fileOf(sessionId);
       if (!file) return null;
-      return { state: await stateOf(file), provider: "claude" };
+      return { state: await stateOf(sessionId, file), provider: "claude" };
     },
 
     /**
@@ -145,7 +160,8 @@ export function createCcLocalProvider(
 
     /**
      * Single-writer guard (mirrors the pi provider):
-     *  - external claude driving this session's cwd + reachable tmux pane
+     *  - external claude driving this conversation (CC record) or, when
+     *    unknown, this session's cwd + reachable tmux pane
      *    (screen shows this conversation, or it's the newest in the cwd)
      *    -> deliver into the pane (same session, one writer)
      *  - external claude alive but unreachable -> 409 (never double-drive)
@@ -160,12 +176,16 @@ export function createCcLocalProvider(
         throw err;
       }
       const meta = ccMeta(file);
-      const external = await findExternalClaude(meta.cwd, { procRoot });
+      const external = await driversOf(sessionId, meta.cwd);
       if (external.length > 0) {
-        const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin });
+        // A known owner: its own pane, no guessing. Unknown: any claude pane
+        // in the cwd, confirmed by screen content / newest-in-cwd.
+        const owner = external.find((p) => p.sessionId === sessionId);
+        const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner?.pid });
         if (pane) {
-          const screen = await capturePane(pane, { tmuxBin }).catch(() => null);
+          const screen = owner ? null : await capturePane(pane, { tmuxBin }).catch(() => null);
           const mine =
+            owner != null ||
             screenShowsFragments(screen, recentCcPromptFragments(file)) ||
             (await listCcSessions({ limit: 1, cwd: meta.cwd, base: ccBase })[0]?.id === sessionId);
           if (mine) {
@@ -217,7 +237,7 @@ export function createCcLocalProvider(
         throw err;
       }
       const meta = ccMeta(file);
-      const external = await findExternalClaude(meta.cwd, { procRoot });
+      const external = await driversOf(sessionId, meta.cwd);
       if (external.length > 0) {
         const err = new Error("That session is running in a terminal the bridge can't interrupt. Use Ctrl+C there.");
         err.statusCode = 409;

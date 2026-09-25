@@ -163,7 +163,10 @@ the official SDK list skips in-progress Claude Code sessions and carries
 no live status, so the disk is the ground truth — every local CC session
 shows up (title from the newest `ai-title`/`agent-name`, else the first
 prompt; cwd from the entries), with `busy` while a terminal `claude`
-drives its cwd or the transcript is being written. The SDK list is kept
+is driving that conversation (per Claude Code's own
+`~/.claude/sessions/<pid>.json` record — other claudes in the same cwd
+don't count; the record's busy/idle wins) or the transcript is being
+written. The SDK list is kept
 only as a fallback if the scan finds nothing.
 
 **RC transcript dedupe:** the RC fork runs the real `claude --remote-control`
@@ -176,8 +179,10 @@ marker in those transcripts:
 {"type":"bridge-session","sessionId":"<local-uuid>","bridgeSessionId":"cse_…",...}
 ```
 
-The bridge scans each local session's transcript head
-(`src/rc-transcripts.mjs`) for the marker, hides the local duplicate, and
+The CLI re-writes the marker on every RC reconnect, possibly with a
+**new** `cse_…` id, so the latest one wins: the bridge scans each local
+session's transcript tail, then head (`src/rc-transcripts.mjs`), for the
+marker, hides the local duplicate, and
 borrows its title + cwd for the RC entry (the upstream lists RC entries with
 `cwd: ""` and a terminal-name title). When the RC session dies, the upstream
 (active-only list) drops it and the transcript automatically becomes a plain
@@ -306,9 +311,13 @@ sessions, mirroring the pi architecture (`src/cc-local.mjs` provider +
   starts the transcript watcher — terminal activity (text + tool calls,
   `Bash …` / `Edit …` summaries via `summarizeCcToolCall`) flows to the
   phone exactly like pi.
-- **Prompt guard:** a phone prompt for a session whose cwd has a running
-  terminal `claude` is **never** answered by spawning a parallel child:
-  - terminal `claude` in the cwd + reachable tmux pane (the pane's screen
+- **Prompt guard:** a phone prompt for a session a terminal `claude` is
+  driving is **never** answered by spawning a parallel child. Ownership is
+  per conversation: a terminal `claude` whose `~/.claude/sessions/<pid>.json`
+  names another session is ignored; one with no record is conservatively
+  treated as driving any session in its cwd.
+  - owning `claude` in a tmux pane → delivered into **its** pane; unknown
+    owner + a `claude` pane in the cwd (the pane's screen
     shows this conversation's recent prompts, or it's the newest CC
     session in the cwd) → the prompt is delivered into the pane with
     `tmux send-keys`; the terminal CC processes it and the watcher streams

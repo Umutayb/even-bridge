@@ -71,13 +71,44 @@ test("missing file returns null (no throw)", () => {
   }
 });
 
-test("marker deeper than 64KB is still missed gracefully (returns null, no throw)", () => {
+test("marker deeper than 64KB in the head is found in the tail window", () => {
   const { base, cleanup } = makeBase();
   try {
     const filler = JSON.stringify({ type: "user", text: "x".repeat(200) });
     const lines = [];
     for (let i = 0; i < 400; i++) lines.push(filler); // ~80KB before the marker
     lines.push(MARKER);
+    writeTranscript(base, CWD, LOCAL_ID, lines);
+    assert.equal(findBridgeSessionId(CWD, LOCAL_ID, base), CSE_ID);
+  } finally {
+    cleanup();
+  }
+});
+
+test("rotated RC id: the LATEST bridge-session marker wins", () => {
+  const { base, cleanup } = makeBase();
+  try {
+    const NEW_ID = "cse_013tmo6VLPo3ZLkVrHy4piPD";
+    const filler = JSON.stringify({ type: "user", text: "x".repeat(200) });
+    const lines = [MARKER];
+    for (let i = 0; i < 2000; i++) lines.push(filler); // ~400KB between the markers
+    lines.push(MARKER.replace(CSE_ID, NEW_ID));
+    lines.push(filler);
+    writeTranscript(base, CWD, LOCAL_ID, lines);
+    assert.equal(findBridgeSessionId(CWD, LOCAL_ID, base), NEW_ID);
+  } finally {
+    cleanup();
+  }
+});
+
+test("marker only in the middle of a huge file falls back to null gracefully", () => {
+  const { base, cleanup } = makeBase();
+  try {
+    const filler = JSON.stringify({ type: "user", text: "x".repeat(200) });
+    const lines = [];
+    for (let i = 0; i < 400; i++) lines.push(filler);
+    lines.push(MARKER);
+    for (let i = 0; i < 2000; i++) lines.push(filler);
     writeTranscript(base, CWD, LOCAL_ID, lines);
     assert.equal(findBridgeSessionId(CWD, LOCAL_ID, base), null);
   } finally {

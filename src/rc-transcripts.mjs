@@ -3,7 +3,8 @@
 // The claude-remote fork runs the real `claude --remote-control` CLI, which
 // writes its transcript to ~/.claude/projects/<cwd>/<local-uuid>.jsonl just
 // like any local session. The claude CLI embeds a `bridge-session` entry in
-// those transcripts (within the first few lines):
+// those transcripts (at session start, and again on every RC reconnect —
+// possibly with a new cse_ id; the latest marker is authoritative):
 //
 //   {"type":"bridge-session","sessionId":"<local-uuid>",
 //    "bridgeSessionId":"cse_...","lastSequenceNum":0, ...}
@@ -17,9 +18,10 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { openSync, readSync, closeSync } from "node:fs";
+import { openSync, readSync, closeSync, fstatSync } from "node:fs";
 
-const HEAD_BYTES = 64 * 1024; // the marker is written at session start
+const HEAD_BYTES = 64 * 1024; // first marker is written at session start
+const TAIL_BYTES = 256 * 1024; // re-written markers (RC reconnects) land here
 const DEFAULT_BASE = join(homedir(), ".claude", "projects");
 
 /** Path of a local Claude session transcript file. */
@@ -28,10 +30,32 @@ export function claudeSessionFile(cwd, sessionId, baseDir = DEFAULT_BASE) {
   return join(baseDir, encoded, `${sessionId}.jsonl`);
 }
 
+/** Last `bridge-session` marker's bridgeSessionId in `text`, or null. */
+function lastMarker(text) {
+  let found = null;
+  for (const line of text.split("\n")) {
+    if (!line.includes("bridge-session")) continue;
+    try {
+      const j = JSON.parse(line);
+      if (j.type === "bridge-session" && typeof j.bridgeSessionId === "string") {
+        found = j.bridgeSessionId;
+      }
+    } catch {
+      /* truncated line at a window boundary — ignore */
+    }
+  }
+  return found;
+}
+
 /**
- * Read the head of a local session file and return the RC `bridgeSessionId`
- * (cse_…) it belongs to, or null if the file is a plain local session /
- * missing.
+ * Return the RC `bridgeSessionId` (cse_…) a local session file belongs to,
+ * or null if the file is a plain local session / missing.
+ *
+ * The CLI re-writes the marker whenever its RC connection is (re)established,
+ * with a NEW cse_ id after a reconnect — so the id near the head can be stale
+ * (observed: 1513 markers for an old cse_ id, then 28 for the live one). The
+ * tail window is checked first (latest marker wins); the head is the fallback
+ * for sessions that wrote their only marker at start.
  */
 export function findBridgeSessionId(cwd, sessionId, baseDir = DEFAULT_BASE) {
   let fd;
@@ -41,21 +65,16 @@ export function findBridgeSessionId(cwd, sessionId, baseDir = DEFAULT_BASE) {
     return null; // no transcript file
   }
   try {
-    const buf = Buffer.alloc(HEAD_BYTES);
-    const n = readSync(fd, buf, 0, buf.length, 0);
-    const head = buf.subarray(0, n).toString("utf8");
-    for (const line of head.split("\n")) {
-      if (!line.includes("bridge-session")) continue;
-      try {
-        const j = JSON.parse(line);
-        if (j.type === "bridge-session" && typeof j.bridgeSessionId === "string") {
-          return j.bridgeSessionId;
-        }
-      } catch {
-        /* truncated line at the head boundary — ignore */
-      }
-    }
-    return null;
+    const size = fstatSync(fd).size;
+    const read = (pos, len) => {
+      const buf = Buffer.alloc(len);
+      const n = readSync(fd, buf, 0, len, pos);
+      return buf.subarray(0, n).toString("utf8");
+    };
+    const tailLen = Math.min(TAIL_BYTES, size);
+    const fromTail = lastMarker(read(size - tailLen, tailLen));
+    if (fromTail || size <= tailLen) return fromTail;
+    return lastMarker(read(0, Math.min(HEAD_BYTES, size)));
   } catch {
     return null;
   } finally {
