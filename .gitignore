@@ -2,3 +2,4 @@ node_modules/
 *.log
 even-bridge-*.log
 .DS_Store
+.achilles/
