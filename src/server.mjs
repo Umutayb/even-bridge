@@ -97,6 +97,22 @@ export async function startServer({ flags = {}, cwd } = {}) {
   const ccProvider =
     process.env.EVEN_BRIDGE_CC_DISABLED === "1" ? null : createCcLocalProvider(emit, { hub });
 
+  // Self-heal the dist patch (CC permission-mode env override) on every start.
+  // Idempotent + no-op when already applied, so a reboot or an `npm update` that
+  // refreshed node_modules can't leave the official CC permission behavior stale.
+  try {
+    const { execFileSync } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, join } = await import("node:path");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const out = execFileSync(process.execPath, [join(here, "..", "scripts", "patch-dist.mjs")], {
+      encoding: "utf8", timeout: 15000,
+    }).trim();
+    if (out) console.log(`[bridge] ${out.split("\n").pop()}`);
+  } catch (err) {
+    console.warn(`[bridge] patch-dist self-heal skipped: ${err.message}`);
+  }
+
   console.log(
     `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}`
   );

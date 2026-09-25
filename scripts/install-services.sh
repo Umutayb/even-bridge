@@ -107,6 +107,11 @@ if [ ! -d "$EVEN_BRIDGE_DIR/node_modules" ]; then
 else
   note "node_modules present in $EVEN_BRIDGE_DIR"
 fi
+# Re-apply the idempotent dist patch (CC permission-mode env override). Runs on
+# every install so an `npm update`/reinstall that refreshed node_modules can't
+# silently drop it. No-op when already applied.
+su -s /bin/bash "$HOST_USER" -c "cd '$EVEN_BRIDGE_DIR' && node scripts/patch-dist.mjs" 2>/dev/null || {
+  warn "patch-dist.mjs could not run — the CC permission-mode patch may be missing"; }
 
 # ── 3. token env file (systemd passes it to the service; kept out of ps) ─────
 say "token env file: $TOKEN_ENV_FILE"
