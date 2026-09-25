@@ -12,10 +12,11 @@
 # resumes the NEWEST pi conversation of the target cwd (the standing
 # "assistant" session); with no conversation yet it starts a fresh one.
 #
-# Tunables (env): EVEN_PI_CWD, EVEN_PI_TMUX_SESSION, EVEN_PI_AGENT_DIR.
+# Tunables (env): EVEN_PI_CWD, EVEN_PI_TMUX_SESSION, EVEN_PI_AGENT_DIR,
+# EVEN_PI_PATH.
 set -eu
 
-CWD="${EVEN_PI_CWD:-/home/ay/github}"
+CWD="${EVEN_PI_CWD:-$HOME/github}"
 SESSION_NAME="${EVEN_PI_TMUX_SESSION:-even}"
 AGENT_DIR="${EVEN_PI_AGENT_DIR:-$HOME/.pi/agent/sessions}"
 
@@ -53,8 +54,9 @@ if [ -d "$AGENT_DIR/$enc" ]; then
   latest=$(ls -1t "$AGENT_DIR/$enc"/*.jsonl 2>/dev/null | head -n 1 || true)
 fi
 
-# PATH for the pane's shell: pi lives on the nvm node's bin dir.
-PANE_PATH="/home/ay/.local/bin:/home/ay/.nvm/versions/node/v26.7.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# PATH for the pane's shell: pi lives on the nvm node's bin dir, which the
+# even-pi-tmux unit (install-services.sh) already puts on our own PATH.
+PANE_PATH="${EVEN_PI_PATH:-$PATH}"
 
 # Model auth: pi's models.json lets-code provider needs $LETS_CODE_TOKEN (any
 # non-empty value; the endpoint does not validate keys) or pi hangs before its

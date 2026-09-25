@@ -18,11 +18,13 @@
 #
 # Env overrides:
 #   HOST_USER        user the services run as          (default: the sudo caller)
+#   HOME_DIR         that user's home                  (default: from the passwd db)
 #   EVEN_BRIDGE_DIR  even-bridge checkout              (default: this repo)
 #   NODE_BIN         node binary for the units         (default: newest nvm node)
 #   TOKEN_ENV_FILE   token file for systemd            (default: /etc/even-terminal.env)
 #   RC_BRIDGE_BIN    RC bridge binary                  (default: ~/.local/bin/claude-remote-terminal-bridge)
 #   RC_BRIDGE_PORT   RC bridge port                    (default: 8790)
+#   PI_BIN           pi binary for the tmux pane       (default: found on the user's PATH)
 #   EVEN_PI_CWD      project dir the persistent tmux pi runs in (default: ~/github)
 #   EVEN_PI_TMUX_SESSION  tmux session name            (default: even)
 #   KEEP_OFFICIAL=1  do not disable the old official even-terminal.service
@@ -37,7 +39,8 @@ fi
 
 HOST_USER="${HOST_USER:-${SUDO_USER:-root}}"
 [ "$HOST_USER" = "root" ] && HOST_USER="$(whoami)"
-HOME_DIR="${HOME_DIR:-/home/$HOST_USER}"
+HOME_DIR="${HOME_DIR:-$(getent passwd "$HOST_USER" | cut -d: -f6)}"
+[ -n "$HOME_DIR" ] || { echo "cannot resolve the home dir of $HOST_USER (set HOME_DIR)" >&2; exit 1; }
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EVEN_BRIDGE_DIR="${EVEN_BRIDGE_DIR:-$REPO_DIR}"
 TOKEN_ENV_FILE="${TOKEN_ENV_FILE:-/etc/even-terminal.env}"
@@ -71,6 +74,30 @@ fi
 NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 18 ] || warn "node major $NODE_MAJOR < 18 (even-bridge needs >= 18)"
 note "node: $NODE_BIN ($("$NODE_BIN" --version 2>/dev/null))"
+
+# pi (the terminal agent) may live anywhere the user installed it: next to
+# nvm's node, ~/.local/bin, a custom npm prefix... Ask the user's login shell.
+PI_BIN="${PI_BIN:-}"
+if [ -z "$PI_BIN" ] && [ -x "$(dirname "$NODE_BIN")/pi" ]; then
+  PI_BIN="$(dirname "$NODE_BIN")/pi"
+fi
+if [ -z "$PI_BIN" ]; then
+  PI_BIN="$(su -l -s /bin/bash "$HOST_USER" -c 'command -v pi' 2>/dev/null | tail -1 || true)"
+fi
+if [ -n "$PI_BIN" ] && [ -x "$PI_BIN" ]; then
+  note "pi: $PI_BIN"
+else
+  warn "pi not found on $HOST_USER's PATH (set PI_BIN=/path/to/pi) — the tmux pi surface will not start"
+  PI_BIN=""
+fi
+
+# PATH baked into the units: user bins, node's dir (non-interactive systemd
+# shells otherwise get an EOL /usr/bin/node), pi's dir, then the system dirs.
+UNIT_PATH="$HOME_DIR/.local/bin:$(dirname "$NODE_BIN")"
+if [ -n "$PI_BIN" ]; then
+  case ":$UNIT_PATH:" in *":$(dirname "$PI_BIN"):"*) ;; *) UNIT_PATH="$UNIT_PATH:$(dirname "$PI_BIN")" ;; esac
+fi
+UNIT_PATH="$UNIT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # ── 2. even-bridge dependencies ──────────────────────────────────────────────
 if [ ! -d "$EVEN_BRIDGE_DIR/node_modules" ]; then
@@ -158,7 +185,7 @@ WorkingDirectory=$HOME_DIR
 # nvm's node is pinned by full path: non-interactive systemd shells otherwise get
 # the EOL /usr/bin/node. Update both paths if the nvm default version changes.
 Environment=HOME=$HOME_DIR
-Environment=PATH=$HOME_DIR/.local/bin:$("$NODE_BIN" -e 'console.log(require("path").dirname(process.execPath))'):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$UNIT_PATH
 EnvironmentFile=$TOKEN_ENV_FILE
 
 ExecStart=$NODE_BIN \
@@ -255,7 +282,7 @@ User=$HOST_USER
 Group=$HOST_USER
 Environment=HOME=$HOME_DIR
 Environment=EVEN_PI_CWD=${EVEN_PI_CWD:-$HOME_DIR/github}
-Environment=PATH=$HOME_DIR/.local/bin:$("$NODE_BIN" -e 'console.log(require("path").dirname(process.execPath))'):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$UNIT_PATH
 # pi's lets-code provider needs $LETS_CODE_TOKEN (any non-empty value) or it
 # hangs before the first model call; the script passes it into the pane (-e).
 EnvironmentFile=-$TOKEN_ENV_FILE

@@ -74,7 +74,7 @@ stack — idempotent, safe to re-run:
 
 ```sh
 sudo scripts/install-services.sh
-# overrides: HOST_USER, EVEN_BRIDGE_DIR, NODE_BIN, TOKEN_ENV_FILE,
+# overrides: HOST_USER, HOME_DIR, EVEN_BRIDGE_DIR, NODE_BIN, PI_BIN, TOKEN_ENV_FILE,
 #            RC_BRIDGE_BIN, RC_BRIDGE_PORT, KEEP_OFFICIAL,
 #            EVEN_PI_CWD, EVEN_PI_TMUX_SESSION
 ```

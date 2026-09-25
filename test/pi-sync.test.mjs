@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, appendFile, symlink, chmod } from "node:fs/promises";
-import { readdirSync, statSync, utimesSync } from "node:fs";
+import { mkdtempSync, readdirSync, realpathSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -16,6 +16,10 @@ import { findExternalPi, findPiTmuxPane, tmuxDeliver } from "../src/providers/pi
 
 const require = createRequire(import.meta.url);
 const getMessages = require("@evenrealities/even-terminal/dist/routes/events.js").getMessages;
+
+// Project cwd the fake pi processes "run in". It must exist on disk: the
+// provider spawns its own pi with this as the working directory.
+const PROJECT = realpathSync(mkdtempSync(join(tmpdir(), "evenbridge-pi-project-")));
 
 async function tmp() {
   return mkdtemp(join(tmpdir(), "evenbridge-pi-sync-"));
@@ -102,9 +106,9 @@ function collectEmit() {
 
 test("findExternalPi finds pi processes by cwd", async () => {
   const dir = await tmp();
-  const proc = await makeProcRoot(dir, 4242, "/home/ay/github");
-  const hit = await findExternalPi("/home/ay/github", { procRoot: proc, myPid: 1 });
-  assert.deepEqual(hit, [{ pid: 4242, cwd: "/home/ay/github" }]);
+  const proc = await makeProcRoot(dir, 4242, PROJECT);
+  const hit = await findExternalPi(PROJECT, { procRoot: proc, myPid: 1 });
+  assert.deepEqual(hit, [{ pid: 4242, cwd: PROJECT }]);
   const miss = await findExternalPi("/other/cwd", { procRoot: proc, myPid: 1 });
   assert.deepEqual(miss, []);
 });
@@ -113,10 +117,10 @@ test("findExternalPi ignores a STOPPED (Ctrl+Z) pi — a zombie can't drive a se
   const dir = await tmp();
   const proc = join(dir, "proc");
   // one live + one stopped pi in the same cwd (the observed zombie case)
-  await makeProcRoot(dir, 4242, "/home/ay/github", { state: "S" });
-  await makeProcRoot(dir, 4243, "/home/ay/github", { state: "T" });
-  const hit = await findExternalPi("/home/ay/github", { procRoot: proc, myPid: 1 });
-  assert.deepEqual(hit, [{ pid: 4242, cwd: "/home/ay/github" }], "stopped pi must not count as the external driver");
+  await makeProcRoot(dir, 4242, PROJECT, { state: "S" });
+  await makeProcRoot(dir, 4243, PROJECT, { state: "T" });
+  const hit = await findExternalPi(PROJECT, { procRoot: proc, myPid: 1 });
+  assert.deepEqual(hit, [{ pid: 4242, cwd: PROJECT }], "stopped pi must not count as the external driver");
 });
 
 // ── detect: tmux pane lookup + delivery ─────────────────────────────────────
@@ -124,11 +128,11 @@ test("findExternalPi ignores a STOPPED (Ctrl+Z) pi — a zombie can't drive a se
 test("findPiTmuxPane matches command+path; tmuxDeliver sends keys", async () => {
   const dir = await tmp();
   const { bin } = await makeFakeTmux(dir, [
-    { session: "s1", pane: "%1", command: "vi", path: "/home/ay/github" },
-    { session: "s2", pane: "%2", command: "pi", path: "/home/ay/github" },
+    { session: "s1", pane: "%1", command: "vi", path: PROJECT },
+    { session: "s2", pane: "%2", command: "pi", path: PROJECT },
     { session: "s3", pane: "%3", command: "pi", path: "/elsewhere" },
   ]);
-  const pane = await findPiTmuxPane("/home/ay/github", { tmuxBin: bin });
+  const pane = await findPiTmuxPane(PROJECT, { tmuxBin: bin });
   assert.equal(pane, "%2");
 
   await tmuxDeliver("%2", "hello glasses", { tmuxBin: bin });
@@ -154,7 +158,7 @@ test("watcher delivers new transcript entries once, dedupes by id, skips healthy
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const id = "aaaa1111-2222-3333-4444-555566667777";
-  const file = await makeSessionFile(agentDir, "/home/ay/github", id, [
+  const file = await makeSessionFile(agentDir, PROJECT, id, [
     msgEntry("e1", "user", [{ type: "text", text: "first from terminal" }]),
   ]);
 
@@ -211,7 +215,7 @@ test("watcher skips healthy sessions (events already flow over RPC)", async () =
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const id = "bbbb1111-2222-3333-4444-555566667777";
-  const file = await makeSessionFile(agentDir, "/home/ay/github", id, [
+  const file = await makeSessionFile(agentDir, PROJECT, id, [
     msgEntry("e1", "user", [{ type: "text", text: "x" }]),
   ]);
   const emit = collectEmit();
@@ -233,7 +237,7 @@ test("watcher delivers tool results across ticks (persistent toolCall bookkeepin
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const id = "00011111-2222-3333-4444-555566667777";
-  const file = await makeSessionFile(agentDir, "/home/ay/github", id, [
+  const file = await makeSessionFile(agentDir, PROJECT, id, [
     // assistant message with a toolCall lands in the baseline (not delivered)
     msgEntry("e1", "assistant", [
       { type: "text", text: "doing it" },
@@ -278,12 +282,12 @@ test("prompt routes to tmux when an external terminal pi drives the session", as
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const id = "cccc1111-2222-3333-4444-555566667777";
-  await makeSessionFile(agentDir, "/home/ay/github", id, [
+  await makeSessionFile(agentDir, PROJECT, id, [
     msgEntry("e1", "user", [{ type: "text", text: "hello" }]),
   ]);
 
   const emitted = collectEmit();
-  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: PROJECT }]);
   const delivered = [];
   let stopped = 0;
 
@@ -321,7 +325,7 @@ test("prompt reports clearly when external pi is not in tmux (no wedged spawn)",
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const id = "dddd1111-2222-3333-4444-555566667777";
-  await makeSessionFile(agentDir, "/home/ay/github", id, [
+  await makeSessionFile(agentDir, PROJECT, id, [
     msgEntry("e1", "user", [{ type: "text", text: "hello" }]),
   ]);
 
@@ -341,7 +345,7 @@ test("prompt spawns/resumes its own instance when no external driver exists", as
   const agentDir = join(dir, "agent");
   const id = "eeee1111-2222-3333-4444-555566667777";
   const fakeSid = "ffff1111-2222-3333-4444-555566667777";
-  await makeSessionFile(agentDir, "/home/ay/github", id, [
+  await makeSessionFile(agentDir, PROJECT, id, [
     msgEntry("e1", "user", [{ type: "text", text: "hello" }]),
   ]);
   const fakePi = await makeFakePi(dir, fakeSid);
@@ -368,7 +372,7 @@ test("prompt spawns/resumes its own instance when no external driver exists", as
 
 test("prompt for a non-newest session in an external driver's cwd spawns its own instance", async () => {
   // The 12:44 collision: an external terminal pi drives the FRESHEST
-  // conversation in /home/ay/github ("this" session); a prompt to a DIFFERENT
+  // conversation in the project cwd ("this" session); a prompt to a DIFFERENT
   // session in the same cwd must NOT be injected into the terminal — the
   // bridge drives its own instance for it (distinct transcripts are safe).
   const dir = await tmp();
@@ -376,10 +380,10 @@ test("prompt for a non-newest session in an external driver's cwd spawns its own
   const mine = "aaaa1111-2222-3333-4444-555566660000"; // external pi's conversation
   const theirs = "bbbb1111-2222-3333-4444-555566660000"; // the prompted (older) session
   const fakeSid = "ffff1111-2222-3333-4444-555566667777";
-  const myFile = await makeSessionFile(agentDir, "/home/ay/github", mine, [
+  const myFile = await makeSessionFile(agentDir, PROJECT, mine, [
     msgEntry("e1", "user", [{ type: "text", text: "terminal convo" }]),
   ]);
-  const theirFile = await makeSessionFile(agentDir, "/home/ay/github", theirs, [
+  const theirFile = await makeSessionFile(agentDir, PROJECT, theirs, [
     msgEntry("e2", "user", [{ type: "text", text: "phone convo" }]),
   ]);
   // The terminal pi is actively writing `mine` -> it is the freshest file.
@@ -388,7 +392,7 @@ test("prompt for a non-newest session in an external driver's cwd spawns its own
   utimesSync(myFile, now, now);
 
   const fakePi = await makeFakePi(dir, fakeSid);
-  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: PROJECT }]);
   const delivered = [];
   const emitted = collectEmit();
   const provider = createPiProxy({ emitted, agentDir, tmux, delivered, bin: fakePi });
@@ -405,24 +409,24 @@ test("prompt for a non-newest session in an external driver's cwd spawns its own
 });
 
 test("pane screen content identifies the conversation the terminal drives (beats mtime)", async () => {
-  // Two sessions share /home/ay/github. The prompted (older) one is what the
+  // Two sessions share the project cwd. The prompted (older) one is what the
   // terminal TUI is actually SHOWING on screen — so route to the pane even
   // though mtime would say the other conversation is fresher.
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const other = "cccc1111-2222-3333-4444-555566669999"; // fresher on disk
   const target = "cccc1111-2222-3333-4444-555566668888"; // on screen (older file)
-  const otherFile = await makeSessionFile(agentDir, "/home/ay/github", other, [
+  const otherFile = await makeSessionFile(agentDir, PROJECT, other, [
     msgEntry("e1", "user", [{ type: "text", text: "some other recent conversation text" }]),
   ]);
-  const targetFile = await makeSessionFile(agentDir, "/home/ay/github", target, [
+  const targetFile = await makeSessionFile(agentDir, PROJECT, target, [
     msgEntry("e2", "user", [{ type: "text", text: "the conversation the terminal shows right now" }]),
   ]);
   const now = Date.now() / 1000;
   utimesSync(targetFile, now - 3600, now - 3600);
   utimesSync(otherFile, now, now);
 
-  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: PROJECT }]);
   const delivered = [];
   const emitted = collectEmit();
   // The screen shows the TARGET session's recent prompt text.
@@ -445,15 +449,15 @@ test("pane clearly showing a sibling conversation -> spawn own instance for the 
   const sibling = "dddd1111-2222-3333-4444-555566669999"; // on screen
   const target = "dddd1111-2222-3333-4444-555566668888"; // prompted (not on screen)
   const fakeSid = "ffff1111-2222-3333-4444-555566661111";
-  await makeSessionFile(agentDir, "/home/ay/github", sibling, [
+  await makeSessionFile(agentDir, PROJECT, sibling, [
     msgEntry("e1", "user", [{ type: "text", text: "sibling conversation visible on the screen here" }]),
   ]);
-  await makeSessionFile(agentDir, "/home/ay/github", target, [
+  await makeSessionFile(agentDir, PROJECT, target, [
     msgEntry("e2", "user", [{ type: "text", text: "the prompted conversation that is NOT on screen" }]),
   ]);
 
   const fakePi = await makeFakePi(dir, fakeSid);
-  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: "/home/ay/github" }]);
+  const tmux = await makeFakeTmux(dir, [{ session: "t", pane: "%9", command: "pi", path: PROJECT }]);
   const delivered = [];
   const emitted = collectEmit();
   const provider = createPiProxy({
@@ -479,7 +483,7 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
     bin,
     externalProbe:
       external ??
-      (async () => [{ pid: 4242, cwd: "/home/ay/github" }]), // default: external driver alive
+      (async () => [{ pid: 4242, cwd: PROJECT }]), // default: external driver alive
     tmuxPaneProbe: async (cwd) => findPiTmuxPane(cwd, { tmuxBin: tmux.bin }),
     tmuxDeliver: async (pane, text) => {
       delivered.push(pane, text);
@@ -510,7 +514,7 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
   };
   const provider = createPiProvider(
     (sid, msg) => emitted(sid, msg),
-    { hub: { clientCount: () => 1 }, pi, cwd: "/home/ay/github", defaultCwd: "/home/ay/github" }
+    { hub: { clientCount: () => 1 }, pi, cwd: PROJECT, defaultCwd: PROJECT }
   );
   if (wedged && wedgedId) provider._sessions.set(wedgedId, wedged);
   return provider;
@@ -522,11 +526,11 @@ test("tmux-delivered prompt is echoed once — the terminal's on-disk copy is sk
   const dir = await tmp();
   const agentDir = join(dir, "agent");
   const id = "eeee1111-2222-3333-4444-555566667777";
-  const file = await makeSessionFile(agentDir, "/home/ay/github", id, [
+  const file = await makeSessionFile(agentDir, PROJECT, id, [
     msgEntry("e1", "user", [{ type: "text", text: "prompt visible on the pane screen" }]),
   ]);
   const tmux = await makeFakeTmux(dir, [
-    { session: "t", pane: "%9", command: "pi", path: "/home/ay/github" },
+    { session: "t", pane: "%9", command: "pi", path: PROJECT },
   ]);
   const delivered = [];
   const emitted = collectEmit();
