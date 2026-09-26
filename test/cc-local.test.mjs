@@ -296,7 +296,8 @@ test("cc-local ownership is per conversation, not per cwd", async (t) => {
     { pid: 301, sessionId: "cc-111", cwd: "/proj/cc", status: "busy" },
     { pid: 302, sessionId: "cc-444", cwd: "/proj/cc", status: "idle" },
   ]);
-  const prov = createCcLocalProvider(() => {}, {
+  const frames = [];
+  const prov = createCcLocalProvider((sid, m) => frames.push([sid, m]), {
     base,
     procRoot,
     sessionsDir,
@@ -309,9 +310,20 @@ test("cc-local ownership is per conversation, not per cwd", async (t) => {
 
   // Nobody drives cc-333: the official router resumes it (no false 409).
   assert.deepEqual(await prov.prompt("cc-333", "hi"), { passThrough: true });
-  // Owned sessions stay single-writer: no reachable pane -> 409.
-  await assert.rejects(prov.prompt("cc-111", "hi"), (e) => e.statusCode === 409 && /pid 301/.test(e.message));
-  await assert.rejects(prov.prompt("cc-444", "hi"), (e) => e.statusCode === 409 && /pid 302/.test(e.message));
+  // Owned sessions stay single-writer: no reachable pane -> NOT delivered,
+  // but never silently: the glasses drop HTTP errors, so the refusal is
+  // told in the session's own stream (echo + error), like pi's BLOCKED path.
+  assert.deepEqual(await prov.prompt("cc-111", "hi"), { sessionId: "cc-111", provider: "claude", blocked: true });
+  const f111 = frames.filter(([sid]) => sid === "cc-111").map(([, m]) => m);
+  assert.equal(f111[0].text, "driven", "history seeded first");
+  const [echo, err] = f111.slice(-2);
+  assert.deepEqual(echo, { type: "user_prompt", text: "hi" });
+  assert.equal(err.type, "error");
+  assert.match(err.message, /NOT delivered/);
+  assert.match(err.message, /pid 301/);
+  assert.match(err.message, /\/remote-control/);
+  assert.equal((await prov.prompt("cc-444", "yo")).blocked, true);
+  assert.match(frames.at(-1)[1].message, /pid 302/);
   assert.deepEqual(await prov.interrupt("cc-333"), { ok: true });
 });
 
@@ -340,7 +352,7 @@ test("watcher baseline = end of the seeded window (no frame duplication)", async
 });
 
 // ── ext-router integration ──────────────────────────────────────────────────
-test("ext router: disk CC rows in /sessions, prompt guard 409 + pass-through", async (t) => {
+test("ext router: disk CC rows in /sessions, prompt guard (in-stream refusal) + pass-through", async (t) => {
   const base = makeBase(t);
   writeCcSession(base, "/proj/cc", "cc-111", { title: "cc local", prompts: ["original prompt"] });
   writeCcSession(base, "/proj/other", "cc-222", { prompts: ["other prompt"] });
@@ -402,14 +414,22 @@ test("ext router: disk CC rows in /sessions, prompt guard 409 + pass-through", a
   assert.equal(rows["cc-111"].status, "busy"); // external claude in its cwd
   assert.equal(rows["cc-222"].status, "busy"); // freshly written transcript
 
-  // /prompt to the externally-driven session -> 409 (no reachable tmux pane).
+  // /prompt to the externally-driven session -> refused in-stream (no
+  // reachable tmux pane): 202 so the phone keeps the session open and
+  // shows the echo + error frame; nothing is spawned.
   r = await fetch(`${baseUrl}/api/prompt`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sessionId: "cc-111", text: "hello cc" }),
   });
-  assert.equal(r.status, 409);
-  assert.match((await r.json()).error, /terminal the bridge can't reach/);
+  assert.equal(r.status, 202);
+  assert.equal((await r.json()).sessionId, "cc-111");
+  assert.ok(!fellThrough.some((p) => p.includes("/prompt")), "no pass-through spawn");
+  const errs = getMessages("cc-111", 0).filter((m) => m.type === "error");
+  assert.match(errs.at(-1).message, /NOT delivered/);
+  const ring = getMessages("cc-111", 0);
+  assert.equal(ring[0].type, "user_prompt", "transcript seeded BEFORE the refusal frames");
+  assert.equal(ring[0].text, "original prompt");
 
   // /prompt to the idle session -> passes through to the official router.
   r = await fetch(`${baseUrl}/api/prompt`, {

@@ -164,7 +164,8 @@ export function createCcLocalProvider(
      *    unknown, this session's cwd + reachable tmux pane
      *    (screen shows this conversation, or it's the newest in the cwd)
      *    -> deliver into the pane (same session, one writer)
-     *  - external claude alive but unreachable -> 409 (never double-drive)
+     *  - external claude alive but unreachable -> NOT delivered (never
+     *    double-drive), told in the session stream: echo + error frame
      *  - nothing external -> pass through to the official router, which
      *    owns spawn/resume of bridge-launched/dead sessions
      */
@@ -197,13 +198,26 @@ export function createCcLocalProvider(
             return { sessionId, provider: "claude" };
           }
         }
-        const err = new Error(
-          `That session is running in a terminal the bridge can't reach ` +
-            `(claude pid ${external[0].pid}, cwd ${meta.cwd}). Reply in that terminal — or put it in ` +
-            `a tmux pane — instead of driving it twice.`
-        );
-        err.statusCode = 409;
-        throw err;
+        // Refuse to double-drive — but tell it IN the session stream. The
+        // glasses silently drop HTTP errors, so a bare 409 made these
+        // messages vanish with no reply and no error (09-26: 5 lost prompts).
+        // Same shape as pi's BLOCKED path: echo + error frame, 202.
+        const pid = external[0].pid;
+        log?.(`[bridge] cc-local prompt BLOCKED (claude pid ${pid} not in tmux, cwd ${meta.cwd}) text=${JSON.stringify(text)}`);
+        console.log(`[bridge] prompt -> BLOCKED (external claude pid ${pid} in non-tmux terminal) session=${sessionId} text=${JSON.stringify(text)}`);
+        // Seed first: seeding only runs on an EMPTY ring, so frames emitted
+        // before it would leave the session showing just this error.
+        await this.seedTranscript(sessionId);
+        emit(sessionId, { type: "user_prompt", text });
+        emit(sessionId, {
+          type: "error",
+          message:
+            `Message NOT delivered: this Claude session is open in a terminal the bridge can't reach ` +
+            `(claude pid ${pid}, ${meta.cwd}), and it won't run the conversation twice. Type ` +
+            `/remote-control in that terminal to reach it from the glasses (or reply there). ` +
+            `For new sessions: scripts/onboard.sh sets this up.`,
+        });
+        return { sessionId, provider: "claude", blocked: true };
       }
       // Not externally driven: the official router is the single writer.
       // Stop our watcher first so frames can't double once it spawns.
