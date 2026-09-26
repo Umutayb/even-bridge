@@ -42,9 +42,43 @@ to the official code paths unchanged — no `node_modules` patching.
 
 ## Install & setup
 
+**First time: run the onboarding flow** (as your user, not sudo):
+
 ```sh
 git clone <this repo> even-bridge
 cd even-bridge
+scripts/onboard.sh          # prerequisites, config, Claude wrap choice, services, pairing
+```
+
+It walks through five steps: prerequisite checks (node required; claude,
+pi, tmux explained), the bridge config, **how terminal Claude sessions are
+reached from the glasses**, the system services (`sudo
+scripts/install-services.sh`), and pairing. Non-interactive: `--yes`
+(plus `EVEN_CLAUDE_WRAP=rc|tmux|none`, default `rc`), `--no-services`.
+
+### Reaching terminal Claude sessions (the Claude wrap)
+
+The bridge can only deliver a glasses message into a terminal `claude`
+session it can reach — it never runs one conversation twice. Onboarding
+offers three modes (a shell **function** sourced from `~/.bashrc` /
+`~/.zshrc`, so IDEs, scripts, the bridge and the RC fork keep calling the
+real binary; installed by `scripts/setup-claude-wrap.sh`):
+
+| mode | new interactive `claude` sessions… | trade-off |
+|---|---|---|
+| `rc` (default) | start with `--remote-control` | needs a claude.ai login + an org allowing Remote Control; every session is registered with claude.ai (and drivable from there) |
+| `tmux` | start inside their own tmux session | no claude.ai needed; tmux keybindings/scrollback in every session |
+| `none` | are left alone | glasses messages to them are **not delivered** — the glasses show a "not delivered" notice (run `/remote-control` in that session to fix it) |
+
+Passes straight through: `-p/--print`, `-h`, `--version`, subcommands
+(`mcp`, `update`, `doctor`, …), an explicit `--remote-control`, non-TTY
+use, and (tmux mode) shells already inside tmux. Skip it for one call with
+`EVEN_CLAUDE_WRAP=off claude` or `command claude`; switch or remove it
+with `scripts/setup-claude-wrap.sh rc|tmux|none`.
+
+**Manual setup** (what onboarding automates):
+
+```sh
 npm install                 # also rebuilds node-pty for the official package
 
 even-bridge init            # create ~/.even-terminal/config.json (defaults)
@@ -322,8 +356,11 @@ sessions, mirroring the pi architecture (`src/cc-local.mjs` provider +
     session in the cwd) → the prompt is delivered into the pane with
     `tmux send-keys`; the terminal CC processes it and the watcher streams
     the reply back;
-  - terminal `claude` alive but unreachable → a clear **409** ("running in
-    a terminal the bridge can't reach — reply there or put it in tmux");
+  - terminal `claude` alive but unreachable → **not delivered**, told in
+    the session stream (echo + "Message NOT delivered … type
+    /remote-control in that terminal" error frame, HTTP 202). A bare 409
+    was silently dropped by the glasses — messages vanished with no reply;
+    refused prompts are also logged with their text;
   - nothing external → pass-through to the official router, which owns
     spawn/resume for dead or officially-launched sessions (and the bridge
     stops its watcher at that point so frames can't double).
@@ -360,6 +397,9 @@ src/providers/pi/            vendored pi provider (MIT — see NOTICE.md)
   provider.mjs               pi provider (owns sessions, probes from disk)
   detect.mjs                 /proc + tmux detection (pi & local CC)
 test/                        node:test suites (hermetic, no real provider state)
+scripts/onboard.sh           first-time onboarding flow (run as the user)
+scripts/setup-claude-wrap.sh install/switch/remove the claude shell wrapper
+scripts/claude-wrap.sh       the wrapper itself (rc | tmux | none)
 scripts/check-upstream.mjs   asserts the official dist exports we rely on
 scripts/smoke-import.mjs     imports every module (catches bad import paths)
 ```
