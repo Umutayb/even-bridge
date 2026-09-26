@@ -171,9 +171,12 @@ export function listSessionFiles(limit, cwd, agentDir) {
  * driver's cwd is the best disk-level signal of which conversation that
  * driver is actually running.
  *
+ * `skip(id, mtimeMs)` drops files whose freshness is explained by someone
+ * else (the provider passes "our own bridge child wrote it").
+ *
  * @returns {{ file: string, id: string, mtimeMs: number } | null}
  */
-export function newestSessionForCwd(cwd, agentDir) {
+export function newestSessionForCwd(cwd, agentDir, skip = () => false) {
   if (!cwd) return null;
   const dir = join(sessionsRoot(agentDir), encodeCwdDir(cwd));
   let names;
@@ -192,9 +195,9 @@ export function newestSessionForCwd(cwd, agentDir) {
     } catch {
       continue;
     }
-    if (!best || st.mtimeMs > best.mtimeMs) {
-      best = { file: p, id: n.slice(n.lastIndexOf("_") + 1, -6), mtimeMs: st.mtimeMs };
-    }
+    const id = n.slice(n.lastIndexOf("_") + 1, -6);
+    if (skip(id, st.mtimeMs)) continue;
+    if (!best || st.mtimeMs > best.mtimeMs) best = { file: p, id, mtimeMs: st.mtimeMs };
   }
   return best;
 }

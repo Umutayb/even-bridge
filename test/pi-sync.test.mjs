@@ -4,7 +4,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, appendFile, symlink, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, appendFile, symlink, chmod, utimes } from "node:fs/promises";
 import { mkdtempSync, readdirSync, realpathSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -476,6 +476,65 @@ test("pane clearly showing a sibling conversation -> spawn own instance for the 
   await provider.stopAll();
 });
 
+test("freshness our own child caused is not terminal ownership (no ping-pong into a sibling's pane)", async (t) => {
+  // Incident 09-26: a bridge-driven conversation X and the tmux terminal pi
+  // (driving sibling S) share a cwd; the pane screen was indeterminate (tool
+  // output). X was the newest transcript only because OUR child wrote it, so
+  // the mtime fallback handed every other prompt to the terminal — landing it
+  // in S. Half the user's messages silently went to the wrong conversation.
+  const dir = await tmp();
+  const agentDir = join(dir, "agent");
+  const sibling = "aaaa1111-2222-3333-4444-555566667777";
+  const x = "ffff1111-2222-3333-4444-555566667777"; // the fake pi reports this id
+  const old = new Date(Date.now() - 3600_000);
+  const sFile = await makeSessionFile(agentDir, PROJECT, sibling, [
+    msgEntry("s1", "user", [{ type: "text", text: "terminal conversation" }]),
+  ]);
+  await utimes(sFile, old, old);
+  const xFile = await makeSessionFile(agentDir, PROJECT, x, [
+    msgEntry("x1", "user", [{ type: "text", text: "phone conversation" }]),
+  ]);
+  await utimes(xFile, old, old);
+
+  const fakePi = await makeFakePi(dir, x);
+  const tmux = await makeFakeTmux(dir, [{ session: "even", pane: "%0", command: "pi", path: PROJECT }]);
+  const delivered = [];
+  let ext = [];
+  const provider = createPiProxy({
+    emitted: collectEmit(),
+    agentDir,
+    tmux,
+    delivered,
+    bin: fakePi,
+    external: async () => ext,
+    screen: null, // indeterminate: pi is showing tool output
+    recentInCwd: () => [x, sibling],
+  });
+
+  t.after(() => provider.stopAll());
+
+  // 1. No terminal yet: our child drives X and writes its transcript.
+  await provider.prompt(x, "first", undefined);
+  assert.equal(provider._sessions.has(x), true, "bridge child drives X");
+  const now = new Date();
+  await utimes(xFile, now, now);
+
+  // 2. The terminal pi (sibling S) is alive in the same cwd (the probe
+  //    cache from step 1 expires first — minutes passed in the incident).
+  ext = [{ pid: 5452, cwd: PROJECT }];
+  await new Promise((r) => setTimeout(r, 3100));
+  await provider.prompt(x, "second", undefined);
+  assert.deepEqual(delivered, [], "must NOT inject X's prompt into the sibling's pane");
+  assert.equal(provider._sessions.has(x), true, "our child stays X's writer");
+
+  // Control: the terminal writes X AFTER our child did -> it owns X now.
+  const later = new Date(Date.now() + 60_000);
+  await utimes(xFile, later, later);
+  await new Promise((r) => setTimeout(r, 3100));
+  await provider.prompt(x, "third", undefined);
+  assert.deepEqual(delivered, ["%0", "third"], "a terminal that took X over still gets it");
+});
+
 /** Provider with DI'd probes (external driver, tmux pane, tmux delivery). */
 function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, external, bin, screen, recentInCwd }) {
   const pi = {
@@ -493,7 +552,7 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
     recentInCwd: recentInCwd ?? (() => []),
     // Mirror the real "freshest transcript in the cwd" signal against the
     // tests' loose session-dir layout.
-    newestForCwd: (c) => {
+    newestForCwd: (c, skip = () => false) => {
       const dir = join(agentDir, "sessions", enc(c));
       let names;
       try {
@@ -505,9 +564,9 @@ function createPiProxy({ emitted, agentDir, tmux, delivered, wedged, wedgedId, e
       for (const n of names) {
         const p = join(dir, n);
         const st = statSync(p);
-        if (!best || st.mtimeMs > best.mtimeMs) {
-          best = { file: p, id: n.slice(n.lastIndexOf("_") + 1, -6), mtimeMs: st.mtimeMs };
-        }
+        const id = n.slice(n.lastIndexOf("_") + 1, -6);
+        if (skip(id, st.mtimeMs)) continue;
+        if (!best || st.mtimeMs > best.mtimeMs) best = { file: p, id, mtimeMs: st.mtimeMs };
       }
       return best;
     },

@@ -99,6 +99,20 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
     if (sid) lastEmitAt.set(sid, Date.now());
     emitRaw(sid, msg);
   }
+  /** sessionId -> ms of the last event OUR bridge child produced for it
+   *  (never the watcher/seed relaying someone else's writes). A transcript
+   *  whose mtime is within CHILD_WRITE_SLACK_MS of that was written by us —
+   *  its freshness is no evidence that a terminal pi is driving it. */
+  const childWroteAt = new Map();
+  const CHILD_WRITE_SLACK_MS = 5000;
+  function childEmit(sid, msg) {
+    if (sid) childWroteAt.set(sid, Date.now());
+    emit(sid, msg);
+  }
+  const freshnessIsOurs = (id, mtimeMs) => {
+    const t = childWroteAt.get(id);
+    return t != null && mtimeMs <= t + CHILD_WRITE_SLACK_MS;
+  };
   const sessions = new Map(); // sessionId -> PiSession
   const seeding = new Set(); // session ids whose transcript seed is in flight
   const liveByFile = new Map(); // resume file -> PiSession
@@ -110,7 +124,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
   const probeExternal = pi.externalProbe ?? findExternalPi;
   const probeTmuxPane = pi.tmuxPaneProbe ?? findPiTmuxPane;
   const deliverTmux = pi.tmuxDeliver ?? tmuxDeliver;
-  const newestForCwd = pi.newestForCwd ?? ((c) => newestSessionForCwd(c, cfg.agentDir));
+  const newestForCwd = pi.newestForCwd ?? ((c, skip) => newestSessionForCwd(c, cfg.agentDir, skip));
   const recentInCwd = pi.recentInCwd ?? ((c) => recentSessionsInCwd(c, cfg.agentDir));
   const paneScreen = pi.paneScreenProbe ?? ((pane) => capturePane(pane));
   const screenShows = pi.screenShowsProbe ?? screenShowsFragments;
@@ -120,7 +134,10 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
    * A cwd can host many pi sessions; the terminal drives one of them.
    * Ground truth = the pane's screen (the TUI shows its conversation's
    * recent messages); without a tmux pane, or when the screen is
-   * indeterminate, fall back to "freshest transcript in the cwd". Undecidable
+   * indeterminate, fall back to "freshest transcript in the cwd" — counting
+   * only freshness our own bridge children did NOT cause (else a transcript
+   * our child just wrote looks terminal-driven, and the next prompt is typed
+   * into a pane running a DIFFERENT conversation). Undecidable
    * -> no (injecting into a terminal that runs a DIFFERENT conversation is
    * the destructive case, so err safe).
    */
@@ -152,7 +169,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       }
     }
     try {
-      const newest = newestForCwd(cwd0);
+      const newest = newestForCwd(cwd0, freshnessIsOurs);
       return Boolean(newest && (newest.id === sessionId || newest.file === file));
     } catch {
       return false;
@@ -364,7 +381,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       let session = null;
       let file = null;
       const directEmit = (sid, msg) => {
-        if (sid) emit(sid, msg);
+        if (sid) childEmit(sid, msg);
       };
 
       if (sessionId) {
@@ -438,7 +455,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       // Buffer messages emitted before the id is known (PiSession.send uses
       // sessionId ?? ""); flush once the id is resolved.
       const pending = [];
-      session.emit = (sid, msg) => (sid ? emit(sid, msg) : pending.push(msg));
+      session.emit = (sid, msg) => (sid ? childEmit(sid, msg) : pending.push(msg));
 
       if (session.sessionId) noteLive(session, file);
 
@@ -451,7 +468,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
 
       const sid = session.sessionId ?? (await waitForId(session));
       if (sid) {
-        for (const m of pending.splice(0)) emit(sid, m);
+        for (const m of pending.splice(0)) childEmit(sid, m);
         noteLive(session, file);
       }
       return { sessionId: sid ?? "", provider: WIRE_PROVIDER };
