@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { EventEmitter } from "node:events";
-import { UpstreamPump } from "../src/upstream-pump.mjs";
+import { UpstreamPump, PumpManager } from "../src/upstream-pump.mjs";
 import { Hub } from "../src/hub.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 
@@ -156,5 +156,39 @@ test("pump ends (no reconnect) when the stream closes with no clients and idle",
   connections[0].res.end();
   await pump.stop();
   assert.equal(connections.length, 1, "no reopen when nobody is listening and the session is idle");
+  server.close();
+});
+
+// Regression (2026-09-27): _idleCheck / a clean END stopped the pump but the
+// manager kept the dead instance, so ensure() on the next /events handed it
+// back and the relay never restarted — replies only showed on refresh.
+test("PumpManager.ensure() replaces a pump that stopped itself", async () => {
+  const { server, connections, url } = await startUpstream([[{ id: 1, type: "status", state: "idle" }]]);
+  const hub = new Hub();
+  const sid = "rc-pump-5";
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "idle" });
+  const first = mgr.ensure(sid);
+  await waitFor(() => connections.length === 1);
+  await first.stop(); // what _idleCheck does after 600s with no clients
+  const second = mgr.ensure(sid);
+  assert.notEqual(second, first, "a stopped pump must not be reused");
+  await waitFor(() => connections.length === 2);
+  await mgr.stop(sid);
+  server.close();
+});
+
+test("PumpManager.ensure() replaces a pump whose loop ended", async () => {
+  const { server, connections, url } = await startUpstream([[{ id: 1, type: "status", state: "idle" }]]);
+  const hub = new Hub();
+  const sid = "rc-pump-6";
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "idle" });
+  const first = mgr.ensure(sid);
+  await waitFor(() => connections.length === 1);
+  connections[0].res.end(); // clean end, no clients, idle -> loop returns
+  await first.loopPromise;
+  const second = mgr.ensure(sid);
+  assert.notEqual(second, first, "an ended pump must not be reused");
+  await waitFor(() => connections.length === 2);
+  await mgr.stop(sid);
   server.close();
 });

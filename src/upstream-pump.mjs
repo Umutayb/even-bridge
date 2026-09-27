@@ -59,6 +59,12 @@ export class UpstreamPump {
     this.lastClientAt = 0;
     this.req = null;
     this.loopPromise = null;
+    this.ended = false; // loop returned (END path or stop()) — never restarts
+  }
+
+  /** A stopped/ended pump never relays again; the manager must replace it. */
+  get dead() {
+    return this.stopped || this.ended;
   }
 
   short() {
@@ -67,7 +73,9 @@ export class UpstreamPump {
 
   start() {
     if (!this.loopPromise) {
-      this.loopPromise = this._loop();
+      this.loopPromise = this._loop().finally(() => {
+        this.ended = true;
+      });
     }
     return this;
   }
@@ -255,12 +263,16 @@ export class PumpManager {
   }
 
   ensure(sessionId) {
-    let p = this.pumps.get(sessionId);
-    if (!p) {
-      p = new UpstreamPump(sessionId, this.opts).start();
-      this.pumps.set(sessionId, p);
-    }
-    return p;
+    const old = this.pumps.get(sessionId);
+    if (old && !old.dead) return old;
+    // A pump that stopped itself (_idleCheck, or the loop's clean END) stays
+    // in the map; handing it back would leave the session with no relay, so
+    // replies only appeared on refresh. Replace it, keeping the water mark so
+    // the upstream ring replay is not fed twice.
+    const p = new UpstreamPump(sessionId, this.opts);
+    if (old) p.lastUpstreamId = old.lastUpstreamId;
+    this.pumps.set(sessionId, p);
+    return p.start();
   }
 
   async stop(sessionId) {
