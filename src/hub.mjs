@@ -38,11 +38,28 @@
 // the in-process pi provider; both call hub.feed, which writes to the shared
 // ring (pushMessage) and to this session's live clients. The official
 // eventsRouter never sees these sessions, so there is no double delivery.
+//
+// Ring-tail catch-up: not every ring writer goes through hub.feed. A local CC
+// session the official pipeline launched/resumed (cc-local owns its /events
+// because its transcript is on disk) is written by the official
+// emitBridgeMessage -> pushMessage + the OFFICIAL broadcast, which only
+// reaches the official router's clients. Without catch-up the phone's hub
+// stream saw those frames only on reconnect replay — "replies don't appear
+// until I refresh the session". So every client keeps a lastSent ring id and
+// a short poll forwards any ring entry past it; hub.feed's immediate write
+// and the poll share that guard, so nothing is sent twice.
 
 import { pushMessage, getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 
 const HEARTBEAT_MS = 8000; // fork: HEARTBEAT_S = 8
 const TURN_REPLAY_CAP = 1500; // max messages replayed on a stream-only reconnect
+const CATCHUP_MS = 150; // ring-tail poll for frames written outside hub.feed
+
+/** Newest ring id for a session (0 when empty). */
+function ringTailId(sessionId) {
+  const ring = getMessages(sessionId, 0);
+  return ring.length ? ring[ring.length - 1].id : 0;
+}
 
 function tuneSocket(res) {
   const sock = res.socket;
@@ -59,42 +76,79 @@ class SessionStream {
   constructor(sessionId, heartbeatMs = HEARTBEAT_MS) {
     this.sid = sessionId;
     this.heartbeatMs = heartbeatMs;
-    /** @type {Set<{res: import('http').ServerResponse, lastFlushed: number}>} */
+    /** @type {Set<{res: import('http').ServerResponse, lastSent: number}>} */
     this.clients = new Set();
     /** Last local ring id actually flushed to a client (monotonic). */
     this.lastDeliveredId = 0;
     /** Last state observed on the session (from fed messages). */
     this.state = "idle";
+    /** Newest ring id folded into `state` (fed, replayed or caught up). */
+    this.lastNotedId = 0;
   }
 
-  noteMessage(msg) {
+  noteMessage(msg, id = 0) {
+    if (id) {
+      if (id <= this.lastNotedId) return;
+      this.lastNotedId = id;
+    }
     if (msg.type === "status") {
       this.state = msg.state === "idle" ? "idle" : msg.state; // busy/think_*/text_*/awaiting
     }
   }
 
-  /** Fan out a newly-fed message to all live clients; advance watermarks. */
+  /** Write one ring entry to one client unless it already has it. */
+  deliver(client, msg, id) {
+    if (id <= client.lastSent) return true;
+    let ok = false;
+    try {
+      ok = client.res.write(`id: ${id}\ndata: ${JSON.stringify(msg)}\n\n`);
+    } catch {
+      ok = false;
+    }
+    if (ok) {
+      client.lastSent = id;
+      if (this.lastDeliveredId < id) this.lastDeliveredId = id;
+    }
+    return ok;
+  }
+
+  dropDead(dead) {
+    for (const client of dead) this.clients.delete(client);
+    if (dead.length > 0) {
+      console.warn(`[hub] Removed ${dead.length} dead client(s) for session=${this.sid} (remaining: ${this.clients.size})`);
+    }
+  }
+
+  /**
+   * Fan out a newly-fed message to all live clients. It is already in the
+   * ring, so this is a catch-up: frames another writer pushed just before it
+   * go out first, in ring order (writing only this one would advance
+   * lastSent past them and they'd never be sent).
+   */
   broadcast(msg, localId) {
-    this.noteMessage(msg);
-    let dead = 0;
-    for (const client of this.clients) {
-      let ok = false;
-      try {
-        ok = client.res.write(`id: ${localId}\ndata: ${JSON.stringify(msg)}\n\n`);
-      } catch {
-        ok = false;
-      }
-      if (!ok) {
-        this.clients.delete(client);
-        dead++;
-      } else if (client.lastFlushed < localId) {
-        client.lastFlushed = localId;
-        if (this.lastDeliveredId < localId) this.lastDeliveredId = localId;
+    this.noteMessage(msg, localId);
+    this.catchUp();
+  }
+
+  /**
+   * Forward ring entries written OUTSIDE hub.feed (the official pipeline's
+   * pushMessage) that a live client hasn't been sent yet.
+   */
+  catchUp() {
+    if (this.clients.size === 0) return;
+    let from = Infinity;
+    for (const client of this.clients) from = Math.min(from, client.lastSent);
+    const pending = getMessages(this.sid, from);
+    if (pending.length === 0) return;
+    const dead = [];
+    for (const { id, ...msg } of pending) {
+      this.noteMessage(msg, id);
+      for (const client of this.clients) {
+        if (dead.includes(client)) continue;
+        if (!this.deliver(client, msg, id)) dead.push(client);
       }
     }
-    if (dead > 0) {
-      console.warn(`[hub] Removed ${dead} dead client(s) for session=${this.sid} (remaining: ${this.clients.size})`);
-    }
+    this.dropDead(dead);
   }
 
   /**
@@ -216,11 +270,15 @@ class SessionStream {
         break;
       }
       if (this.lastDeliveredId < id) this.lastDeliveredId = id;
-      this.noteMessage(msg);
+      this.noteMessage(msg, id);
     }
 
-    const client = { res, lastFlushed: 0 };
+    // Everything up to the ring tail is either replayed above or deliberately
+    // skipped (outside the turn window / another client is live); the
+    // catch-up poll forwards only what lands after this point.
+    const client = { res, lastSent: ringTailId(this.sid) };
     this.clients.add(client);
+    this.onClientAdded?.();
 
     const heartbeat = setInterval(() => {
       if (closed) return;
@@ -266,18 +324,43 @@ class SessionStream {
  * the in-process pi provider.
  */
 export class Hub {
-  constructor({ heartbeatMs } = {}) {
+  constructor({ heartbeatMs, catchUpMs } = {}) {
     this.heartbeatMs = heartbeatMs ?? HEARTBEAT_MS;
+    this.catchUpMs = catchUpMs ?? CATCHUP_MS;
     this.streams = new Map();
+    this.catchUpTimer = null;
   }
 
   streamFor(sessionId) {
     let s = this.streams.get(sessionId);
     if (!s) {
       s = new SessionStream(sessionId, this.heartbeatMs);
+      s.onClientAdded = () => this.startCatchUp();
       this.streams.set(sessionId, s);
     }
     return s;
+  }
+
+  /** One ring-tail poll for every session with live clients. */
+  catchUpAll() {
+    let live = 0;
+    for (const s of this.streams.values()) {
+      s.catchUp();
+      live += s.clients.size;
+    }
+    if (live === 0) this.stopCatchUp();
+  }
+
+  startCatchUp() {
+    if (this.catchUpTimer || !(this.catchUpMs > 0)) return;
+    this.catchUpTimer = setInterval(() => this.catchUpAll(), this.catchUpMs);
+    this.catchUpTimer.unref?.();
+  }
+
+  stopCatchUp() {
+    if (!this.catchUpTimer) return;
+    clearInterval(this.catchUpTimer);
+    this.catchUpTimer = null;
   }
 
   /**

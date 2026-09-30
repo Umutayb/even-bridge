@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
+import { getMessages, pushMessage } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { Hub } from "../src/hub.mjs";
 
 // Minimal mock of express req/res for the SSE handler.
@@ -290,4 +290,50 @@ test("hub feeds the shared ring (getMessages sees extended-session messages)", (
   // The official ring returns flattened entries: {id, ...msg}.
   assert.equal(msgs[0].type, "user_prompt");
   assert.equal(msgs[0].text, "hello");
+});
+
+test("ring-tail catch-up: frames pushed outside hub.feed reach live clients once", async () => {
+  // Official-pipeline sessions (bridge-launched local CC) write the ring via
+  // pushMessage + the OFFICIAL broadcast; the phone's /events is ours. Those
+  // frames used to surface only after a reconnect ("refresh to see replies").
+  const hub = new Hub({ catchUpMs: 5 });
+  const sid = "sess-official";
+  pushMessage(sid, { type: "user_prompt", text: "earlier", n: 0 });
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  const replayed = parseFrames(conn.frames).length;
+
+  pushMessage(sid, { type: "status", state: "busy", n: 1 });
+  pushMessage(sid, { type: "text_delta", text: "hi", n: 2 });
+  hub.feed(sid, { type: "text_delta", text: "fed", n: 3 }); // immediate path
+  pushMessage(sid, { type: "status", state: "idle", n: 4 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const live = parseFrames(conn.frames)
+    .slice(replayed)
+    .filter((m) => m.id != null)
+    .map((m) => m.msg.n);
+  assert.deepEqual(live, [1, 2, 3, 4], "every ring frame once, in order");
+  assert.equal(hub.streamFor(sid).state, "idle", "state tracks caught-up frames");
+  conn.req.emit("close");
+  hub.stopCatchUp();
+});
+
+test("catch-up does not re-send what a stream-only multi-client connect skipped", async () => {
+  const hub = new Hub({ catchUpMs: 5 });
+  const sid = "sess-multi";
+  const a = makeConn();
+  hub.streamFor(sid).handleEvents(a.req, a.res);
+  for (let i = 1; i <= 3; i++) pushMessage(sid, { type: "text_delta", text: "x", n: i });
+  await new Promise((r) => setTimeout(r, 30));
+  const b = makeConn(); // second client, no replay
+  hub.streamFor(sid).handleEvents(b.req, b.res);
+  pushMessage(sid, { type: "text_delta", text: "y", n: 4 });
+  await new Promise((r) => setTimeout(r, 30));
+  const ids = (c) => parseFrames(c.frames).filter((m) => m.id != null).map((m) => m.msg.n);
+  assert.deepEqual(ids(a), [1, 2, 3, 4]);
+  assert.deepEqual(ids(b), [4]);
+  a.req.emit("close");
+  b.req.emit("close");
+  hub.stopCatchUp();
 });

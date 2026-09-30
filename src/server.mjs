@@ -95,7 +95,9 @@ export async function startServer({ flags = {}, cwd } = {}) {
   // transcripts, single-writer prompt guard. Disable with
   // EVEN_BRIDGE_CC_DISABLED=1.
   const ccProvider =
-    process.env.EVEN_BRIDGE_CC_DISABLED === "1" ? null : createCcLocalProvider(emit, { hub });
+    process.env.EVEN_BRIDGE_CC_DISABLED === "1"
+      ? null
+      : createCcLocalProvider(emit, { hub, official: () => getProvider("claude") });
 
   // Self-heal the dist patch (CC permission-mode env override) on every start.
   // Idempotent + no-op when already applied, so a reboot or an `npm update` that

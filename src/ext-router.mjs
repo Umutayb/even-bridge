@@ -240,6 +240,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!p.getStatus(sessionId)) return res.status(404).json({ error: "Session not found" });
     try {
       const accepted = await p.respondPermission(sessionId, decision || "deny");
+      if (accepted?.passThrough) return next(); // cc-local: the official pipeline asked
       if (accepted === false) {
         return res.status(400).json({ error: "Permission decision was not offered or no permission request is pending" });
       }
@@ -258,7 +259,8 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!p) return next();
     if (!p.getStatus(sessionId)) return res.status(404).json({ error: "Session not found" });
     try {
-      await p.respondQuestion(sessionId, answer || "skip");
+      const result = await p.respondQuestion(sessionId, answer || "skip");
+      if (result?.passThrough) return next(); // cc-local: the official pipeline asked
       res.json({ ok: true });
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
@@ -274,7 +276,8 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!p) return next();
     if (!p.getStatus(sessionId)) return res.status(404).json({ error: "Session not found" });
     try {
-      await p.interrupt(sessionId);
+      const result = await p.interrupt(sessionId);
+      if (result?.passThrough) return next(); // cc-local: the official pipeline runs it
       res.json({ ok: true });
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;

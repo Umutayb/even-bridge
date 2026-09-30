@@ -14,7 +14,10 @@
 // official routers: if the session's ring is already populated (the official
 // pipeline streams it) we never seed or watch, and prompt() passes through
 // to the official handler (spawn/resume is the correct single writer for
-// dead or bridge-launched sessions).
+// dead or bridge-launched sessions). Once the official provider holds the
+// session live, status comes from it and interrupt / permission / question
+// answers pass through to it too (answering them here swallowed the phone's
+// Stop and left the turn running).
 
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { statSync } from "node:fs";
@@ -51,6 +54,7 @@ const FRESH_MS = 15_000; // transcript written within 15s counts as live
  *   tmuxBin?: string,
  *   procRoot?: string,
  *   sessionsDir?: string,   // CC per-process records (default ~/.claude/sessions)
+ *   official?: () => object|null, // official claude provider (live bridge-launched sessions)
  *   watcher?: object,       // injected createCcWatcher() result (tests)
  *   intervalMs?: number,
  *   log?: (s: string) => void,
@@ -58,13 +62,22 @@ const FRESH_MS = 15_000; // transcript written within 15s counts as live
  */
 export function createCcLocalProvider(
   emit,
-  { base, tmuxBin = "tmux", procRoot = "/proc", sessionsDir, watcher, intervalMs = 1000, log = () => {} } = {}
+  { base, tmuxBin = "tmux", procRoot = "/proc", sessionsDir, watcher, intervalMs = 1000, official = () => null, log = () => {} } = {}
 ) {
   const ccBase = base ?? ccProjectsBase();
   const watch = watcher ?? createCcWatcher({ emit, intervalMs, log });
   const seededOffsets = new Map(); // sessionId -> watcher baseline byte offset
 
   const fileOf = (sessionId) => findCcSessionFile(sessionId, ccBase);
+
+  /** The official provider's live status when it holds this session, else null. */
+  function officialStatus(sessionId) {
+    try {
+      return official()?.getStatus(sessionId) ?? null;
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * Terminal claudes that may be driving THIS conversation. Ownership is per
@@ -104,11 +117,15 @@ export function createCcLocalProvider(
     listSessions: async () => [],
 
     getSessionStatus: async (sessionId) => {
+      const live = officialStatus(sessionId);
+      if (live) return live.state;
       const file = fileOf(sessionId);
       return file ? stateOf(sessionId, file) : null;
     },
 
     async getStatus(sessionId) {
+      const live = officialStatus(sessionId);
+      if (live) return { state: live.state, provider: "claude" };
       const file = fileOf(sessionId);
       if (!file) return null;
       return { state: await stateOf(sessionId, file), provider: "claude" };
@@ -250,6 +267,7 @@ export function createCcLocalProvider(
         err.statusCode = 404;
         throw err;
       }
+      if (officialStatus(sessionId)) return { passThrough: true };
       const meta = ccMeta(file);
       const external = await driversOf(sessionId, meta.cwd);
       if (external.length > 0) {
@@ -260,10 +278,12 @@ export function createCcLocalProvider(
       return { ok: true }; // bridge-launched/dead: official router's territory
     },
 
-    // CC permission prompts are answered in the terminal UI itself.
-    respondPermission: async () => false,
+    // CC permission prompts are answered in the terminal UI itself — unless
+    // the official pipeline runs the session, which asks the phone.
+    respondPermission: async (sessionId) => (officialStatus(sessionId) ? { passThrough: true } : false),
 
-    async respondQuestion() {
+    async respondQuestion(sessionId) {
+      if (officialStatus(sessionId)) return { passThrough: true };
       throw Object.assign(new Error("No question pending on this session"), { statusCode: 400 });
     },
   };

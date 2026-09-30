@@ -327,6 +327,30 @@ test("cc-local ownership is per conversation, not per cwd", async (t) => {
   assert.deepEqual(await prov.interrupt("cc-333"), { ok: true });
 });
 
+test("official-pipeline sessions: status + interrupt/permission/question pass through", async (t) => {
+  // A glasses-launched session lives in the official provider. Answering its
+  // interrupt here (the old { ok: true }) swallowed the phone's Stop.
+  const base = makeBase(t);
+  writeCcSession(base, "/proj/off", "cc-off", { prompts: ["go"] });
+  writeCcSession(base, "/proj/off", "cc-dead", { prompts: ["old"] });
+  const live = { "cc-off": { state: "busy", provider: "claude" } };
+  const prov = createCcLocalProvider(() => {}, {
+    base,
+    procRoot: makeBase(t),
+    sessionsDir: makeBase(t),
+    tmuxBin: "definitely-not-a-tmux-bin",
+    official: () => ({ getStatus: (sid) => live[sid] ?? null }),
+  });
+  assert.deepEqual(await prov.getStatus("cc-off"), { state: "busy", provider: "claude" });
+  assert.equal(await prov.getSessionStatus("cc-off"), "busy");
+  assert.deepEqual(await prov.interrupt("cc-off"), { passThrough: true });
+  assert.deepEqual(await prov.respondPermission("cc-off", "allow"), { passThrough: true });
+  assert.deepEqual(await prov.respondQuestion("cc-off", "yes"), { passThrough: true });
+  // Not held by the official provider: unchanged behavior.
+  assert.deepEqual(await prov.interrupt("cc-dead"), { ok: true });
+  assert.equal(await prov.respondPermission("cc-dead", "allow"), false);
+});
+
 // ── seed/watcher baseline ─────────────────────────────────────────────────
 test("watcher baseline = end of the seeded window (no frame duplication)", async (t) => {
   const base = makeBase(t);
