@@ -21,6 +21,7 @@
 
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { statSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { claim } from "./ownership.mjs";
 import {
   ccMeta,
@@ -60,6 +61,35 @@ const FRESH_MS = 15_000; // transcript written within 15s counts as live
  *   log?: (s: string) => void,
  * }} [deps]
  */
+/**
+ * EVEN_BRIDGE_CC_RESUME_RC=1: resume an idle local session as an interactive
+ * `claude --resume <id> --remote-control` in a detached tmux session instead of
+ * handing it to the official router (Agent SDK, no Remote Control).
+ * Never answers the folder-trust prompt: an untrusted cwd is reported back.
+ * Returns { pane } when the TUI is ready for input, else { reason }.
+ */
+async function resumeInRcTmux(sessionId, cwd, { tmuxBin = "tmux", claudeBin = process.env.EVEN_BRIDGE_CLAUDE_BIN || "claude", log } = {}) {
+  const name = `cc-${sessionId.slice(0, 8)}`;
+  const run = (args) =>
+    new Promise((resolve, reject) =>
+      execFile(tmuxBin, args, { timeout: 10000 }, (err, stdout) => (err ? reject(err) : resolve(String(stdout ?? ""))))
+    );
+  const exists = await run(["has-session", "-t", name]).then(() => true, () => false);
+  if (!exists) {
+    await run(["new-session", "-d", "-s", name, "-c", cwd || process.env.HOME || "/", claudeBin, "--resume", sessionId, "--remote-control"]);
+    log?.(`[bridge] cc-local resume -> tmux ${name}: claude --resume ${sessionId} --remote-control (cwd ${cwd})`);
+  }
+  for (let i = 0; i < 60; i++) {           // up to ~30 s for the TUI
+    const screen = await capturePane(name, { tmuxBin }).catch(() => "");
+    if (/trust the files in this folder|I trust this folder/i.test(screen)) {
+      return { reason: `folder ${cwd} is not trusted yet - open it once with claude on the Pi (tmux ${name} is waiting at the trust prompt)` };
+    }
+    if (screen.includes("\u276f")) return { pane: name };   // input prompt is up
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return { reason: `resuming with Remote Control timed out (tmux ${name})` };
+}
+
 export function createCcLocalProvider(
   emit,
   { base, tmuxBin = "tmux", procRoot = "/proc", sessionsDir, watcher, intervalMs = 1000, official = () => null, log = () => {} } = {}
@@ -236,7 +266,22 @@ export function createCcLocalProvider(
         });
         return { sessionId, provider: "claude", blocked: true };
       }
-      // Not externally driven: the official router is the single writer.
+      // Not externally driven. With EVEN_BRIDGE_CC_RESUME_RC=1 every session
+      // must run with Remote Control: resume it as an interactive RC claude in
+      // tmux and deliver there (it then counts as externally driven).
+      if (process.env.EVEN_BRIDGE_CC_RESUME_RC === "1") {
+        const r = await resumeInRcTmux(sessionId, meta.cwd, { tmuxBin, log });
+        if (r.pane) {
+          await tmuxDeliver(r.pane, text, { tmuxBin });
+          claim(sessionId, CC_LOCAL_NAME);
+          return { sessionId, provider: "claude" };
+        }
+        await this.seedTranscript(sessionId);
+        emit(sessionId, { type: "user_prompt", text });
+        emit(sessionId, { type: "error", message: `Message NOT delivered: ${r.reason}.` });
+        return { sessionId, provider: "claude", blocked: true };
+      }
+      // Otherwise the official router is the single writer.
       // Stop our watcher first so frames can't double once it spawns.
       watch.stop(sessionId);
       seededOffsets.delete(sessionId);
