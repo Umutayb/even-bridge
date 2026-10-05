@@ -208,11 +208,10 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       } else {
         // NEW session. The phone sends provider="claude" as an app-level
         // default (from the pairing URL), not a user choice — so it can't be
-        // honored here. New sessions go to pi by default (local Claude Code
-        // spawns are broken on this box: org disabled subscription access).
-        // EVEN_BRIDGE_NEW_SESSION_PROVIDER: "pi" (default), another ext name,
-        // or "official"/"claude" for stock Claude Code behavior.
-        const want = String(process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER ?? "pi").trim().toLowerCase();
+        // honored here. New sessions get stock Claude Code by default;
+        // EVEN_BRIDGE_NEW_SESSION_PROVIDER picks an extended provider instead:
+        // "official"/"claude" (default), "pi", or "claude-remote".
+        const want = String(process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER ?? "official").trim().toLowerCase();
         if (want !== "official" && want !== "claude") p = byName(want);
       }
     }

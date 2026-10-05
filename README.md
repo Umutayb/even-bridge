@@ -177,12 +177,12 @@ official routers and claims a request when:
    - cc-local probes from disk (`~/.claude/projects/*/<id>.jsonl` file
      lookup) — local Claude Code sessions the official SDK list would skip
      while they are live.
-3. the prompt creates a **new session** (no `sessionId`): it routes to pi
-   by default. The phone sends `provider: "claude"` as an app-level default
-   (from the pairing URL's `defaultProvider`), not a user choice, so it is
-   deliberately not honored for new sessions. Override with
-   `EVEN_BRIDGE_NEW_SESSION_PROVIDER` (`pi` default; `claude-remote` for an
-   RC session; `official`/`claude` for stock Claude Code).
+3. the prompt creates a **new session** (no `sessionId`) and
+   `EVEN_BRIDGE_NEW_SESSION_PROVIDER` names an extended provider (`pi`, or
+   `claude-remote` for an RC session). The default (`official`/`claude`) is
+   stock Claude Code. The phone's `provider: "claude"` is an app-level
+   default (from the pairing URL's `defaultProvider`), not a user choice, so
+   it does not pick the provider for new sessions; the env var does.
 
 Everything else calls `next()` and is handled by the official routers —
 codex sessions and Claude Code sessions the official dist launched itself
