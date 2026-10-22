@@ -9,11 +9,19 @@ import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js"
 // ── Fake upstream: the claude-remote bridge's /api/events endpoint ─────────
 // plan[i] = the frames connection (i+1) replays (its ring), newest process
 // generation. Each frame: {id, ...msg}.
-function startUpstream(plan) {
+// ring: optional {state, messages} served on /api/messages (the cold-start
+// seed boundary); omitted = 404, like an upstream without that route.
+function startUpstream(plan, ring) {
   return new Promise((resolve) => {
     const connections = [];
     const server = http.createServer((req, res) => {
       const u = new URL(req.url, "http://x");
+      if (u.pathname === "/api/messages" && ring) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        if (ring.onRead) ring.onRead();
+        res.end(JSON.stringify({ messages: ring.messages, state: ring.state, historyLoaded: ring.historyLoaded, historyHighId: ring.historyHighId, sessionId: u.searchParams.get("sessionId") }));
+        return;
+      }
       if (u.pathname !== "/api/events") {
         res.writeHead(404).end();
         return;
@@ -27,7 +35,9 @@ function startUpstream(plan) {
         setTimeout(() => {
           if (conn.closed) return;
           try {
-            res.write(`id: ${msg.id}\ndata: ${JSON.stringify(msg)}\n\n`);
+            // Like the real upstream: the id rides the SSE id line only.
+            const { id, ...body } = msg;
+            res.write(`id: ${id}\ndata: ${JSON.stringify(body)}\n\n`);
           } catch {
             /* socket gone */
           }
@@ -49,10 +59,11 @@ async function waitFor(cond, ms = 4000, step = 10) {
   }
 }
 
-function makeClientConn() {
+function makeClientConn(frames = []) {
   const res = {
     setHeader() {},
-    write() {
+    write(chunk) {
+      frames.push(chunk);
       return true;
     },
     end() {},
@@ -190,5 +201,165 @@ test("PumpManager.ensure() replaces a pump whose loop ended", async () => {
   assert.notEqual(second, first, "an ended pump must not be reused");
   await waitFor(() => connections.length === 2);
   await mgr.stop(sid);
+  server.close();
+});
+
+// Live frames a hub client received (data lines only, heartbeats/idle pings skipped).
+function liveTexts(frames) {
+  return frames
+    .join("")
+    .split("\n\n")
+    .map((b) => b.split("\n").find((l) => l.startsWith("data:")))
+    .filter(Boolean)
+    .map((l) => JSON.parse(l.slice(5)))
+    .filter((m) => m.type !== "status")
+    .map((m) => m.text);
+}
+
+const IDLE_RING = [
+  { id: 1, type: "user_prompt", text: "q1" },
+  { id: 2, type: "text_delta", text: "a1" },
+  { id: 3, type: "status", state: "idle" },
+];
+
+test("cold pump seeds the upstream history instead of sending it live (no duplicates on the glasses)", async () => {
+  const { server, url } = await startUpstream([[...IDLE_RING, { id: 4, type: "text_delta", text: "live" }]], {
+    state: "idle",
+    messages: IDLE_RING,
+  });
+  const hub = new Hub();
+  const sid = "rc-pump-seed-1";
+  const frames = [];
+  const client = makeClientConn(frames); // the phone, connected before the pump
+  hub.streamFor(sid).handleEvents(client.req, client.res);
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "idle" });
+  mgr.ensure(sid);
+  await waitFor(() => getMessages(sid, 0).length === 4);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(getMessages(sid, 0).map((m) => m.text ?? m.state), ["q1", "a1", "idle", "live"], "history is in the ring");
+  assert.deepEqual(liveTexts(frames), ["live"], "only the frame past the upstream tail is sent live");
+  await mgr.stop(sid);
+  client.req.emit("close");
+  server.close();
+});
+
+test("cold pump on a busy session sends live only what follows the last finished text", async () => {
+  const ring = [
+    ...IDLE_RING,
+    { id: 4, type: "user_prompt", text: "q2" },
+    { id: 5, type: "text_delta", text: "a2-done" },
+    { id: 6, type: "status", state: "text_end" },
+    { id: 7, type: "text_delta", text: "a2-part" },
+  ];
+  const { server, url } = await startUpstream([ring], { state: "busy", messages: ring });
+  const hub = new Hub();
+  const sid = "rc-pump-seed-2";
+  const frames = [];
+  const client = makeClientConn(frames);
+  hub.streamFor(sid).handleEvents(client.req, client.res);
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "busy" });
+  mgr.ensure(sid);
+  await waitFor(() => getMessages(sid, 0).length === 7);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(liveTexts(frames), ["a2-part"]);
+  await mgr.stop(sid);
+  client.req.emit("close");
+  server.close();
+});
+
+test("pump for a brand-new session relays everything (nothing on the phone yet)", async () => {
+  const { server, url } = await startUpstream([IDLE_RING], { state: "idle", messages: IDLE_RING });
+  const hub = new Hub();
+  const sid = "rc-pump-seed-3";
+  const frames = [];
+  const client = makeClientConn(frames);
+  hub.streamFor(sid).handleEvents(client.req, client.res);
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "idle" });
+  mgr.ensure(sid, { newSession: true });
+  await waitFor(() => getMessages(sid, 0).length === 3);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(liveTexts(frames), ["q1", "a1"]);
+  await mgr.stop(sid);
+  client.req.emit("close");
+  server.close();
+});
+
+test("upstream restart: the new generation's replay is seeded, not sent live", async () => {
+  const gen1 = Array.from({ length: 600 }, (_, i) => ({ id: i + 1, type: "text_delta", text: `g1-${i + 1}` }));
+  const gen2 = [
+    { id: 1, type: "user_prompt", text: "old-q" },
+    { id: 2, type: "text_delta", text: "old-a" },
+    { id: 3, type: "status", state: "idle" },
+  ];
+  const ring = { state: "idle", messages: [] };
+  const { server, connections, url } = await startUpstream([gen1, gen2, [...gen2, { id: 4, type: "text_delta", text: "after-restart" }]], ring);
+  const hub = new Hub();
+  const sid = "rc-pump-restart";
+  const frames = [];
+  const client = makeClientConn(frames);
+  hub.streamFor(sid).handleEvents(client.req, client.res);
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "busy" });
+  const pump = mgr.ensure(sid);
+  await waitFor(() => pump.lastUpstreamId === 600, 15000);
+  ring.messages = gen2; // the restarted upstream's ring
+  frames.length = 0;
+  connections[0].res.end();
+  await waitFor(() => getMessages(sid, 0).some((m) => m.text === "after-restart"), 15000);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(liveTexts(frames), ["after-restart"], "only frames past the restarted upstream's tail go live");
+  await mgr.stop(sid);
+  client.req.emit("close");
+  server.close();
+});
+
+test("cold pump waits for the upstream to finish loading history before reading the boundary", async () => {
+  const ring = { state: "idle", messages: [], historyLoaded: false, reads: 0 };
+  ring.onRead = () => {
+    ring.reads += 1;
+    if (ring.reads === 3) {
+      ring.messages = IDLE_RING; // the upstream's rebuild finished
+      ring.historyLoaded = true;
+    }
+  };
+  const { server, url } = await startUpstream([[...IDLE_RING, { id: 4, type: "text_delta", text: "live" }]], ring);
+  const hub = new Hub();
+  const sid = "rc-pump-hist-wait";
+  const frames = [];
+  const client = makeClientConn(frames);
+  hub.streamFor(sid).handleEvents(client.req, client.res);
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "idle" });
+  mgr.ensure(sid);
+  await waitFor(() => getMessages(sid, 0).length === 4);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(ring.reads >= 3, "polled until historyLoaded");
+  assert.deepEqual(liveTexts(frames), ["live"]);
+  await mgr.stop(sid);
+  client.req.emit("close");
+  server.close();
+});
+
+test("busy session on a rebuilt upstream ring: replayed history (historyHighId) is seeded", async () => {
+  // A restarted upstream replays RC history without status frames, and its
+  // window can start after the current turn's prompt: only historyHighId
+  // tells where the history ends.
+  const rebuilt = [
+    { id: 1, type: "text_delta", text: "old-a" },
+    { id: 2, type: "tool_start", name: "Bash" },
+    { id: 3, type: "text_delta", text: "old-b" },
+  ];
+  const ring = { state: "busy", messages: rebuilt, historyLoaded: true, historyHighId: 3 };
+  const { server, url } = await startUpstream([[...rebuilt, { id: 4, type: "text_delta", text: "live" }]], ring);
+  const hub = new Hub();
+  const sid = "rc-pump-hist-high";
+  const frames = [];
+  const client = makeClientConn(frames);
+  hub.streamFor(sid).handleEvents(client.req, client.res);
+  const mgr = new PumpManager({ baseUrl: url, hub, getState: async () => "busy" });
+  mgr.ensure(sid);
+  await waitFor(() => getMessages(sid, 0).length === 4);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(liveTexts(frames), ["live"]);
+  await mgr.stop(sid);
+  client.req.emit("close");
   server.close();
 });

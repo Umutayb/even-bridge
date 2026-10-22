@@ -337,3 +337,95 @@ test("catch-up does not re-send what a stream-only multi-client connect skipped"
   b.req.emit("close");
   hub.stopCatchUp();
 });
+
+function turn(hub, sid, q, a) {
+  hub.feed(sid, { type: "user_prompt", text: q });
+  hub.feed(sid, { type: "status", state: "busy" });
+  hub.feed(sid, { type: "text_delta", text: a });
+  hub.feed(sid, { type: "status", state: "idle" });
+}
+
+test("history reload + completed turn: stream-only reconnect replays nothing (no duplicate turn)", () => {
+  const hub = new Hub();
+  const sid = "sess-hist-idle";
+  turn(hub, sid, "q1", "a1");
+  hub.noteHistory(sid); // the app reloads /history alongside the reconnect
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  assert.deepEqual(parseFrames(conn.frames), [], "the completed turn is not re-sent");
+  hub.feed(sid, { type: "text_delta", text: "next" });
+  assert.equal(parseFrames(conn.frames).at(-1).msg.text, "next", "live frames still flow");
+  conn.req.emit("close");
+});
+
+test("history reload + turn in progress: replays only what follows the last finished text", () => {
+  const hub = new Hub();
+  const sid = "sess-hist-busy";
+  turn(hub, sid, "q1", "a1");
+  hub.feed(sid, { type: "user_prompt", text: "q2" });
+  hub.feed(sid, { type: "status", state: "busy" });
+  hub.feed(sid, { type: "status", state: "text_start" });
+  hub.feed(sid, { type: "text_delta", text: "a2-done" }); // in history already
+  hub.feed(sid, { type: "status", state: "text_end" });
+  hub.feed(sid, { type: "tool_start", name: "Bash" });
+  hub.feed(sid, { type: "status", state: "text_start" });
+  hub.feed(sid, { type: "text_delta", text: "a2-streaming" });
+  hub.noteHistory(sid);
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  assert.deepEqual(
+    parseFrames(conn.frames).map((f) => f.msg.text ?? f.msg.state ?? f.msg.name),
+    ["Bash", "text_start", "a2-streaming"]
+  );
+  conn.req.emit("close");
+});
+
+test("history reload arriving just after the connect (grace window) also suppresses the replay", async () => {
+  const hub = new Hub({ historyGraceMs: 200 });
+  const sid = "sess-hist-grace";
+  turn(hub, sid, "q1", "a1");
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  hub.feed(sid, { type: "text_delta", text: "during-wait" }); // lands while waiting
+  await new Promise((r) => setTimeout(r, 20));
+  hub.noteHistory(sid);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(
+    parseFrames(conn.frames).map((f) => f.msg.text),
+    ["during-wait"],
+    "no replay; the frame that arrived during the wait is still delivered"
+  );
+  conn.req.emit("close");
+});
+
+test("no history reload within the grace window: the turn-window replay still runs", async () => {
+  const hub = new Hub({ historyGraceMs: 30 });
+  const sid = "sess-hist-none";
+  turn(hub, sid, "q1", "a1");
+  const conn = makeConn();
+  hub.streamFor(sid).handleEvents(conn.req, conn.res);
+  assert.equal(parseFrames(conn.frames).length, 0, "nothing before the grace window ends");
+  await new Promise((r) => setTimeout(r, 80));
+  assert.deepEqual(
+    parseFrames(conn.frames).filter((f) => f.id).map((f) => f.msg.text ?? f.msg.state),
+    ["q1", "busy", "a1", "idle"]
+  );
+  conn.req.emit("close");
+});
+
+test("seeded history is never sent live, even to a connect waiting on its grace window", async () => {
+  const hub = new Hub({ historyGraceMs: 50, catchUpMs: 5 });
+  const sid = "sess-seed-wait";
+  const live = makeConn();
+  hub.streamFor(sid).handleEvents(live.req, live.res); // waits (empty ring, no history)
+  hub.seed(sid, { type: "user_prompt", text: "old-q" });
+  hub.seed(sid, { type: "text_delta", text: "old-a" });
+  hub.seed(sid, { type: "status", state: "idle" });
+  hub.noteHistory(sid);
+  await new Promise((r) => setTimeout(r, 30));
+  hub.feed(sid, { type: "text_delta", text: "fresh" });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(parseFrames(live.frames).map((f) => f.msg.text), ["fresh"]);
+  assert.equal(getMessages(sid, 0).length, 4, "seeded frames are in the ring");
+  live.req.emit("close");
+});

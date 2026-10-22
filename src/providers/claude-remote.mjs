@@ -218,7 +218,9 @@ export function createClaudeRemoteProvider(emit, { hub, baseUrl, token } = {}) {
       const sid = r.body?.sessionId;
       if (sid) {
         noteKnown(sid);
-        pumps.ensure(sid); // keep the relay warm so streaming starts immediately
+        // Keep the relay warm so streaming starts immediately. A session this
+        // prompt just created has no history on the phone: relay it all.
+        pumps.ensure(sid, { newSession: !sessionId });
       }
       return { sessionId: sid ?? sessionId ?? "", provider: WIRE_PROVIDER };
     },

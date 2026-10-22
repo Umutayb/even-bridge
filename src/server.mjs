@@ -73,7 +73,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
   const BIND_ADDRESS = HOST.address || "127.0.0.1";
 
   // ── Extended-session plumbing ─────────────────────────────────────────────
-  const hub = new Hub();
+  const hub = new Hub({ historyGraceMs: 1500 });
 
   /** emit for extended providers: into the shared ring + live hub clients. */
   const emit = (sessionId, msg) => {

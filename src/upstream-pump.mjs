@@ -22,6 +22,14 @@
 //     text_delta must hit the wire immediately) and aggressive keepalive
 //     (idle 5s / every 2s / 2 probes ~= 9s) to reap half-open connections
 //     left when the network path silently changes.
+//   * COLD START SEEDS, DOESN'T SEND — a pump with no water mark asks for a
+//     full replay, and that replay is history the phone already loaded via
+//     /history. Forwarding it live showed every message twice on the
+//     glasses. So a cold pump (seedFirst) first reads the upstream ring tail
+//     from /api/messages and puts frames up to it into the ring with
+//     hub.seed. For a busy session, frames after the in-progress turn's last
+//     finished text block are sent live (historyCoveredIndex). A pump for a
+//     brand-new session (no history on the phone yet) does not seed.
 //   * ONE BAD FRAME MUST NOT KILL THE STREAM — parse errors are logged, not
 //     thrown.
 //   * ALWAYS SETTLES — a destroyed request (stop()) or a dead socket resolves
@@ -29,6 +37,7 @@
 
 import http from "node:http";
 import { URL } from "node:url";
+import { historyCoveredIndex } from "./hub.mjs";
 
 const IDLE_STOP_MS = 600_000; // fork: PUMP_IDLE_STOP_S
 const RING_SIZE = 500; // fork: MAX_MESSAGES_PER_SESSION — reset-detection threshold
@@ -60,6 +69,56 @@ export class UpstreamPump {
     this.req = null;
     this.loopPromise = null;
     this.ended = false; // loop returned (END path or stop()) — never restarts
+    this.seedFirst = opts.seedFirst ?? false;
+    this.seedUntil = 0; // upstream ids <= this are history: hub.seed, not hub.feed
+    this.reseed = false; // upstream restarted: re-read the history boundary
+    this.historyWaitMs = opts.historyWaitMs ?? 15_000;
+    this.discarding = false; // drop the rest of a stream we are abandoning
+  }
+
+  /** Learn where the upstream's existing history ends (cold start only). */
+  async _readSeedBoundary() {
+    const url = new URL(`${this.baseUrl}/api/messages`);
+    url.searchParams.set("sessionId", this.sid);
+    url.searchParams.set("after", "0");
+    if (this.token) url.searchParams.set("token", this.token);
+    try {
+      // A freshly started upstream rebuilds its ring from the RC history in
+      // the background; until historyLoaded it would look (nearly) empty and
+      // the rebuild would then go out live. Wait for it (bounded). Upstreams
+      // without the flag (undefined) are taken as loaded.
+      let body = null;
+      const deadline = Date.now() + this.historyWaitMs;
+      for (;;) {
+        const r = await fetch(url, {
+          headers: this.token ? { Authorization: `Bearer ${this.token}` } : {},
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!r.ok) return 0;
+        body = await r.json();
+        if (body?.historyLoaded !== false || this.stopped) break;
+        if (Date.now() >= deadline) {
+          console.warn(`[rc-pump ${this.short()}] upstream history still loading after ${this.historyWaitMs}ms — using what it has`);
+          break;
+        }
+        await sleep(250);
+      }
+      const msgs = Array.isArray(body?.messages) ? body.messages : [];
+      const ids = (list) => list.map((m) => Number(m.id)).filter(Number.isFinite);
+      // Everything the upstream replayed from RC history is history, even
+      // when its frames (no status frames) don't show where it ends.
+      const replayedHigh = Number(body?.historyHighId) || 0;
+      if (msgs.length === 0) return replayedHigh;
+      if ((body.state ?? "idle") === "idle") return Math.max(replayedHigh, ...ids(msgs));
+      // Busy: /history has the prompt and every finished text block of the
+      // current turn; send only what comes after the last of those live.
+      const covered = historyCoveredIndex(msgs);
+      if (covered < 0) return replayedHigh;
+      return Math.max(replayedHigh, ...ids(msgs.slice(0, covered + 1)));
+    } catch (err) {
+      console.warn(`[rc-pump ${this.short()}] seed boundary unavailable (${err.message}) — relaying the replay live`);
+      return 0;
+    }
   }
 
   /** A stopped/ended pump never relays again; the manager must replace it. */
@@ -90,6 +149,14 @@ export class UpstreamPump {
   async _loop() {
     let backoff = 1000;
     while (!this.stopped) {
+      if ((this.seedFirst && this.lastUpstreamId === 0) || this.reseed) {
+        const why = this.reseed ? "upstream restart" : "cold start";
+        this.reseed = false;
+        this.seedUntil = await this._readSeedBoundary();
+        if (this.seedUntil > 0) {
+          console.log(`[rc-pump ${this.short()}] ${why}: upstream ids <= ${this.seedUntil} are history (seeded, not sent)`);
+        }
+      }
       const hadClients = this.hub.clientCount(this.sid) > 0;
       try {
         await this._streamOnce();
@@ -170,6 +237,7 @@ export class UpstreamPump {
           }
           console.log(`[rc-pump ${this.short()}] START (upstream connected)`);
           this.awaitFirstId = true;
+          this.discarding = false;
           timer = setInterval(() => this._idleCheck(), 30_000);
           timer.unref?.();
           let buf = "";
@@ -214,18 +282,32 @@ export class UpstreamPump {
       }
     }
     if (data === null || data === "") return;
+    if (this.discarding) return;
     const msg = JSON.parse(data);
     if (typeof id === "number" && Number.isFinite(id)) {
       if (this.awaitFirstId) {
         this.awaitFirstId = false;
         if (id < this.lastUpstreamId - RING_SIZE) {
-          // Upstream restarted: ids reset. Re-baseline so we don't go silent.
+          // Upstream restarted: ids reset. Its new ring replays the whole
+          // session, which the phone already shows. Drop this stream, re-read
+          // the history boundary, and reconnect (the loop reopens).
           console.log(`[rc-pump ${this.short()}] upstream generation reset (first id ${id} < water mark ${this.lastUpstreamId}) — re-baselining`);
           this.lastUpstreamId = 0;
+          this.seedUntil = 0;
+          if (this.seedFirst) {
+            this.reseed = true;
+            this.discarding = true;
+            this.req?.destroy();
+            return;
+          }
         }
       }
       if (id <= this.lastUpstreamId) return; // replayed / already fed
       this.lastUpstreamId = id;
+      if (id <= this.seedUntil) {
+        this.hub.seed(this.sid, msg); // history the phone already has
+        return;
+      }
     }
     this.hub.feed(this.sid, msg);
   }
@@ -262,14 +344,18 @@ export class PumpManager {
     return this.pumps.get(sessionId);
   }
 
-  ensure(sessionId) {
+  /**
+   * @param {{ newSession?: boolean }} [o] newSession: the session was just
+   *   created, so the phone has no history to duplicate — relay everything.
+   */
+  ensure(sessionId, { newSession = false } = {}) {
     const old = this.pumps.get(sessionId);
     if (old && !old.dead) return old;
     // A pump that stopped itself (_idleCheck, or the loop's clean END) stays
     // in the map; handing it back would leave the session with no relay, so
     // replies only appeared on refresh. Replace it, keeping the water mark so
     // the upstream ring replay is not fed twice.
-    const p = new UpstreamPump(sessionId, this.opts);
+    const p = new UpstreamPump(sessionId, { ...this.opts, seedFirst: !newSession });
     if (old) p.lastUpstreamId = old.lastUpstreamId;
     this.pumps.set(sessionId, p);
     return p.start();

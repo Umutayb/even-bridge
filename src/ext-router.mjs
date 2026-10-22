@@ -319,6 +319,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     const id = req.params.id;
     const p = byName(req.query.provider) ?? (await ownProvider(id));
     if (!p) return next();
+    hub.noteHistory(id); // a reconnect alongside this reload needs no turn replay
     const limit = Math.min(Number(req.query.limit) || 10, 50);
     try {
       const history = await p.getHistory(id, limit);

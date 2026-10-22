@@ -26,6 +26,16 @@
 //      the session (the reported "reply cut off mid-sentence" bug). The app
 //      merges by message id (it already tolerates the needReplay=true
 //      full-ring overlap), so re-sent frames don't duplicate.
+//      CORRECTION (2026-10-22): it does NOT merge. The app never sends
+//      Last-Event-ID and appends every frame it gets, so a replayed turn
+//      showed up twice. Almost every reopen also reloads
+//      /api/sessions/:id/history, which already carries completed turns.
+//      So: a stream-only reconnect that comes with a history reload (just
+//      before, or within historyGraceMs after the connect) replays nothing
+//      when the latest turn is complete, and only the in-progress turn's
+//      frames after its last finished text block (history has the prompt
+//      and every finished text) when it is busy.
+//      Without a history reload the turn-window replay below still applies.
 //   3. 8s heartbeat + idle re-assertion — when idle, re-emit status:idle so a
 //      dropped turn-end can't leave the phone stuck on "thinking". Never
 //      re-send busy (would restart the thinking animation mid-turn).
@@ -54,6 +64,31 @@ import { pushMessage, getMessages } from "@evenrealities/even-terminal/dist/rout
 const HEARTBEAT_MS = 8000; // fork: HEARTBEAT_S = 8
 const TURN_REPLAY_CAP = 1500; // max messages replayed on a stream-only reconnect
 const CATCHUP_MS = 150; // ring-tail poll for frames written outside hub.feed
+const HISTORY_RECENT_MS = 5000; // a history reload this recent counts for a connect
+
+/**
+ * Index of the last ring entry that /history already covers while a turn is
+ * in progress: the latest finished text block (status text_end) of the
+ * current turn, else the turn's user_prompt; -1 when neither exists. History
+ * is built from the transcript, which has the prompt and every completed
+ * assistant text, so only frames after this index are new to a phone that
+ * just reloaded history. Entries may be flat ({id, type, state}) or wrapped.
+ */
+export function historyCoveredIndex(ring) {
+  const typeOf = (m) => m.type ?? m.msg?.type;
+  const stateOf = (m) => m.state ?? m.msg?.state;
+  let prompt = -1;
+  for (let i = ring.length - 1; i >= 0; i--) {
+    if (typeOf(ring[i]) === "user_prompt") {
+      prompt = i;
+      break;
+    }
+  }
+  for (let i = ring.length - 1; i > prompt; i--) {
+    if (typeOf(ring[i]) === "status" && stateOf(ring[i]) === "text_end") return i;
+  }
+  return prompt;
+}
 
 /** Newest ring id for a session (0 when empty). */
 function ringTailId(sessionId) {
@@ -84,6 +119,58 @@ class SessionStream {
     this.state = "idle";
     /** Newest ring id folded into `state` (fed, replayed or caught up). */
     this.lastNotedId = 0;
+    /** When the phone last reloaded /history for this session (ms). */
+    this.lastHistoryAt = 0;
+    /** Resolves a stream-only connect waiting for a history reload. */
+    this.historyWaiters = new Set();
+    this.historyGraceMs = 0;
+    /** Ring ids that are seeded history: never sent live. */
+    this.seeded = new Set();
+  }
+
+  noteHistory() {
+    this.lastHistoryAt = Date.now();
+    for (const wake of this.historyWaiters) wake();
+    this.historyWaiters.clear();
+  }
+
+  historyRecent(now = Date.now()) {
+    return this.lastHistoryAt > 0 && now - this.lastHistoryAt <= HISTORY_RECENT_MS;
+  }
+
+  /**
+   * What a sole-client stream-only reconnect gets, limited to ring ids <= tail
+   * (later frames reach the client through catch-up).
+   */
+  streamOnlyReplay(tail, historyReloaded) {
+    const window = this.reconnectWindow().filter((m) => m.id <= tail);
+    if (!historyReloaded) {
+      return { replay: window, mode: "stream-only reconnect -> turn-window replay" };
+    }
+    if (this.state === "idle") {
+      return { replay: [], mode: "stream-only reconnect + history reload, turn complete -> no replay" };
+    }
+    const covered = historyCoveredIndex(window);
+    return {
+      replay: window.slice(covered + 1),
+      mode: "stream-only reconnect + history reload, turn in progress -> replay after the last finished text",
+    };
+  }
+
+  /**
+   * Put an entry in the ring as already-known history. Live delivery
+   * (catch-up) skips it, including for a connect still waiting on a history
+   * reload; explicit replays (needReplay, turn window) still include it.
+   */
+  seed(msg) {
+    const id = pushMessage(this.sid, msg);
+    this.noteMessage(msg, id);
+    this.seeded.add(id);
+    if (this.seeded.size > 2000) {
+      const head = getMessages(this.sid, 0)[0]?.id ?? 0;
+      for (const sid of this.seeded) if (sid < head) this.seeded.delete(sid);
+    }
+    return id;
   }
 
   noteMessage(msg, id = 0) {
@@ -99,6 +186,10 @@ class SessionStream {
   /** Write one ring entry to one client unless it already has it. */
   deliver(client, msg, id) {
     if (id <= client.lastSent) return true;
+    if (this.seeded.has(id)) {
+      client.lastSent = id; // history the phone already has
+      return true;
+    }
     let ok = false;
     try {
       ok = client.res.write(`id: ${id}\ndata: ${JSON.stringify(msg)}\n\n`);
@@ -232,79 +323,18 @@ class SessionStream {
     // while ANOTHER client is live gets no replay (its watermark reflects
     // that client; replaying would re-send what the newcomer already had —
     // the fork's 206-duplicate bug).
-    let replay = [];
-    let mode;
-    if (lastEventId > 0) {
-      mode = `resume from ${lastEventId}`;
-      replay = getMessages(this.sid, lastEventId);
-    } else if (needReplay) {
-      mode = "full replay (needReplay)";
-      replay = getMessages(this.sid, 0);
-    } else if (this.clients.size === 0) {
-      replay = this.reconnectWindow();
-      mode = "stream-only reconnect -> turn-window replay";
-    } else {
-      mode = "stream-only (multi-client, no replay)";
-    }
-    console.log(
-      `[hub] ${this.sid.slice(0, 8)}: /events connect Last-Event-ID=${req.headers["last-event-id"] ?? ""} ` +
-        `needReplay=${String(needReplay)} -> ${mode} (${replay.length} replayed)`
-    );
-
     const connectedAt = Date.now();
     let endReason = "loop-exit";
     let closed = false;
-
-    // Replay (watermark advances only after a successful flush).
-    // The official getMessages returns FLATTENED entries ({id, ...msg}).
-    for (const m of replay) {
-      const { id, ...msg } = m;
-      let ok = true;
-      try {
-        ok = res.write(`id: ${id}\ndata: ${JSON.stringify(msg)}\n\n`);
-      } catch {
-        ok = false;
-      }
-      if (!ok) {
-        endReason = "client-dropped (replay)";
-        break;
-      }
-      if (this.lastDeliveredId < id) this.lastDeliveredId = id;
-      this.noteMessage(msg, id);
-    }
-
-    // Everything up to the ring tail is either replayed above or deliberately
-    // skipped (outside the turn window / another client is live); the
-    // catch-up poll forwards only what lands after this point.
-    const client = { res, lastSent: ringTailId(this.sid) };
-    this.clients.add(client);
-    this.onClientAdded?.();
-
-    const heartbeat = setInterval(() => {
-      if (closed) return;
-      // The fork's reconcile: re-assert idle so a dropped turn-end can't leave
-      // the phone stuck on "thinking". Never re-send busy.
-      if (this.state === "idle") {
-        try {
-          res.write(`data: ${JSON.stringify({ type: "status", state: "idle", sessionId: this.sid })}\n\n`);
-        } catch {
-          /* fall through to heartbeat write failure */
-        }
-      }
-      try {
-        if (!res.write(":heartbeat\n\n")) throw new Error("write failed");
-      } catch {
-        close("client-dropped (heartbeat)");
-      }
-    }, this.heartbeatMs);
-    heartbeat.unref?.();
+    let client = null;
+    let heartbeat = null;
 
     const close = (reason) => {
       if (closed) return;
       closed = true;
       endReason = reason;
-      this.clients.delete(client);
-      clearInterval(heartbeat);
+      if (client) this.clients.delete(client);
+      if (heartbeat) clearInterval(heartbeat);
       console.log(`[hub] ${this.sid.slice(0, 8)}: /events closed after ${((Date.now() - connectedAt) / 1000).toFixed(1)}s reason=${endReason}`);
       try {
         res.end();
@@ -312,9 +342,84 @@ class SessionStream {
         /* already gone */
       }
     };
-
     req.on("close", () => close("client-dropped (req close)"));
     res.on("error", (err) => close(`client-dropped (${err.name})`));
+
+    const start = (replay, mode, tail) => {
+      if (closed) return;
+      console.log(
+        `[hub] ${this.sid.slice(0, 8)}: /events connect Last-Event-ID=${req.headers["last-event-id"] ?? ""} ` +
+          `needReplay=${String(needReplay)} -> ${mode} (${replay.length} replayed)`
+      );
+      // Replay (watermark advances only after a successful flush).
+      // The official getMessages returns FLATTENED entries ({id, ...msg}).
+      for (const m of replay) {
+        const { id, ...msg } = m;
+        let ok = true;
+        try {
+          ok = res.write(`id: ${id}\ndata: ${JSON.stringify(msg)}\n\n`);
+        } catch {
+          ok = false;
+        }
+        if (!ok) {
+          close("client-dropped (replay)");
+          return;
+        }
+        if (this.lastDeliveredId < id) this.lastDeliveredId = id;
+        this.noteMessage(msg, id);
+      }
+      // Everything up to `tail` is either replayed above or deliberately
+      // skipped (outside the turn window / another client is live / history
+      // reload covers it); the catch-up poll forwards only what lands after.
+      client = { res, lastSent: tail };
+      this.clients.add(client);
+      this.onClientAdded?.();
+      this.catchUp(); // frames that landed while a connect waited for history
+
+      heartbeat = setInterval(() => {
+        if (closed) return;
+        // The fork's reconcile: re-assert idle so a dropped turn-end can't leave
+        // the phone stuck on "thinking". Never re-send busy.
+        if (this.state === "idle") {
+          try {
+            res.write(`data: ${JSON.stringify({ type: "status", state: "idle", sessionId: this.sid })}\n\n`);
+          } catch {
+            /* fall through to heartbeat write failure */
+          }
+        }
+        try {
+          if (!res.write(":heartbeat\n\n")) throw new Error("write failed");
+        } catch {
+          close("client-dropped (heartbeat)");
+        }
+      }, this.heartbeatMs);
+      heartbeat.unref?.();
+    };
+
+    const tail = ringTailId(this.sid);
+    if (lastEventId > 0) {
+      start(getMessages(this.sid, lastEventId), `resume from ${lastEventId}`, tail);
+    } else if (needReplay) {
+      start(getMessages(this.sid, 0), "full replay (needReplay)", tail);
+    } else if (this.clients.size > 0) {
+      start([], "stream-only (multi-client, no replay)", tail);
+    } else if (this.historyRecent(connectedAt) || !(this.historyGraceMs > 0)) {
+      const { replay, mode } = this.streamOnlyReplay(tail, this.historyRecent(connectedAt));
+      start(replay, mode, tail);
+    } else {
+      // The app usually reloads /history alongside the connect; give that
+      // request a moment so a completed turn isn't sent a second time.
+      let timer = null;
+      const decide = () => {
+        clearTimeout(timer);
+        this.historyWaiters.delete(decide);
+        const { replay, mode } = this.streamOnlyReplay(tail, this.historyRecent());
+        start(replay, mode, tail);
+      };
+      this.historyWaiters.add(decide);
+      timer = setTimeout(decide, this.historyGraceMs);
+      timer.unref?.();
+    }
   }
 }
 
@@ -324,8 +429,9 @@ class SessionStream {
  * the in-process pi provider.
  */
 export class Hub {
-  constructor({ heartbeatMs, catchUpMs } = {}) {
+  constructor({ heartbeatMs, catchUpMs, historyGraceMs } = {}) {
     this.heartbeatMs = heartbeatMs ?? HEARTBEAT_MS;
+    this.historyGraceMs = historyGraceMs ?? 0;
     this.catchUpMs = catchUpMs ?? CATCHUP_MS;
     this.streams = new Map();
     this.catchUpTimer = null;
@@ -335,6 +441,7 @@ export class Hub {
     let s = this.streams.get(sessionId);
     if (!s) {
       s = new SessionStream(sessionId, this.heartbeatMs);
+      s.historyGraceMs = this.historyGraceMs;
       s.onClientAdded = () => this.startCatchUp();
       this.streams.set(sessionId, s);
     }
@@ -372,6 +479,19 @@ export class Hub {
     const id = pushMessage(sessionId, msg);
     s.broadcast(msg, id);
     return id;
+  }
+
+  /**
+   * Put a message in the ring as history the phone already has (it loaded
+   * it through /history): kept for state and later replays, never sent live.
+   */
+  seed(sessionId, msg) {
+    return this.streamFor(sessionId).seed(msg);
+  }
+
+  /** The phone reloaded /history for this session. */
+  noteHistory(sessionId) {
+    this.streamFor(sessionId).noteHistory();
   }
 
   clientCount(sessionId) {
