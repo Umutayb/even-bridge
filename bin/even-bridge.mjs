@@ -19,6 +19,9 @@
 //   --no-pi-all-cwds    list pi sessions for the project dir only (default: all)
 //   --pi-agent-dir <d>  pi agent dir (default: ~/.pi/agent)
 
+// Must stay the first import: loads ~/.even-terminal/bridge.env before the
+// official dist modules read their env at import time.
+import "../src/env-file-preload.mjs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";

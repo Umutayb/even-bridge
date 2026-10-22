@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Idempotent dist patch for @evenrealities/even-terminal: make the
 // glasses-spawned CC permission mode configurable (EVEN_BRIDGE_CC_PERMISSION_MODE,
-// default "auto"). The official dist hardcodes permissionMode: "default", which
+// default "auto") and the model (EVEN_BRIDGE_CC_MODEL). The official dist hardcodes permissionMode: "default", which
 // prompts the wearer for every non-auto tool call; a late or missed answer
 // (60s waitForUser timeout, or an aborted SSE stream) resolves to DENY and wedges
 // the session ("Stream closed"). Run after any `npm update` — server.mjs
@@ -17,10 +17,8 @@ const anchor = "const CLAUDE_CODE_EXECUTABLE = process.env.EVEN_TERMINAL_CLAUDE_
 const marker = "EVEN_BRIDGE_CC_PERMISSION_MODE";
 
 let s = readFileSync(target, "utf8");
-if (s.includes(marker)) {
-  console.log("[patch-dist] already patched — nothing to do");
-  process.exit(0);
-}
+const applied = [];
+if (!s.includes(marker)) {
 if (!s.includes(anchor)) {
   console.error("[patch-dist] anchor not found — the dist changed shape; patch by hand.");
   process.exit(1);
@@ -40,5 +38,31 @@ if (!s.includes(oldLine)) {
   process.exit(1);
 }
 s = s.replace(oldLine, "                permissionMode: EVEN_BRIDGE_CC_PERMISSION_MODE,", 1);
-writeFileSync(target, s, "utf8");
-console.log("[patch-dist] applied permission-mode env patch to", target);
+applied.push("permission-mode");
+}
+
+// Patch 2: model for glasses-spawned CC sessions (EVEN_BRIDGE_CC_MODEL). Read
+// per launch, so ~/.even-terminal/bridge.env edits apply without a restart.
+// Unset/empty = the CLI default (~/.claude/settings.json "model").
+const modelMarker = "EVEN_BRIDGE_CC_MODEL";
+const modelAnchor = "                permissionMode: EVEN_BRIDGE_CC_PERMISSION_MODE,";
+if (!s.includes(modelMarker)) {
+  if (!s.includes(modelAnchor)) {
+    console.error("[patch-dist] model anchor not found — patch by hand.");
+    process.exit(1);
+  }
+  s = s.replace(
+    modelAnchor,
+    modelAnchor +
+      "\n                ...((process.env.EVEN_BRIDGE_CC_MODEL || \"\").trim() ? { model: process.env.EVEN_BRIDGE_CC_MODEL.trim() } : {}),",
+    1,
+  );
+  applied.push("model");
+}
+
+if (applied.length) {
+  writeFileSync(target, s, "utf8");
+  console.log(`[patch-dist] applied ${applied.join(" + ")} env patch to`, target);
+} else {
+  console.log("[patch-dist] already patched — nothing to do");
+}

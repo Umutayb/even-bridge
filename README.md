@@ -162,6 +162,21 @@ Bridge flags:
 | `--no-pi-all-cwds` | `EVEN_BRIDGE_PI_ALL_CWDS=0` | all cwds | scope pi list to project dir |
 | `--pi-agent-dir <d>` | `EVEN_BRIDGE_PI_AGENT_DIR` | `~/.pi/agent` | pi agent dir |
 
+## Live settings (`~/.even-terminal/bridge.env`)
+
+`KEY=VALUE` lines, loaded before anything else at startup and re-read within
+~2 s of every edit (`src/env-file.mjs`). Values there win over the systemd
+unit's `Environment=`; a key removed from the file falls back to the unit's
+value. Override the path with `EVEN_BRIDGE_ENV_FILE`.
+
+| key | live? | meaning |
+| --- | --- | --- |
+| `EVEN_BRIDGE_NEW_SESSION_PROVIDER` | yes | what a new glasses session runs: `claude` (stock Claude Code), `pi`, `claude-remote` |
+| `EVEN_BRIDGE_CC_MODEL` | yes | model for glasses-spawned Claude Code (`claude-opus-5-5`, `sonnet`, ...); unset = `~/.claude/settings.json` |
+| `EVEN_TERMINAL_CLAUDE_CODE_EXECUTABLE` | restart | Claude Code CLI to launch; the SDK-bundled one lags and rejects new models |
+
+Restart without sudo: `pkill -f bin/even-bridge.mjs` (`Restart=always` brings it back).
+
 ## How it routes
 
 The extension router (`src/ext-router.mjs`) intercepts `/api/*` before the
