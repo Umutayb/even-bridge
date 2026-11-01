@@ -13,7 +13,8 @@
 # "assistant" session); with no conversation yet it starts a fresh one.
 #
 # Tunables (env): EVEN_PI_CWD, EVEN_PI_TMUX_SESSION, EVEN_PI_AGENT_DIR,
-# EVEN_PI_PATH.
+# EVEN_PI_PATH, EVEN_PI_BIN (what runs pi in the pane: lets-code when it is
+# on the pane's PATH, so the pane's pi has lets-code's modules on; else pi).
 set -eu
 
 CWD="${EVEN_PI_CWD:-$HOME/github}"
@@ -58,6 +59,13 @@ fi
 # even-pi-tmux unit (install-services.sh) already puts on our own PATH.
 PANE_PATH="${EVEN_PI_PATH:-$PATH}"
 
+# What starts pi in the pane: lets-code when it is installed (its modules
+# turn on only in a pi it launched), else pi itself.
+PI_LAUNCH="${EVEN_PI_BIN:-}"
+if [ -z "$PI_LAUNCH" ]; then
+  if PATH="$PANE_PATH" command -v lets-code >/dev/null 2>&1; then PI_LAUNCH=lets-code; else PI_LAUNCH=pi; fi
+fi
+
 # Model auth: pi's models.json lets-code provider needs $LETS_CODE_TOKEN (any
 # non-empty value; the endpoint does not validate keys) or pi hangs before its
 # first model call. The unit loads /etc/even-terminal.env (EnvironmentFile);
@@ -70,10 +78,10 @@ if [ -n "$latest" ]; then
   echo "ensure-pi-tmux: starting tmux session '$SESSION_NAME' — resuming $(basename "$latest") in $CWD" >&2
   set -- new-session -d -s "$SESSION_NAME" -c "$CWD" -e "PATH=$PANE_PATH"
   if [ -n "${LETS_CODE_TOKEN:-}" ]; then set -- "$@" -e "LETS_CODE_TOKEN=$LETS_CODE_TOKEN"; fi
-  exec tmux "$@" "pi --session $latest"
+  exec tmux "$@" "$PI_LAUNCH --session $latest"
 fi
 
 echo "ensure-pi-tmux: starting tmux session '$SESSION_NAME' — fresh pi in $CWD" >&2
 set -- new-session -d -s "$SESSION_NAME" -c "$CWD" -e "PATH=$PANE_PATH"
 if [ -n "${LETS_CODE_TOKEN:-}" ]; then set -- "$@" -e "LETS_CODE_TOKEN=$LETS_CODE_TOKEN"; fi
-exec tmux "$@" pi
+exec tmux "$@" "$PI_LAUNCH"

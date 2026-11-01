@@ -91,11 +91,28 @@ else
   PI_BIN=""
 fi
 
+# lets-code, when installed, launches pi for the bridge and the tmux pane (so
+# lets-code's modules are on there); its dir goes on the units' PATH too
+LC_BIN="${LC_BIN:-}"
+if [ -z "$LC_BIN" ]; then
+  LC_BIN="$(su -l -s /bin/bash "$HOST_USER" -c 'command -v lets-code' 2>/dev/null | tail -1 || true)"
+fi
+if [ -n "$LC_BIN" ] && [ -x "$LC_BIN" ]; then
+  note "lets-code: $LC_BIN (pi sessions start through it)"
+else
+  note "lets-code not found on $HOST_USER's PATH: pi sessions start as a bare pi"
+  LC_BIN=""
+fi
+
 # PATH baked into the units: user bins, node's dir (non-interactive systemd
-# shells otherwise get an EOL /usr/bin/node), pi's dir, then the system dirs.
+# shells otherwise get an EOL /usr/bin/node), pi's and lets-code's dirs, then
+# the system dirs.
 UNIT_PATH="$HOME_DIR/.local/bin:$(dirname "$NODE_BIN")"
 if [ -n "$PI_BIN" ]; then
   case ":$UNIT_PATH:" in *":$(dirname "$PI_BIN"):"*) ;; *) UNIT_PATH="$UNIT_PATH:$(dirname "$PI_BIN")" ;; esac
+fi
+if [ -n "$LC_BIN" ]; then
+  case ":$UNIT_PATH:" in *":$(dirname "$LC_BIN"):"*) ;; *) UNIT_PATH="$UNIT_PATH:$(dirname "$LC_BIN")" ;; esac
 fi
 UNIT_PATH="$UNIT_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 

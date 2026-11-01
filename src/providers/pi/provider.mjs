@@ -12,7 +12,8 @@
 //  * messages emitted before the session id is known are buffered per session
 //    and flushed when the id resolves (the reference dropped them).
 
-import { readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync } from "node:fs";
+import { basename, delimiter, join } from "node:path";
 import { PiSession } from "./session.mjs";
 import {
   listSessionFiles,
@@ -37,10 +38,30 @@ function isFlag(v) {
   return v === false || v === "0" || v === "false" || v === "no";
 }
 
+// pi through lets-code when lets-code is installed: lets-code's modules
+// (grounding, agent guard, subagents, experts, core memory, sessions...) turn
+// on only in a pi that lets-code launched; a bare `pi` loads them switched
+// off. lets-code keeps pi's RPC stdout to the protocol alone (its own lines
+// go to stderr). EVEN_BRIDGE_PI_BIN=pi (or --pi-bin) keeps a bare pi.
+export function defaultPiBin(env = process.env) {
+  for (const d of String(env.PATH ?? "").split(delimiter)) {
+    if (!d) continue;
+    try { accessSync(join(d, "lets-code"), constants.X_OK); return "lets-code"; } catch { /* not here */ }
+  }
+  return "pi";
+}
+export const isLetsCode = (bin) => /^lets-code$/.test(basename(String(bin ?? "")));
+// lets-code's --model is a model id on its own server: a "lets-code/<id>"
+// (pi's provider/id form) is given as <id>
+export function launcherModel(bin, model) {
+  if (!model || !isLetsCode(bin)) return model;
+  return model.startsWith("lets-code/") ? model.slice("lets-code/".length) : model;
+}
+
 export function resolvePiConfig(flags = {}) {
   return {
     enabled: !isFlag(flags.piEnable ?? process.env.EVEN_BRIDGE_PI_ENABLE ?? "1"),
-    bin: flags.piBin ?? process.env.EVEN_BRIDGE_PI_BIN ?? "pi",
+    bin: flags.piBin ?? process.env.EVEN_BRIDGE_PI_BIN ?? defaultPiBin(),
     model: flags.piModel ?? process.env.EVEN_BRIDGE_PI_MODEL ?? "",
     allCwds: !isFlag(flags.piAllCwds ?? process.env.EVEN_BRIDGE_PI_ALL_CWDS ?? "1"),
     agentDir: flags.piAgentDir ?? process.env.EVEN_BRIDGE_PI_AGENT_DIR ?? undefined,
@@ -528,7 +549,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
 
   function rpcOpts() {
     const o = { bin: cfg.bin };
-    if (cfg.model) o.model = cfg.model;
+    if (cfg.model) o.model = launcherModel(cfg.bin, cfg.model);
     return o;
   }
 
