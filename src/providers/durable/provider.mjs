@@ -5,7 +5,9 @@
 // One process owns one Harness (SQLite store, `~/.even-terminal/durable.sqlite`)
 // and a SessionMap (its own SQLite file) that maps the bridge's "dur-<uuid>"
 // session ids to Durable conversation ids. Every conversation runs CodingTools
-// behind the guard extension (path confinement, command vetting, resource caps).
+// behind the guard extension (path confinement, command vetting, resource caps)
+// and offers the `subagent` tool (lets-code agent files, owned child
+// conversations that keep the guard and work in the parent's cwd).
 //
 // Wire frames come from `conversation.watch()` views through ViewTranslator.
 // A watcher runs while a conversation is busy (so the ring fills without any
@@ -33,6 +35,8 @@ import { openDurable } from "./harness.mjs";
 import { SessionMap } from "./sessions.mjs";
 import { ViewTranslator } from "./wire.mjs";
 import { createGuardExtension, shellEnv as guardShellEnv } from "./guard.mjs";
+import { loadAgentFiles } from "./agent-files.mjs";
+import { createSubagentExtension } from "./subagent.mjs";
 
 const NAME = "durable";
 const WIRE_PROVIDER = "claude";
@@ -148,6 +152,9 @@ function parseMaxTurns(v) {
  * @param {object} [o.guard] extra options for createGuardExtension (tests: `{ wrapper: "none" }`).
  * @param {object} [o.settings] extra HarnessSettings.
  * @param {number} [o.historyWindow] entries history/seed reads look at.
+ * @param {string} [o.agentsDir] lets-code agent files the `subagent` tool offers.
+ * @param {Map<string, object>} [o.agents] ready agent definitions instead of `agentsDir` (tests).
+ * @param {object} [o.subagent] extra options for createSubagentExtension (e.g. `defaultTimeoutS`).
  */
 export function createDurableProvider(
   emitRaw,
@@ -164,18 +171,50 @@ export function createDurableProvider(
     settings,
     env = process.env,
     historyWindow = HISTORY_WINDOW,
+    agentsDir = "~/.pi/agent/agents",
+    agents,
+    subagent = {},
   } = {},
 ) {
   const map = new SessionMap(storePath);
   const { models, refs, default: defaultRef } = loadPiModels(modelsPath, env);
-  const guardExt = createGuardExtension({
-    cwdOf: (conversationId) => map.byConversation(conversationId)?.cwd,
-    ...guard,
+  // Subagent children are owned conversations the session map does not know:
+  // child conversation id → parent conversation id. Filled when the subagent
+  // tool creates (or, on a rerun, reuses) a child, and on open from the
+  // ownership index. A child resolves to its parent's cwd (its own agent cwd is
+  // a copy of it); an unknown conversation stays undefined, which the guard blocks.
+  const childParents = new Map();
+  const cwdOf = (conversationId) => {
+    let id = conversationId;
+    for (let hops = 0; hops < 8; hops++) {
+      const row = map.byConversation(id);
+      if (row) return row.cwd;
+      if (!childParents.has(id)) return undefined;
+      id = childParents.get(id);
+    }
+    return undefined;
+  };
+  const guardExt = createGuardExtension({ cwdOf, ...guard });
+  const subagentExt = createSubagentExtension({
+    agents: agents ?? loadAgentFiles(agentsDir, { log }),
+    ...subagent,
+    onChild: ({ childId, parentId }) => childParents.set(childId, parentId),
   });
   const registry = createRegistry();
   registry.install(CodingTools);
   registry.install(guardExt); // after CodingTools: the guard's bash (with resource caps) wins
-  const EXTENSIONS = [CodingTools, guardExt];
+  registry.install(subagentExt); // children keep the guard and drop this one
+  const EXTENSIONS = [CodingTools, guardExt, subagentExt];
+
+  /** Record the subagent children of `conv` (after a restart, before their tools reach the guard again). */
+  async function noteChildren(conv) {
+    let cursor;
+    do {
+      const page = await conv.commit((tx) => tx.scanConversations({ ownerConversationId: conv.id }, 100, cursor), durable.ctx);
+      for (const c of page.items) childParents.set(c.id, conv.id);
+      cursor = page.next;
+    } while (cursor !== undefined);
+  }
   // Defense in depth: the guard's `prepare` already rebuilds the bash env from
   // its allowlist; the environment itself starts from that allowlist too.
   const shellEnv = guardShellEnv({ PI_TELEMETRY: "0" }, env);
@@ -212,6 +251,12 @@ export function createDurableProvider(
       const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
       for (const row of map.rows({ seenSince: since })) {
         if (row.conversation_id == null) continue;
+        try {
+          const conv = await durable.harness.conversation(row.conversation_id, durable.ctx);
+          if (conv) await noteChildren(conv);
+        } catch (err) {
+          log.warn?.(`[durable] subagent children of ${row.sid}: ${err.message}`);
+        }
         try {
           const lv = await durable.harness.snapshot(LiveDoc, row.conversation_id, durable.ctx);
           if (lv?.run) {
@@ -686,6 +731,7 @@ export function createDurableProvider(
       return durable?.harness;
     },
     _live: live,
+    _childParents: childParents,
     _lastLines: lastLines,
     _idleWaiters: idleWaiters,
     _untilIdle: untilIdle,

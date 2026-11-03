@@ -40,6 +40,7 @@ function setup(extra = {}) {
     allowedCwds: [dir],
     guard: { wrapper: "none", log: () => {} },
     log: { warn() {}, error() {}, log() {} },
+    agentsDir: join(dir, "no-agents"),
     ...extra,
   });
   return { provider, frames, work, dir };
@@ -95,8 +96,9 @@ test("new session creates a conversation and emits a full turn to the hub", asyn
   assert.equal(agent.cwd, work);
   assert.equal(agent.maxTurns, DEFAULT_MAX_TURNS);
   assert.equal(agent.instructions, AGENT_INSTRUCTIONS);
-  assert.equal(agent.extensions.at(-1).name, "even-guard"); // after CodingTools: its bash wins
-  assert.equal(agent.extensions.length, 2);
+  // CodingTools, then the guard (its bash wins), then the subagent tool.
+  assert.deepEqual(agent.extensions.slice(1).map((e) => e.name), ["even-guard", "even-subagent"]);
+  assert.equal(agent.extensions.length, 3);
   assert.equal(provider.probe(sessionId), true);
   assert.equal(getOwner(sessionId), "durable");
   assert.deepEqual(await provider.getHistory(sessionId, 10), [
