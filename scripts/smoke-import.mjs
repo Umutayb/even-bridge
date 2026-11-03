@@ -15,6 +15,14 @@ const MODULES = [
   "../src/providers/pi/rpc-client.mjs",
   "../src/providers/pi/session.mjs",
   "../src/providers/pi/provider.mjs",
+  "../src/providers/durable/models.mjs",
+  "../src/providers/durable/harness.mjs",
+  "../src/providers/durable/sessions.mjs",
+  "../src/providers/durable/wire.mjs",
+  "../src/providers/durable/guard.mjs",
+  "../src/providers/durable/agent-files.mjs",
+  "../src/providers/durable/subagent.mjs",
+  "../src/providers/durable/provider.mjs",
   "../src/server.mjs",
 ];
 

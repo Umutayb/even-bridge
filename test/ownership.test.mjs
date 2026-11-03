@@ -68,6 +68,7 @@ test("probeOwners: a throwing prober does not break routing", async () => {
 test("isExtendedProvider", () => {
   assert.ok(isExtendedProvider("claude-remote"));
   assert.ok(isExtendedProvider("pi"));
+  assert.ok(isExtendedProvider("durable"));
   assert.ok(!isExtendedProvider("claude"));
   assert.ok(!isExtendedProvider("codex"));
 });

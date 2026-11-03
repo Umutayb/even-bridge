@@ -72,7 +72,7 @@ function stubPi() {
 /** Build an app with ONLY the ext router + a fall-through sentinel.
  *  The official default provider is injected (hermetic — never touches
  *  the user's ~/.claude or ~/.codex). */
-async function buildApp(t, { rc, pi, local = localProvider, rcTranscriptBase }) {
+async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase }) {
   const { createExtRouter } = await import("../src/ext-router.mjs");
   const hub = new Hub();
   const app = express();
@@ -82,7 +82,7 @@ async function buildApp(t, { rc, pi, local = localProvider, rcTranscriptBase }) 
     "/api",
     createExtRouter({
       hub,
-      providers: [rc, pi],
+      providers: [rc, pi, durable],
       getDefaultLocalProvider: () => local,
       rcTranscriptBase,
     })
@@ -374,4 +374,167 @@ test("/api/events serves the hub SSE stream for owned sessions", async (t) => {
   ac.abort();
   assert.match(buf, /:ok/);
   assert.match(buf, /"text":"earlier"/);
+});
+
+// ── Durable agents ─────────────────────────────────────────────────────────
+
+function stubDurable() {
+  const calls = { prompt: [], stop: [] };
+  return {
+    calls,
+    name: "durable",
+    wireProvider: "claude",
+    probe: (sid) => sid.startsWith("dur-"),
+    listSessions: async () => [],
+    getSessionStatus: async () => "idle",
+    getHistory: async () => [],
+    prompt: async (sid, text, cwd, opts) => {
+      calls.prompt.push({ sid, text, cwd, opts });
+      return { sessionId: sid ?? "dur-new", provider: "claude", submissionId: "sub-1" };
+    },
+    getStatus: (sid) => (sid.startsWith("dur-") ? { state: "idle", provider: "claude" } : null),
+    listAgents: async () => [{ sid: "dur-1", name: "fixer", cwd: "/w", model: "qwen", state: "busy", lastLine: "ok" }],
+    stopSession: async (sid) => {
+      if (!sid.startsWith("dur-")) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+      calls.stop.push(sid);
+    },
+  };
+}
+
+async function listen(t, app) {
+  const server = app.listen(0);
+  t.after(() => { server.close(); server.closeAllConnections(); });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+const postJson = (url, body) =>
+  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+test("/prompt passes the agent fields to the provider's prompt as its 4th argument", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+
+  const r = await postJson(`${base}/api/prompt`, {
+    provider: "durable", text: "fix the tests", cwd: "/w/proj",
+    name: "fixer", model: "qwen", maxTurns: 12, requestId: "req-1", origin: "evenai",
+  });
+  assert.equal(r.status, 202);
+  assert.deepEqual(await r.json(), { ok: true, sessionId: "dur-new", provider: "claude", submissionId: "sub-1" });
+  assert.deepEqual(durable.calls.prompt, [{
+    sid: undefined, text: "fix the tests", cwd: "/w/proj",
+    opts: { name: "fixer", model: "qwen", maxTurns: 12, requestId: "req-1", origin: "evenai" },
+  }]);
+
+  // Fields the caller did not send are absent, not undefined.
+  claim("dur-1", "durable");
+  await postJson(`${base}/api/prompt`, { sessionId: "dur-1", text: "and the docs" });
+  assert.deepEqual(durable.calls.prompt[1], { sid: "dur-1", text: "and the docs", cwd: undefined, opts: {} });
+});
+
+test("/prompt to other providers keeps the 3-argument call and no submissionId", async (t) => {
+  const pi = stubPi();
+  const argc = [];
+  const inner = pi.prompt;
+  pi.prompt = function (...args) {
+    argc.push(args.length);
+    return inner(...args);
+  };
+  const { app } = await buildApp(t, { rc: stubRc(), pi, durable: stubDurable() });
+  const base = await listen(t, app);
+  // Agent fields (even invalid ones) are neither validated nor passed for pi.
+  const r = await postJson(`${base}/api/prompt`, { provider: "pi", text: "hi", name: "x".repeat(99), maxTurns: "lots" });
+  assert.equal(r.status, 202);
+  assert.deepEqual(await r.json(), { ok: true, sessionId: "pi-new", provider: "claude" });
+  assert.deepEqual(argc, [3]);
+});
+
+test("/prompt validates the durable agent fields (400 with a clear error)", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = [
+    [{ name: "x".repeat(25) }, /'name'/],
+    [{ name: "rm -rf /;" }, /'name'/],
+    [{ name: "" }, /'name'/],
+    [{ name: 7 }, /'name'/],
+    [{ maxTurns: 0 }, /'maxTurns'/],
+    [{ maxTurns: 61 }, /'maxTurns'/],
+    [{ maxTurns: 2.5 }, /'maxTurns'/],
+    [{ maxTurns: "12a" }, /'maxTurns'/],
+    [{ maxTurns: "-3" }, /'maxTurns'/],
+    [{ requestId: "r".repeat(129) }, /'requestId'/],
+    [{ requestId: 42 }, /'requestId'/],
+    [{ origin: "shell" }, /'origin'/],
+    [{ model: "m".repeat(33) }, /'model'/],
+    [{ model: ["qwen"] }, /'model'/],
+  ];
+  for (const [fields, re] of bad) {
+    const r = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", ...fields });
+    assert.equal(r.status, 400, JSON.stringify(fields));
+    assert.match((await r.json()).error, re, JSON.stringify(fields));
+  }
+  assert.equal(durable.calls.prompt.length, 0, "no rejected prompt reached the provider");
+
+  // Boundaries accepted; a digit-only maxTurns string becomes a number.
+  const r = await postJson(`${base}/api/prompt`, {
+    provider: "durable", text: "go", cwd: "/w",
+    name: "fix-the_tests v2.0 abcdef", model: "m".repeat(32), maxTurns: "60",
+    requestId: "r".repeat(128), origin: "phone",
+  });
+  assert.equal(r.status, 400, "a 25-char name is still too long");
+  const ok = await postJson(`${base}/api/prompt`, {
+    provider: "durable", text: "go", cwd: "/w",
+    name: "fix-the_tests v2.0 abcde", model: "m".repeat(32), maxTurns: "60",
+    requestId: "r".repeat(128), origin: "phone",
+  });
+  assert.equal(ok.status, 202);
+  assert.deepEqual(durable.calls.prompt[0].opts, {
+    name: "fix-the_tests v2.0 abcde", model: "m".repeat(32), maxTurns: 60,
+    requestId: "r".repeat(128), origin: "phone",
+  });
+});
+
+test("GET /agents returns the durable provider's listAgents()", async (t) => {
+  const durable = stubDurable();
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/agents`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { agents: await durable.listAgents() });
+  assert.equal(fellThrough.length, 0);
+});
+
+test("POST /agents/:sid/stop calls stopSession; unknown sid is 404", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/agents/dur-1/stop`, {});
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true, sessionId: "dur-1" });
+  assert.deepEqual(durable.calls.stop, ["dur-1"]);
+
+  r = await postJson(`${base}/api/agents/nope/stop`, {});
+  assert.equal(r.status, 404);
+  assert.deepEqual(durable.calls.stop, ["dur-1"]);
+});
+
+test("/agents routes fall through (next()) without the durable provider, as before they existed", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi() });
+  const base = await listen(t, app);
+  await fetch(`${base}/api/agents`);
+  await postJson(`${base}/api/agents/dur-1/stop`, {});
+  assert.equal(fellThrough.length, 2);
+});
+
+test("a durable prompt without a cwd reaches the provider with no cwd (never PROJECT_DIR)", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const prev = process.env.PROJECT_DIR;
+  process.env.PROJECT_DIR = "/home/u/github/even-bridge";
+  t.after(() => (prev === undefined ? delete process.env.PROJECT_DIR : (process.env.PROJECT_DIR = prev)));
+  const r = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go" });
+  assert.equal(r.status, 202);
+  assert.equal(durable.calls.prompt[0].cwd, undefined);
 });

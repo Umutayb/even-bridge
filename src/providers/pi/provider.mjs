@@ -12,7 +12,7 @@
 //  * messages emitted before the session id is known are buffered per session
 //    and flushed when the id resolves (the reference dropped them).
 
-import { accessSync, constants, readFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, statSync } from "node:fs";
 import { basename, delimiter, join } from "node:path";
 import { PiSession } from "./session.mjs";
 import {
@@ -85,6 +85,27 @@ function waitForId(session, ms = 10_000) {
       }
     }, 100);
   });
+}
+
+function isDir(p) {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Where a new pi session starts: the phone's folder, else the bridge's. A
+ * folder that does not exist here would make spawn fail with a misleading
+ * ENOENT on the pi binary, so the first existing of cwd, defaultCwd and HOME
+ * stands in for it.
+ * @returns {{ cwd: string | undefined, missing?: string }}
+ */
+export function startCwdFor(phoneCwd, cwd, defaultCwd, home = process.env.HOME) {
+  const want = phoneCwd ?? cwd ?? defaultCwd;
+  if (!want || isDir(want)) return { cwd: want };
+  return { cwd: [cwd, defaultCwd, home].find((d) => d && isDir(d)), missing: want };
 }
 
 /**
@@ -462,7 +483,8 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
         }
         if (!session) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
       } else {
-        const startCwd = phoneCwd ?? cwd ?? defaultCwd;
+        const { cwd: startCwd, missing } = startCwdFor(phoneCwd, cwd, defaultCwd);
+        if (missing) console.log(`[pi] new session: cwd ${missing} does not exist, using ${startCwd}`);
         session = new PiSession(directEmit, {
           cwd: startCwd,
           ...rpcOpts(),

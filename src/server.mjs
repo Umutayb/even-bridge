@@ -4,7 +4,7 @@
 // auth, hook endpoint, transport attach, pidfile, expose, logging, shutdown)
 // and inserts the extension router BEFORE the official events/core routers:
 //
-//   app.use("/api", auth, extRouter);     // extended sessions (claude-remote, pi)
+//   app.use("/api", auth, extRouter);     // extended sessions (claude-remote, pi, durable)
 //   app.use("/api", auth, eventsRouter);  // official SSE (local claude/codex)
 //   app.use("/api", auth, coreRouter);    // official routes
 //
@@ -12,7 +12,9 @@
 // untouched; extended sessions are served from the shared ring by the hub.
 
 import http from "node:http";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve, sep } from "node:path";
 import express from "express";
 import cors from "cors";
 
@@ -44,6 +46,56 @@ import { resolvePiConfig, createPiProvider } from "./providers/pi/provider.mjs";
 import { createCcLocalProvider } from "./cc-local.mjs";
 import { getProvider } from "@evenrealities/even-terminal/dist/routes/core.js";
 import { getDefaultProvider } from "@evenrealities/even-terminal/dist/session.js";
+
+const DURABLE_CLOSE_MS = 3000; // signal shutdown: max wait for the durable store to close
+
+/** True when the durable (Pi Durable) provider is switched on: EVEN_BRIDGE_DURABLE_ENABLE=1. */
+export function durableEnabled(env = process.env) {
+  return String(env.EVEN_BRIDGE_DURABLE_ENABLE ?? "").trim() === "1";
+}
+
+/**
+ * createDurableProvider options from the environment, or null when the flag is
+ * off. EVEN_BRIDGE_DURABLE_CWDS is a colon-separated list of roots; a new
+ * agent's cwd must lie strictly below one. A durable prompt without a cwd
+ * works in EVEN_BRIDGE_DURABLE_DEFAULT_CWD, default `<first root>/glasses`
+ * (created on demand) — never the bridge's PROJECT_DIR.
+ * @param {object} env
+ */
+export function durableOptions(env = process.env) {
+  if (!durableEnabled(env)) return null;
+  const allowedCwds = String(env.EVEN_BRIDGE_DURABLE_CWDS ?? "")
+    .split(":")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const opts = {
+    defaultCwd: env.EVEN_BRIDGE_DURABLE_DEFAULT_CWD?.trim() || `${(allowedCwds[0] ?? DURABLE_DEFAULT_ROOT).replace(/\/+$/, "")}/glasses`,
+    allowedCwds,
+  };
+  if (env.EVEN_BRIDGE_DURABLE_STORE) opts.storePath = env.EVEN_BRIDGE_DURABLE_STORE;
+  if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
+  return opts;
+}
+
+/** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
+export const DURABLE_DEFAULT_ROOT = "~/sandbox/agents";
+
+/**
+ * Would a new agent be allowed to work in `dir`? The same rule as the
+ * provider's resolveAgentCwd (strictly below a root; never ~ or /; no roots
+ * configured = DURABLE_DEFAULT_ROOT) but without its side effect (it creates
+ * missing dirs). Used for the startup warning about the default cwd.
+ */
+export function cwdAllowed(dir, roots = [], home = homedir()) {
+  if (!dir) return false;
+  const expand = (p) => resolve(p === "~" ? home : p.startsWith("~/") ? home + p.slice(1) : p);
+  const real = (p) => (existsSync(p) ? realpathSync(p) : p);
+  const d = real(expand(dir));
+  if (d === real(home) || d === "/") return false;
+  const configured = roots.filter(Boolean);
+  const rs = (configured.length ? configured : [DURABLE_DEFAULT_ROOT]).map((r) => real(expand(r)));
+  return rs.some((r) => d.startsWith(r + sep));
+}
 
 /**
  * @param {{ flags?: object, cwd?: string }} opts flags = CLI flags (rcUrl, rcToken,
@@ -98,11 +150,37 @@ export async function startServer({ flags = {}, cwd } = {}) {
     process.env.EVEN_BRIDGE_CC_DISABLED === "1"
       ? null
       : createCcLocalProvider(emit, { hub, official: () => getProvider("claude") });
+  // Pi Durable conversations (glasses-started agents), only with
+  // EVEN_BRIDGE_DURABLE_ENABLE=1. Imported lazily so a flag-off bridge never
+  // loads pi-durable; a store/models failure leaves the rest of the bridge up.
+  let durableProvider = null;
+  let durableState = "off";
+  const durableOpts = durableOptions(process.env);
+  if (durableOpts) {
+    let p = null;
+    try {
+      const { createDurableProvider } = await import("./providers/durable/provider.mjs");
+      p = createDurableProvider(emit, { hub, ...durableOpts });
+      await p.ready; // store open + resumed (undefined on providers without it)
+      durableProvider = p;
+      durableState = `on wrapper=${p.wrapper ?? "none"}`;
+    } catch (err) {
+      durableState = `failed: ${err.message}`;
+      p?.stopAll().catch(() => {});
+    }
+    if (durableProvider && !cwdAllowed(durableOpts.defaultCwd, durableOpts.allowedCwds)) {
+      console.warn(
+        `[bridge] durable: default cwd ${durableOpts.defaultCwd} is not under EVEN_BRIDGE_DURABLE_CWDS ` +
+          `(${durableOpts.allowedCwds.join(":") || `unset, so ${DURABLE_DEFAULT_ROOT}`}); prompts without a cwd will be refused`,
+      );
+    }
+  }
 
   // Self-heal the dist patch (CC permission-mode env override) on every start.
   // Idempotent + no-op when already applied, so a reboot or an `npm update` that
   // refreshed node_modules can't leave the official CC permission behavior stale.
-  try {
+  // EVEN_BRIDGE_SKIP_PATCH_DIST=1 skips it (test children must not touch node_modules).
+  if (process.env.EVEN_BRIDGE_SKIP_PATCH_DIST !== "1") try {
     const { execFileSync } = await import("node:child_process");
     const { fileURLToPath } = await import("node:url");
     const { dirname, join } = await import("node:path");
@@ -116,12 +194,12 @@ export async function startServer({ flags = {}, cwd } = {}) {
   }
 
   console.log(
-    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}`
+    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}, durable=${durableState}`
   );
 
   const extRouter = createExtRouter({
     hub,
-    providers: [rcProvider, piProvider, ccProvider],
+    providers: [rcProvider, piProvider, durableProvider, ccProvider],
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
   });
 
@@ -206,22 +284,32 @@ export async function startServer({ flags = {}, cwd } = {}) {
     console.error(`[server] UNHANDLED REJECTION: ${reason}`);
   });
 
+  let durableClosing; // the one stopAll() promise (shutdown can run twice: signal, then exit)
   function shutdown() {
     stopCodexAppServer();
     piProvider?.stopAll().catch(() => {});
+    // No abort: unfinished durable runs stay pending and resume on the next start.
+    durableClosing ??= durableProvider?.stopAll();
+    durableClosing?.catch(() => {});
     rcProvider?._pumps &&
       [...rcProvider._pumps.pumps.keys()].forEach((sid) => rcProvider.stopPump(sid).catch(() => {}));
     removeInstancePidfile();
   }
+  // Signals: give the durable store up to 3 s to close cleanly before exiting
+  // (the `exit` event cannot wait, so it keeps the fire-and-forget path).
+  async function shutdownAndExit() {
+    shutdown();
+    if (durableClosing) {
+      await Promise.race([
+        durableClosing.then(() => console.log("[bridge] durable store closed")),
+        new Promise((r) => setTimeout(r, DURABLE_CLOSE_MS).unref()),
+      ]).catch((err) => console.warn(`[bridge] durable close failed: ${err.message}`));
+    }
+    process.exit(0);
+  }
   process.on("exit", shutdown);
-  process.on("SIGINT", () => {
-    shutdown();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    shutdown();
-    process.exit(0);
-  });
+  process.on("SIGINT", shutdownAndExit);
+  process.on("SIGTERM", shutdownAndExit);
 
   return { app, httpServer, hub };
 }

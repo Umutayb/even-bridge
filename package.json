@@ -14,13 +14,16 @@
     "test": "node --test 'test/*.test.mjs'"
   },
   "dependencies": {
+    "@earendil-works/chord": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-durable": "1.5.0",
     "@evenrealities/even-terminal": "0.10.4",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "yargs": "^18.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19"
   },
   "allowScripts": {
     "@evenrealities/even-terminal@0.10.4": true,

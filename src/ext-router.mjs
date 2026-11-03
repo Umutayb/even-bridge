@@ -25,6 +25,54 @@ import { listCcSessions, ccProjectsBase } from "./cc-transcripts.mjs";
 
 const STATUS_CHECK_COUNT = 10; // mirrors core.js
 
+// Durable prompt fields (POST /api/prompt): limits per the plan's rulings.
+export const AGENT_LIMITS = Object.freeze({ nameMax: 24, maxTurns: 60, requestIdMax: 128, modelMax: 32 });
+export const AGENT_ORIGINS = Object.freeze(["evenai", "phone"]);
+const NAME_RE = /^[\w .-]+$/;
+
+/**
+ * Validate the durable prompt fields. Absent (undefined/null) fields are left
+ * out; `maxTurns` may be a number or a digit-only string and comes back a number.
+ * @returns {{ opts: object } | { error: string }}
+ */
+export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
+  const opts = {};
+  const L = AGENT_LIMITS;
+  if (name != null) {
+    if (typeof name !== "string" || name.length < 1 || name.length > L.nameMax || !NAME_RE.test(name)) {
+      return { error: `'name' must be 1-${L.nameMax} characters of letters, digits, space, '_', '.' or '-'` };
+    }
+    opts.name = name;
+  }
+  if (model != null) {
+    if (typeof model !== "string" || model.length < 1 || model.length > L.modelMax) {
+      return { error: `'model' must be a string of 1-${L.modelMax} characters` };
+    }
+    opts.model = model;
+  }
+  if (maxTurns != null) {
+    const n =
+      typeof maxTurns === "number" ? maxTurns : typeof maxTurns === "string" && /^\d+$/.test(maxTurns) ? Number(maxTurns) : NaN;
+    if (!Number.isInteger(n) || n < 1 || n > L.maxTurns) {
+      return { error: `'maxTurns' must be an integer from 1 to ${L.maxTurns}` };
+    }
+    opts.maxTurns = n;
+  }
+  if (requestId != null) {
+    if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > L.requestIdMax) {
+      return { error: `'requestId' must be a string of 1-${L.requestIdMax} characters` };
+    }
+    opts.requestId = requestId;
+  }
+  if (origin != null) {
+    if (!AGENT_ORIGINS.includes(origin)) {
+      return { error: `'origin' must be one of ${AGENT_ORIGINS.join(", ")}` };
+    }
+    opts.origin = origin;
+  }
+  return { opts };
+}
+
 /**
  * @param {{
  *   hub: import("./hub.mjs").Hub,
@@ -196,7 +244,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
   // ── POST /api/prompt ───────────────────────────────────────────────────────
   router.post("/prompt", async (req, res, next) => {
-    const { text, sessionId, provider, cwd } = req.body ?? {};
+    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin } = req.body ?? {};
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing 'text' field" });
     }
@@ -210,7 +258,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
         // default (from the pairing URL), not a user choice — so it can't be
         // honored here. New sessions get stock Claude Code by default;
         // EVEN_BRIDGE_NEW_SESSION_PROVIDER picks an extended provider instead:
-        // "official"/"claude" (default), "pi", or "claude-remote".
+        // "official"/"claude" (default), "pi", "durable", or "claude-remote".
         const want = String(process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER ?? "official").trim().toLowerCase();
         if (want !== "official" && want !== "claude") p = byName(want);
       }
@@ -218,12 +266,24 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!p) return next();
     console.log(`[bridge] prompt -> ${p.name} session=${sessionId ?? "(new)"}`);
     try {
-      const effectiveCwd = sessionId ? undefined : cwd ?? process.env.PROJECT_DIR;
-      const result = await p.prompt(sessionId, text, effectiveCwd);
+      // A durable prompt without a cwd uses the provider's default cwd (below an agent root),
+      // never PROJECT_DIR (the bridge's own project dir).
+      const effectiveCwd = sessionId ? undefined : p.name === "durable" ? cwd : cwd ?? process.env.PROJECT_DIR;
+      let result;
+      if (p.name === "durable") {
+        // Agent fields: validated, and only the ones the caller sent.
+        const checked = agentOpts({ name, model, maxTurns, requestId, origin });
+        if (checked.error) return res.status(400).json({ error: checked.error });
+        result = await p.prompt(sessionId, text, effectiveCwd, checked.opts);
+      } else {
+        result = await p.prompt(sessionId, text, effectiveCwd);
+      }
       // cc-local: session not externally driven -> the official router is
       // the single writer (spawn/resume) for this session.
       if (result?.passThrough) return next();
-      res.status(202).json({ ok: true, sessionId: result.sessionId, provider: result.provider });
+      const body = { ok: true, sessionId: result.sessionId, provider: result.provider };
+      if (result.submissionId !== undefined) body.submissionId = result.submissionId; // durable only
+      res.status(202).json(body);
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
       res.status(statusCode).json({ error: err.message });
@@ -340,6 +400,31 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     hub.streamFor(sessionId).handleEvents(req, res);
     p.watchTranscript?.(sessionId); // pi: tail the transcript for external (terminal) writers
     res.on("close", () => p.unwatchTranscript?.(sessionId));
+  });
+
+  // ── /api/agents — durable agents (the shim's registry/reaper) ─────────────
+  // Bridge-only endpoints. Without the durable provider they fall through
+  // (next()), exactly as before they existed.
+  const durable = byName("durable");
+
+  router.get("/agents", async (req, res, next) => {
+    if (!durable) return next();
+    try {
+      res.json({ agents: await durable.listAgents() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post("/agents/:sid/stop", async (req, res, next) => {
+    if (!durable) return next();
+    try {
+      await durable.stopSession(req.params.sid);
+      res.json({ ok: true, sessionId: req.params.sid });
+    } catch (err) {
+      const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
+      res.status(statusCode).json({ error: err.message });
+    }
   });
 
   return router;
