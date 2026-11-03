@@ -303,7 +303,7 @@ test("server, overseer on: dur-overseer is listed, /api/overseer answers, the ag
   assert.equal(r.status, 200);
   assert.deepEqual(await r.json(), { status: "pending", requestId: "ovs-1" });
   r = await fetch(`${s.base}/api/agents`, authed);
-  assert.deepEqual(await r.json(), { agents: [] }, "the overseer is not an agent (the reaper never sees it)");
+  assert.deepEqual(await r.json(), { agents: [], overseer: true }, "advertised; the overseer is not an agent (the reaper never sees it)");
   r = await fetch(`${s.base}/api/sessions?provider=claude&limit=50`, authed);
   const sessions = (await r.json()).sessions;
   assert.ok(sessions.some((x) => x.id === "dur-overseer" && x.title === "Overseer"), JSON.stringify(sessions));

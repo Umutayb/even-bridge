@@ -800,3 +800,30 @@ test("/overseer routes fall through without the overseer", async (t) => {
   await postJson(`${base}/api/overseer/outbox/read`, { upTo: 1 });
   assert.deepEqual(fellThrough, ["POST /api/overseer/ask", "GET /api/overseer/outbox", "POST /api/overseer/outbox/read"]);
 });
+
+test("GET /agents advertises the overseer only when it is on", async (t) => {
+  const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc(), overseer: stubOverseer() });
+  let r = await fetch(`${await listen(t, on.app)}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [], engines: ["native", "lets-code"], overseer: true }));
+  const nat = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc({ engines: ["native"] }), overseer: stubOverseer() });
+  r = await fetch(`${await listen(t, nat.app)}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [], overseer: true }));
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc({ engines: ["native"] }) });
+  r = await fetch(`${await listen(t, off.app)}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [] }), "overseer off: the body of before");
+});
+
+test("GET /sessions pins the overseer first", async (t) => {
+  const durable = { ...stubDurable(), listSessions: async () => [
+    { id: "dur-overseer", title: "Overseer", timestamp: 1, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-1", title: "a", timestamp: 2, cwd: "/w", provider: "claude", status: null },
+  ] };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, overseer: { ...stubOverseer(), sid: "dur-overseer" } });
+  const base = await listen(t, app);
+  const ids = (await (await fetch(`${base}/api/sessions?limit=3`)).json()).sessions.map((s) => s.id);
+  assert.equal(ids[0], "dur-overseer");
+  assert.equal(ids.length, 3);
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const ids2 = (await (await fetch(`${await listen(t, off.app)}/api/sessions?limit=10`)).json()).sessions.map((s) => s.id);
+  assert.notEqual(ids2[0], "dur-overseer", "without the overseer nothing is pinned");
+});

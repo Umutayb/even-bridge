@@ -195,7 +195,7 @@ test("sessions_list and session_read reach the model fenced as untrusted data", 
     await s.overseer.ask("CALL sessions_list", { requestId: "q8", waitMs: 10000 });
     const list = toolTexts(mark).find((t) => t.includes("untrusted session list"));
     assert.ok(list, "a fenced list");
-    assert.match(list, new RegExp(`${sessionId} \\| durable \\| state idle \\| driver bridge`));
+    assert.match(list, new RegExp(`id ${sessionId} \\| kind durable \\| engine native \\| name "docs" \\| state idle \\| driver bridge`));
     const m2 = fake.requests.length;
     await s.overseer.ask(`TOOL session_read {"id":"${sessionId}","n":5}`, { requestId: "q9", waitMs: 10000 });
     const read = toolTexts(m2).find((t) => t.includes("untrusted session output"));

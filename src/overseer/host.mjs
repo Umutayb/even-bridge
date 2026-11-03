@@ -164,14 +164,15 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
 /** A list row as one fenced line for the model (untrusted fields defused and cut). */
 export function rowLine(r) {
   const parts = [
-    r.id,
-    r.kind + (r.engine && r.engine !== "native" ? `/${r.engine}` : ""),
+    `id ${r.id}`,
+    `kind ${r.kind}`,
+    r.engine ? `engine ${r.engine}` : null,
+    r.title ? `name "${defuse(r.title, { oneLine: true, max: LINE_MAX })}"` : null,
     `state ${r.state}`,
     `driver ${r.driver}`,
     r.ageS != null ? `age ${r.ageS}s` : null,
     r.cwd ? `cwd ${defuse(r.cwd, { oneLine: true, max: LINE_MAX })}` : null,
-    r.title ? `title "${defuse(r.title, { oneLine: true, max: LINE_MAX })}"` : null,
-    r.lastLine ? `last "${defuse(r.lastLine, { oneLine: true, max: LINE_MAX })}"` : null,
+    r.lastLine ? `last line "${defuse(r.lastLine, { oneLine: true, max: LINE_MAX })}"` : null,
   ];
   return parts.filter(Boolean).join(" | ");
 }

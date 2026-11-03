@@ -291,6 +291,11 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     out.push(...local);
     for (const p of ext) out.push(...(extLists.get(p.name) || []));
     out.sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+    if (overseer?.sid) {
+      // The overseer is pinned first (plan ruling 6), whatever the other rows' timestamps.
+      const i = out.findIndex((s) => s.id === overseer.sid);
+      if (i > 0) out.unshift(...out.splice(i, 1));
+    }
     res.json({ sessions: out.slice(0, limit) });
   });
 
@@ -480,7 +485,9 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       const agents = await durable.listAgents();
       // `engines` only when there is a choice (ruling 9); with the lets-code flag off the body is as before.
       const engines = Array.isArray(durable.engines) && durable.engines.includes("lets-code") ? durable.engines : null;
-      res.json(engines ? { agents, engines } : { agents });
+      const body = engines ? { agents, engines } : { agents };
+      if (overseer) body.overseer = true; // the shim offers overseer_ask only then (flag off: the body of before)
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
