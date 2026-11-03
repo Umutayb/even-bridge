@@ -23,7 +23,7 @@
     "yargs": "^18.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19"
   },
   "allowScripts": {
     "@evenrealities/even-terminal@0.10.4": true,
