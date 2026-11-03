@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +15,12 @@ import {
   lcScopeUnit,
   removeStaleRegistry,
   stopLcScopes,
+  resetFailedScope,
+  expertsEnabled,
+  FACTORY_EXPERTS,
+  installProjectGuard,
+  projectGuardSource,
+  LC_PROJECT_GUARD,
 } from "../src/providers/durable/lc/launch.mjs";
 
 const BASE = {
@@ -39,13 +45,13 @@ test("constants", () => {
 test("lcLaunch builds the glasses argv and the scope wrapper", () => {
   const l = lcLaunch(BASE);
   assert.equal(l.bin, "/home/ay/.local/bin/lets-code");
-  assert.deepEqual(l.wrap, ["systemd-run", "--user", "--scope", "-q", "--unit=even-lc-dur-abc", "-p", "MemoryMax=500M", "-p", "CPUQuota=200%", "--"]);
+  assert.deepEqual(l.wrap, ["systemd-run", "--user", "--scope", "-q", "--collect", "--unit=even-lc-dur-abc", "-p", "MemoryMax=500M", "-p", "CPUQuota=200%", "--"]);
   assert.deepEqual(l.extraArgs, ["--mandate", "ask", "--subagents", "--sandbox", "--session-dir", "/s/lc-sessions/dur-abc", "-e", "/b/src/providers/durable/lc/even-guard.ts"]);
 });
 
 test("lcLaunch without a memory controller omits MemoryMax", () => {
   const l = lcLaunch({ ...BASE, caps: { memoryMax: null, cpuQuota: "200%" } });
-  assert.deepEqual(l.wrap, ["systemd-run", "--user", "--scope", "-q", "--unit=even-lc-dur-abc", "-p", "CPUQuota=200%", "--"]);
+  assert.deepEqual(l.wrap, ["systemd-run", "--user", "--scope", "-q", "--collect", "--unit=even-lc-dur-abc", "-p", "CPUQuota=200%", "--"]);
 });
 
 test("lcLaunch defaults the bin to lets-code", () => {
@@ -125,4 +131,30 @@ test("removeStaleRegistry deletes the file of a dead pid only", (t) => {
   assert.equal(removeStaleRegistry(4242, { root, alive: () => false }), true);
   assert.ok(!existsSync(f));
   assert.equal(removeStaleRegistry(null, { root, alive: () => false }), false);
+});
+
+test("resetFailedScope forgets a failed scope of the session only", () => {
+  const calls = [];
+  resetFailedScope("dur-a", { run: (argv) => (calls.push(argv), { status: 1 }) });
+  assert.deepEqual(calls, [["systemctl", "--user", "reset-failed", "even-lc-dur-a.scope"]]);
+});
+
+test("expertsEnabled reads lets-code's state file and never writes it", () => {
+  const all = Object.fromEntries(FACTORY_EXPERTS.map((n) => [n, true]));
+  assert.deepEqual(expertsEnabled({ readFile: () => JSON.stringify({ experts: all }) }), { ok: true, missing: [] });
+  assert.deepEqual(expertsEnabled({ readFile: () => JSON.stringify({ experts: { ...all, tester: false } }) }), { ok: false, missing: ["tester"] });
+  assert.deepEqual(expertsEnabled({ readFile: () => { throw new Error("ENOENT"); } }).missing, [...FACTORY_EXPERTS]);
+});
+
+test("the project-local guard imports guard-core by absolute URL and is rewritten atomically", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "lc-pguard-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const src = projectGuardSource();
+  assert.match(src, /import \{ guardDecision \} from "file:\/\/\/.+\/lc\/guard-core\.mjs";/);
+  assert.match(src, /pi\.on\("tool_call"/);
+  const f = installProjectGuard(dir);
+  assert.equal(f, join(dir, LC_PROJECT_GUARD));
+  writeFileSync(f, "tampered");
+  installProjectGuard(dir);
+  assert.equal(readFileSync(f, "utf8"), src, "every spawn overwrites it");
 });

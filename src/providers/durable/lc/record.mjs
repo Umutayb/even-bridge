@@ -25,6 +25,7 @@ export const lcSessionInitial = () => ({
   lastLine: "",
   lastRequestId: null,
   childPid: null,
+  sentTaskId: null, // the run task whose prompt lets-code accepted: a restart continues it with a cut-off prompt
 });
 
 export const LcSessionDoc = defineDoc({

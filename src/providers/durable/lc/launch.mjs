@@ -14,9 +14,10 @@
 // `lets-code-<pid>.scope` (spike Finding 2), and the scope stop, the cgroup
 // check of findExternalPi and the memory cap would all miss it.
 
-import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runSync, shellEnv } from "../guard.mjs";
 import { launcherModel } from "../../pi/provider.mjs";
 
@@ -26,6 +27,13 @@ export const FACTORY_ROOT = "~/.pi/agent/lets-code-factory";
 export const LC_REGISTRY_ROOT = "~/.pi/agent/lets-code-sessions";
 export const LC_RUNS_ROOT = "~/.pi/agent/lets-code-runs";
 export const LC_CGROUP_CONTROLLERS = "/sys/fs/cgroup/cgroup.controllers";
+/** lets-code's host-wide state (remembered experts among others). */
+export const LC_STATE_FILE = "~/.pi/agent/lets-code-state.json";
+/** The experts the factory needs (lets-code factory.ts `ensureExperts`). */
+export const FACTORY_EXPERTS = Object.freeze(["developer", "expert-reviewer", "design-reviewer", "tester", "acceptance-judge"]);
+/** The project-local copy of the guard (pi loads `<cwd>/.pi/extensions/*` in every pi it starts there, subagents included). */
+export const LC_PROJECT_GUARD = join(".pi", "extensions", "even-guard.ts");
+const GUARD_CORE = fileURLToPath(new URL("./guard-core.mjs", import.meta.url));
 
 export const expandHome = (p, home = homedir()) => (p === "~" ? home : String(p).startsWith("~/") ? home + String(p).slice(1) : p);
 
@@ -64,7 +72,9 @@ export function lcEnv(baseEnv = process.env, { cwd, extra = {} } = {}) {
 export function lcLaunch({ sid, cwd, sessionDir, model, bin = LC_DEFAULT_BIN, guardExt, caps = { memoryMax: null, cpuQuota: "200%" }, wrapper = "none", sandbox = true, baseEnv = process.env, extraEnv } = {}) {
   const wrap = [];
   if (wrapper === "systemd-run") {
-    wrap.push("systemd-run", "--user", "--scope", "-q", `--unit=${lcScopeUnit(sid)}`);
+    // --collect: a scope that failed (an OOM kill under MemoryMax) is unloaded at once, so the
+    // next spawn of the same session can take the same unit name.
+    wrap.push("systemd-run", "--user", "--scope", "-q", "--collect", `--unit=${lcScopeUnit(sid)}`);
     if (caps?.memoryMax) wrap.push("-p", `MemoryMax=${caps.memoryMax}`);
     if (caps?.cpuQuota) wrap.push("-p", `CPUQuota=${caps.cpuQuota}`);
     wrap.push("--");
@@ -90,6 +100,60 @@ export function stopLcScopes(sids, { env = process.env, run = runSync } = {}) {
   if (!units.length) return true;
   const { status } = run(["systemctl", "--user", "stop", ...units], { env });
   return status === 0;
+}
+
+/** Forget a failed scope of `sid` (left by a kill before --collect existed, or by a crash of systemd-run itself). */
+export function resetFailedScope(sid, { env = process.env, run = runSync } = {}) {
+  const { status } = run(["systemctl", "--user", "reset-failed", `${lcScopeUnit(sid)}.scope`], { env });
+  return status === 0;
+}
+
+/**
+ * Are all of `names` enabled in lets-code's host-wide state? Experts are host-global
+ * (plan ruling 4): only the operator enables them; the bridge only reads.
+ * @returns {{ ok: boolean, missing: string[] }}
+ */
+export function expertsEnabled({ stateFile = LC_STATE_FILE, names = FACTORY_EXPERTS, readFile = (p) => readFileSync(p, "utf8") } = {}) {
+  let experts = {};
+  try {
+    experts = JSON.parse(readFile(expandHome(stateFile)))?.experts ?? {};
+  } catch {
+    /* no state yet: nothing enabled */
+  }
+  const missing = names.filter((n) => experts[n] !== true);
+  return { ok: missing.length === 0, missing };
+}
+
+/**
+ * The guard source for `<cwd>/.pi/extensions/even-guard.ts`: lets-code starts its subagents as
+ * plain `pi --mode rpc` processes in the same cwd, without the parent's `-e` flags, so only a
+ * project-local extension reaches them (live probe 2026-11-03: a subagent's bash read under
+ * ~/.ssh ran unguarded before this). It imports guard-core.mjs from this checkout by absolute URL.
+ */
+export function projectGuardSource(guardCore = GUARD_CORE) {
+  return [
+    "// Written by even-bridge (durable lets-code engine) at every spawn; edits are overwritten.",
+    "// The even guard for this project's pi processes, subagents included (see guard-core.mjs).",
+    `import { guardDecision } from ${JSON.stringify(pathToFileURL(guardCore).href)};`,
+    "",
+    "export default function (pi: any) {",
+    '  pi.on("tool_call", async (event: any) => {',
+    '    const decision = guardDecision(String(event?.toolName ?? ""), event?.input ?? {}, { cwd: process.env.EVEN_GUARD_CWD || process.cwd() });',
+    "    return decision ?? undefined;",
+    "  });",
+    "}",
+    "",
+  ].join("\n");
+}
+
+/** (Re)write the project-local guard of `cwd` (atomically, 0644). @returns the file path */
+export function installProjectGuard(cwd, { source = projectGuardSource() } = {}) {
+  const file = join(cwd, LC_PROJECT_GUARD);
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, source, { mode: 0o644 });
+  renameSync(tmp, file);
+  return file;
 }
 
 function onPath(bin, env) {

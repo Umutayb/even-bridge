@@ -686,7 +686,6 @@ export function createDurableProvider(
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
-    if (engine === "lets-code") lcEngine.admit(null); // 503 without the sandbox, 429 at the live limit: before any row
     const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns, ...(engine === "lets-code" ? { engine } : {}) });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
@@ -873,6 +872,12 @@ export function createDurableProvider(
       await ready;
       let sid = sessionId;
       if (!sid && opts.requestId) sid = map.sidForRequest(opts.requestId);
+      // A new lets-code agent: 503 without the sandbox, 429 at the live limit (an idle-kept child is
+      // stopped first, awaited), all before any row exists. The requestId is checked again after it.
+      if (!sid && opts.engine === "lets-code" && lcEngine) {
+        await lcEngine.admit(null);
+        if (opts.requestId) sid = map.sidForRequest(opts.requestId);
+      }
       let created = false;
       if (sid) {
         const row = map.get(sid);
@@ -886,8 +891,15 @@ export function createDurableProvider(
       if (isLc(map.get(sid))) {
         // A new session started with the factory on: recorded before the first spawn, which then
         // sends `/mode orchestration` before the text (no child yet, so nothing is sent here).
-        if (created && opts.factory === true) await lcEngine.setFactory(sid, true);
-        const r = await lcEngine.prompt(sid, text, { requestId: opts.requestId });
+        let r;
+        try {
+          if (created && opts.factory === true) await lcEngine.setFactory(sid, true);
+          r = await lcEngine.prompt(sid, text, { requestId: opts.requestId });
+        } catch (err) {
+          // A new session refused at its first prompt (a concurrent start took the last slot): no empty row stays.
+          if (created) provider.forgetSession(sid);
+          throw err;
+        }
         map.touch(sid);
         return { sessionId: sid, provider: WIRE_PROVIDER, ...(r.taskId != null ? { submissionId: r.taskId } : {}) };
       }

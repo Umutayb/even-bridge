@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { guardDecision } from "../src/providers/durable/lc/guard-core.mjs";
+import { guardDecision, trustsProject } from "../src/providers/durable/lc/guard-core.mjs";
 
 const ID = "20261103-093221-c129";
 
@@ -76,4 +76,41 @@ test("guard-core loads no pi-durable (it runs inside every lets-code child)", ()
   for (const f of ["../src/providers/durable/lc/guard-core.mjs", "../src/providers/durable/guard.mjs"]) {
     assert.doesNotMatch(readFileSync(new URL(f, import.meta.url), "utf8"), /from "@earendil-works\//, f);
   }
+});
+
+test("the project's .pi dir (the project-local guard) cannot be written or named in bash", (t) => {
+  const s = sandbox(t);
+  for (const [tool, input] of [
+    ["write", { path: join(s.cwd, ".pi", "extensions", "even-guard.ts"), content: "" }],
+    ["edit", { path: ".pi/extensions/even-guard.ts" }],
+    ["write", { path: ".pi/settings.json", content: "{}" }],
+    ["bash", { command: "rm -rf .pi" }],
+    ["bash", { command: "mv .pi/extensions x" }],
+    ["bash", { command: `echo > ${s.cwd}/.pi/extensions/even-guard.ts` }],
+  ]) {
+    const d = guardDecision(tool, input, s);
+    assert.equal(d?.block, true, `${tool} ${JSON.stringify(input)}`);
+    assert.match(d.reason, /^even-guard: /);
+  }
+  assert.equal(guardDecision("write", { path: join(s.cwd, ".pinned.txt"), content: "x" }, s), undefined, "a name starting with .pi is fine");
+  assert.equal(guardDecision("bash", { command: "cat app.pid && ls .pids" }, s), undefined);
+});
+
+test("the guard trusts exactly its session's project, and only with the project guard in place", (t) => {
+  const s = sandbox(t);
+  assert.equal(trustsProject(s.cwd, s.cwd, { home: s.home }), false, "no project guard yet");
+  mkdirSync(join(s.cwd, ".pi", "extensions"), { recursive: true });
+  writeFileSync(join(s.cwd, ".pi", "extensions", "even-guard.ts"), "x");
+  assert.equal(trustsProject(s.cwd, s.cwd, { home: s.home }), true);
+  assert.equal(trustsProject(join(s.cwd, "sub"), s.cwd, { home: s.home }), false, "another dir");
+  assert.equal(trustsProject(s.cwd, undefined, { home: s.home }), false, "no EVEN_GUARD_CWD: never");
+  assert.equal(trustsProject(s.home, s.home, { home: s.home }), false, "never the home dir");
+});
+
+test("even-guard.ts answers project_trust through trustsProject", () => {
+  const src = readFileSync(new URL("../src/providers/durable/lc/even-guard.ts", import.meta.url), "utf8");
+  assert.match(src, /pi\.on\("project_trust"/);
+  assert.match(src, /trustsProject\(/);
+  assert.match(src, /remember: true/);
+  assert.match(src, /trusted: "undecided"/);
 });

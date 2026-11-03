@@ -21,6 +21,10 @@ export const FACTORY_TITLE = /^Factory (\S+): ([^\n]+)/;
 export const MANDATE_TITLE = /^mandate \(ask\): /;
 export const MANDATE_ALLOW = "Allow once";
 export const MANDATE_DENY = "Deny";
+/** lets-code's factory asks this (a `confirm`) before it enables its experts host-wide; answered No here (R-C2). */
+export const FACTORY_EXPERTS_TITLE = "Enable the factory's experts?";
+export const FACTORY_EXPERTS_ERROR = "factory experts must be enabled by the operator";
+const ACTIVITY_EVENTS = new Set(["agent_start", "turn_start", "message_start", "message_update", "tool_execution_start", "tool_execution_end", "agent_end"]);
 /** The prompt-response wait of a command that may run long (a factory run answers its prompt only when it ends). */
 export const LC_LONG_MS = 2 ** 31 - 1;
 
@@ -135,7 +139,10 @@ export class LcSession extends PiSession {
     const due = this.pendingPermissions.filter((r) => r._kind === "confirm" && r.openedAt + LC_CONFIRM_DENY_MS <= nowMs);
     for (const req of due) {
       this.pendingPermissions = this.pendingPermissions.filter((r) => r !== req);
-      this.client?.respondUi({ type: "extension_ui_response", id: req.id, value: MANDATE_DENY });
+      // A `confirm` takes {confirmed:false}; a mandate `select` takes its Deny option.
+      this.client?.respondUi(
+        req.method === "confirm" ? { type: "extension_ui_response", id: req.id, confirmed: false } : { type: "extension_ui_response", id: req.id, value: MANDATE_DENY },
+      );
       this.emitPermissionResult(req, "deny");
     }
     return due.length;
@@ -160,7 +167,23 @@ export class LcSession extends PiSession {
     this.send({ type: "permission_result", toolName: "mandate", summary: req._what ?? "", decision: decision === "deny" ? "denied" : "allowed" });
   }
 
+  /** Anything the child does after a prompt proves lets-code accepted it (the engine's "sent" mark). */
+  activity() {
+    try {
+      this.opts.onActivity?.();
+    } catch {
+      /* the engine's callback must not break the stream */
+    }
+  }
+
   onUiRequest(req) {
+    if (!(req.method === "notify" && /^mode: /.test(String(req.message ?? "")))) this.activity();
+    if (req.method === "confirm" && String(req.title ?? "").trim() === FACTORY_EXPERTS_TITLE) {
+      // Experts are host-wide lets-code state: a glasses Yes must never enable them (R-C2).
+      this.client?.respondUi({ type: "extension_ui_response", id: req.id, confirmed: false });
+      this.send({ type: "error", message: FACTORY_EXPERTS_ERROR });
+      return;
+    }
     if (req.method === "notify") {
       try {
         this.opts.onNotify?.(String(req.message ?? ""));
@@ -226,6 +249,7 @@ export class LcSession extends PiSession {
   }
 
   onEvent(e) {
+    if (ACTIVITY_EVENTS.has(e.type)) this.activity();
     if (e.type === "tool_execution_start") this.answerText = "";
     if (e.type === "tool_execution_end") {
       const args = this.toolArgs.get(e.toolCallId) ?? {};

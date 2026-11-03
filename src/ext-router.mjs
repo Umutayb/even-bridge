@@ -482,7 +482,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       res.json({ ok: true, sessionId: req.params.sid, factory: r?.factory, mode: r?.mode });
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
-      res.status(statusCode).json({ error: err.message });
+      res.status(statusCode).json({ error: err.message, ...(err.reason ? { reason: err.reason } : {}) });
     }
   });
 

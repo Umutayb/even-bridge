@@ -160,6 +160,52 @@ The wait is bounded by the file's `timeout` (`N`, `Ns`, `Nm`, `Nh`; default
 Agent files are read **once at bridge start**: restart the bridge to pick
 up edits.
 
+## The lets-code engine
+
+`POST /api/prompt` with `provider: "durable"` and **`engine: "lets-code"`** (`native`
+is the default; anything else is a 400 `'engine' must be one of native, lets-code`)
+starts the session as an owned lets-code child instead of in-process tools. Off
+(`EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE` unset) such a prompt is a 400 `the lets-code
+engine is off`. The child is `lets-code --mode rpc [--session <file>] --name <label>
+--mandate ask --subagents --sandbox --session-dir <store dir>/lc-sessions/<sid>
+-e src/providers/durable/lc/even-guard.ts`, inside `systemd-run --user --scope -q
+--collect --unit=even-lc-<sid> [-p MemoryMax=…] -p CPUQuota=200%` (`--collect` plus a
+`systemctl --user reset-failed even-lc-<sid>.scope` before each spawn: a scope that an
+OOM kill left failed never blocks the next spawn's unit name).
+
+- **Child token.** The bridge passes no token or key (allowlisted env). lets-code reads
+  `~/.config/lets-code/config` itself and exports `LETS_CODE_TOKEN` to its pi, so that
+  variable is in pi's environment anyway; the bridge's own `LETS_CODE_TOKEN` is not needed
+  for lets-code sessions (only native durable sessions read it through models.json).
+- **The even guard** (`lc/guard-core.mjs`) is a floor under lets-code's mandate: the denied
+  dirs (~/.ssh ~/.aws ~/.config ~/.even-terminal ~/.pi ~/.gnupg, secret /etc files,
+  /run/user) and guard.mjs's RULES. Writes outside the project are the mandate's (mode
+  `ask` asks the glasses). The project's own `.pi/` dir is refused too (see next point).
+- **Subagents.** lets-code starts subagents as plain `pi` processes in the same cwd,
+  **without** the parent's `-e`. So at every spawn the bridge writes the guard to
+  `<cwd>/.pi/extensions/even-guard.ts`; pi loads project extensions only for a trusted
+  project, and the parent's `-e even-guard.ts` answers pi's `project_trust` event "yes,
+  remember" for exactly its session cwd (pi records it in `~/.pi/agent/trust.json`).
+  Live probe 2026-11-03: before this a subagent's `wc -c ~/.ssh/id_ed25519.pub` ran;
+  after it, the subagent got `even-guard: ~/.ssh is off limits`. **Not covered:** a
+  factory run's stage subagents work in the run's worktree (below), which has no
+  project-local guard.
+- **Factory worktree.** A factory run works in
+  `~/.pi/agent/lets-code-factory/<id>/work`; the guard treats that dir as the project
+  when the run's `ledger.json` `repo` is the session cwd or below it (ruling 19), and keeps
+  the rest of `~/.pi` off limits. `stopSession` leaves the factory dir to lets-code.
+- **Experts are the operator's.** lets-code's "Enable the factory's experts?" confirm is
+  answered No by the bridge with the error frame `factory experts must be enabled by the
+  operator` (a glasses Yes must never change host-wide lets-code state), and
+  `POST /api/agents/:sid/factory` with a ticket answers 409 `{reason: "experts_disabled"}`
+  while `~/.pi/agent/lets-code-state.json` lacks any of developer, expert-reviewer,
+  design-reviewer, tester, acceptance-judge (it is only read).
+- **Restarts.** A prompt counts as delivered once lets-code accepted it (its response or
+  any event after it, recorded as `sentTaskId`). After a restart a delivered run gets one
+  cut-off prompt (or `/factory resume <id>`); an undelivered prompt is sent again as it was.
+  A child that crashes while the bridge runs gets a crash prompt after an error frame
+  `lets-code exited mid-turn; starting it again (attempt n of 6)`.
+
 ## Restart and resume
 
 A bridge shutdown does **not** abort running agents. On SIGTERM/SIGINT the

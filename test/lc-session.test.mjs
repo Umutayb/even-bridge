@@ -12,6 +12,7 @@ import {
   MANDATE_DENY,
   MANDATE_TITLE,
   dialogKind,
+  FACTORY_EXPERTS_ERROR,
 } from "../src/providers/durable/lc/session.mjs";
 
 const FAKE = fileURLToPath(new URL("./helpers/fake-pi-rpc.mjs", import.meta.url));
@@ -175,4 +176,28 @@ test("frames carry the bridge sid, and get_state gives the session file", async 
   assert.ok(idle.every((f) => f.sessionId === "dur-x"));
   assert.equal(s.frames.find((f) => f.type === "result").sessionId, "dur-x");
   assert.ok(existsSync(s.session.sessionFile));
+});
+
+test("lets-code's 'Enable the factory's experts?' is answered No, with an error frame (R-C2)", async (t) => {
+  const s = await setup(t, { clients: 1 });
+  await s.session.run("EXPERTS");
+  await until(() => s.log().some((c) => c.type === "extension_ui_response"));
+  const r = s.log().find((c) => c.type === "extension_ui_response");
+  assert.equal(r.confirmed, false);
+  assert.equal(FACTORY_EXPERTS_ERROR, "factory experts must be enabled by the operator");
+  assert.ok(s.frames.some((f) => f.type === "error" && f.message === FACTORY_EXPERTS_ERROR));
+  assert.equal(s.frames.filter((f) => f.type === "permission_request").length, 0, "never offered to the glasses");
+  assert.equal(s.dialogs.length, 0);
+  assert.equal(s.session.respondPermission("allow"), false, "nothing to answer");
+});
+
+test("a plain confirm swept after 10 minutes unwatched gets confirmed:false, not a select value", async (t) => {
+  const s = await setup(t, { clients: 0 });
+  await s.session.run("CONFIRM");
+  await until(() => s.frames.some((f) => f.type === "permission_request"));
+  assert.equal(s.session.sweepDialogs(s.t0 + 600_000), 1);
+  await until(() => s.log().some((c) => c.type === "extension_ui_response"));
+  const r = s.log().find((c) => c.type === "extension_ui_response");
+  assert.equal(r.confirmed, false);
+  assert.equal(r.value, undefined);
 });

@@ -24,7 +24,13 @@
 // prompt response (disposition "handled") once it is answered; other `/…` → handled.
 // FAKE_PI_CRASH=1: exit 137 on every prompt (a crash mid-turn).
 // FAKE_PI_DIE_ONCE=<marker file>: the first prompt (across processes) exits 137
-// before anything is written (a child killed before its first prompt).
+// before anything is written or answered (lets-code never accepted it);
+// FAKE_PI_DIE_TEXT=<text> limits that to a prompt with exactly this text.
+// FAKE_PI_CRASH_ONCE=<marker file>: the first prompt is accepted (response,
+// agent_start, user message written), then the process exits 137.
+//   CONFIRM  a plain `confirm` dialog ("Proceed?")
+//   EXPERTS  lets-code's factory "Enable the factory's experts?" confirm
+//   TOOLS25  25 bash tool calls, then "ok: TOOLS25"
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -111,7 +117,8 @@ const FACTORY_REQ = {
 function onPrompt(cmd) {
   const text = String(cmd.message ?? "");
   const marker = process.env.FAKE_PI_DIE_ONCE;
-  if (marker && !existsSync(marker)) {
+  const dieText = process.env.FAKE_PI_DIE_TEXT;
+  if (marker && !existsSync(marker) && (!dieText || dieText === text)) {
     writeFileSync(marker, String(process.pid));
     process.exit(137);
   }
@@ -141,6 +148,29 @@ function onPrompt(cmd) {
   out({ type: "response", id: cmd.id, command: "prompt", success: true, data: { disposition: "started" } });
   message("user", [{ type: "text", text }]);
   startRun(text);
+  const crashOnce = process.env.FAKE_PI_CRASH_ONCE;
+  if (crashOnce && !existsSync(crashOnce)) {
+    writeFileSync(crashOnce, String(process.pid));
+    setTimeout(() => process.exit(137), 50);
+    return;
+  }
+  if (text === "CONFIRM" || text === "EXPERTS") {
+    const req = text === "CONFIRM"
+      ? { method: "confirm", title: "Proceed?", message: "a plain confirm" }
+      : { method: "confirm", title: "Enable the factory's experts?", message: "developer, tester\nlets-code remembers the answer yes." };
+    ask(req, (r) => {
+      say(r.cancelled ? "cancelled" : `confirmed: ${r.confirmed}`);
+      endRun();
+    });
+    return;
+  }
+  if (text === "TOOLS25") {
+    for (let i = 1; i <= 25; i++) {
+      const args = { command: `echo ${i}` };
+      out({ type: "tool_execution_start", toolCallId: `t${i}`, toolName: "bash", args });
+      out({ type: "tool_execution_end", toolCallId: `t${i}`, toolName: "bash", result: { content: [{ type: "text", text: String(i) }] } });
+    }
+  }
   if (text === "HANG") return;
   if (text === "ASK") {
     ask({ method: "select", title: "mandate (ask): write outside the project: /x/out.txt\n\nAllow?", options: ["Allow once", "Allow for this session", "Deny"] }, (r) => {

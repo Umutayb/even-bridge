@@ -10,6 +10,9 @@
 // - everything else, writes outside the project included, is left to the
 //   mandate (mode `ask` asks before leaving the project), so a glasses user is
 //   asked instead of being refused.
+// The project's own `.pi/` dir holds the project-local copy of this guard
+// (launch.mjs installProjectGuard: lets-code's subagents load only that one), so
+// writes there and any bash mention of a `.pi` path are refused.
 // One exception inside ~/.pi (plan ruling 19): the worktree of a factory run,
 // `<factoryRoot>/<id>/work`, counts as the project when that run's ledger repo
 // is the session cwd or below it.
@@ -24,6 +27,8 @@ import { confinePath, judgeHard } from "../guard.mjs";
 export const GUARD_PREFIX = "even-guard: ";
 const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 const HARD_WHY = /off limits|too many symlinks|cannot tell where/;
+const DOT_PI = /(?:^|[\s;&|()<>'"`=\/])\.pi(?=$|[\s/;&|()<>'"`])/;
+const PROJECT_PI_WHY = "the project's .pi dir (it holds the even guard) is off limits";
 
 const within = (p, root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
 const expand = (p, home) => (p === "~" ? home : p.startsWith("~/") ? home + p.slice(1) : p.replace(/^\$\{?HOME\}?(?=\/|$)/, home));
@@ -85,13 +90,26 @@ export function guardDecision(toolName, input, { cwd = process.cwd(), home = hom
     const prefixes = [root, ...(tail !== null ? ["~" + tail, "$HOME" + tail, "${HOME}" + tail] : [])];
     const re = new RegExp(`(?:${prefixes.map(escapeRe).join("|")})/([^/\\s'"\`;|&()<>]+)/work(?=/|$|[\\s'"\`;|&()<>])`, "g");
     cmd = cmd.replace(re, (m, id) => (inOwnWorktree(join(root, id, "work"), ctx) ? cwd : m));
-    why = judgeHard(cmd, home).block;
+    why = judgeHard(cmd, home).block ?? (DOT_PI.test(cmd) ? PROJECT_PI_WHY : undefined);
   } else if (PATH_TOOLS.has(toolName) && args.path != null && args.path !== "") {
     const p = String(args.path);
     const abs = resolve(cwd, expand(p, home));
+    const writes = toolName === "write" || toolName === "edit";
+    if (writes && cwd && within(realish(abs), realish(join(resolve(cwd), ".pi")))) return { block: true, reason: GUARD_PREFIX + PROJECT_PI_WHY };
     if (inOwnWorktree(abs, ctx)) return undefined;
     const res = confinePath(p, cwd, home, { mode: toolName === "write" || toolName === "edit" ? "write" : "read" });
     if (!res.ok && HARD_WHY.test(res.why ?? "")) why = res.why;
   }
   return why ? { block: true, reason: GUARD_PREFIX + why } : undefined;
+}
+
+/**
+ * Does the guard trust `cwd` as a pi project? Exactly the session's own project (EVEN_GUARD_CWD),
+ * and only when it holds the bridge's project-local guard; never the home dir or a parent of it.
+ */
+export function trustsProject(cwd, guardCwd, { home = homedir() } = {}) {
+  if (!cwd || !guardCwd) return false;
+  const c = resolve(cwd);
+  if (c !== resolve(guardCwd) || c === resolve(home) || within(resolve(home), c)) return false;
+  return existsSync(join(c, ".pi", "extensions", "even-guard.ts"));
 }

@@ -11,6 +11,9 @@ export const LC_RESTART_LIMIT = 5;
 export const LC_CUTOFF_PROMPT =
   "You were cut off by a restart of the bridge. Your last tool call may have no result; run it again if you still need it. " +
   "Check the state of your work (files, tests, git status) and continue the task.";
+export const LC_CRASH_PROMPT =
+  "Your lets-code process exited unexpectedly and was started again. Your last tool call may have no result; run it again if you still need it. " +
+  "Check the state of your work (files, tests, git status) and continue the task.";
 export const LC_RESTART_LIMIT_MESSAGE = `lets-code run stopped: restarted ${LC_RESTART_LIMIT} times in a row`;
 
 /** The child died mid-turn (not stopped by us): the run is retried. */
@@ -38,7 +41,7 @@ export function createLcRunTask(engine) {
           }
           await runtime.commit(() => ({ status: "running", checkpoint: { phase: "drive", attempt } }), context);
           try {
-            const { lastLine } = await engine.drive(sid, { text, attempt }, runtime.signal);
+            const { lastLine } = await engine.drive(sid, { text, attempt, taskId: task.id }, runtime.signal);
             await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { lastLine: lastLine ?? "" } } }), context);
             return;
           } catch (err) {

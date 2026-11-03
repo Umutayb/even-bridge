@@ -34,16 +34,20 @@ import {
   LC_REGISTRY_ROOT,
   LC_RUNS_ROOT,
   expandHome,
+  LC_STATE_FILE,
+  expertsEnabled,
   findFactoryRun,
+  installProjectGuard,
   lcLaunch,
   lcMemoryControllerAvailable,
   lcSandboxAvailable,
   removeStaleRegistry,
+  resetFailedScope,
   stopLcScopes,
 } from "./launch.mjs";
 import { LC_ANSWER, LC_ANSWER_MAX, LC_TOOL, LC_USER, LcSessionDoc, lcSessionInitial } from "./record.mjs";
 import { LcSession } from "./session.mjs";
-import { LC_CUTOFF_PROMPT, LC_EXIT, LC_RUN_TASK, createLcRunTask } from "./task.mjs";
+import { LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_EXIT, LC_RESTART_LIMIT, LC_RUN_TASK, createLcRunTask } from "./task.mjs";
 
 // What the provider needs besides the engine (it imports only this module, lazily).
 export { stopLcScopes } from "./launch.mjs";
@@ -58,6 +62,9 @@ export const LC_GUARD_EXT = fileURLToPath(new URL("./even-guard.ts", import.meta
 export const LC_NO_MEMORY_WARNING =
   "lets-code: no memory cgroup controller; MemoryMax not applied (operator: add cgroup_enable=memory to /boot/firmware/cmdline.txt and reboot)";
 export const LC_SANDBOX_MISSING = "lets-code sandbox unavailable: install bubblewrap and socat";
+/** lc.tool entries kept per run (Durable never prunes; the full transcript is pi's session file). */
+export const LC_TOOL_ENTRIES_MAX = 20;
+export const LC_EXPERTS_DISABLED = "factory experts must be enabled by the operator";
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 const lastLineOf = (text) => String(text ?? "").split("\n").filter((l) => l.trim()).at(-1)?.trim() ?? "";
@@ -112,6 +119,7 @@ export function createLcEngine({
   clientCount = () => 0,
   defaultModel,
   spawnWrap = (wrap) => wrap,
+  stateFile = LC_STATE_FILE,
 } = {}) {
   const mem = memoryController ?? lcMemoryControllerAvailable();
   if (!mem) log.warn?.(LC_NO_MEMORY_WARNING);
@@ -129,7 +137,25 @@ export function createLcEngine({
   const S = (sid) => {
     let s = states.get(sid);
     if (!s) {
-      s = { sid, session: null, busy: false, taskId: null, idleTimer: null, waiter: null, expectedExit: false, queued: [], requestIds: new Set(), modeWaiters: [], crashed: false, starting: null };
+      s = {
+        sid,
+        session: null,
+        busy: false,
+        reserved: false, // a prompt between its admission and its task (counts toward maxLive)
+        stopping: false, // an idle-kept child being stopped to make room
+        stopPromise: null, // the stop in flight (stopChild)
+        taskId: null,
+        sentTaskId: null, // the run task whose prompt lets-code accepted (also in the record)
+        idleTimer: null,
+        waiter: null,
+        queued: [],
+        requestIds: new Set(),
+        modeWaiters: [],
+        crashed: false,
+        starting: null,
+        tools: 0,
+        toolsDropped: 0,
+      };
       states.set(sid, s);
     }
     return s;
@@ -181,20 +207,26 @@ export function createLcEngine({
   }
 
   const isLive = (s) => Boolean(s.session?.running) || Boolean(s.starting);
-  const idleKept = (s) => isLive(s) && !s.busy && !(s.session?.openDialogs().length > 0);
+  const idleKept = (s) => isLive(s) && !s.busy && !s.reserved && !(s.session?.openDialogs().length > 0);
 
   /**
    * May `sid` (null: a new session) get a child now? Throws 503 without the sandbox and 429 at the
-   * live limit; an idle-kept child of another session is stopped to make room.
+   * live limit. Busy sessions (resumed runs included), reserved prompts and live children count; an
+   * idle-kept child of another session is stopped (awaited) to make room.
    */
-  function admit(sid) {
+  async function admit(sid) {
     if (!sandboxOk) throw httpError(503, LC_SANDBOX_MISSING);
     if (sid && isLive(S(sid))) return;
-    const live = [...states.values()].filter((s) => s.sid !== sid && (isLive(s) || s.busy));
+    const live = [...states.values()].filter((s) => s.sid !== sid && !s.stopping && (isLive(s) || s.busy || s.reserved));
     if (live.length < maxLive) return;
     const spare = live.find((s) => idleKept(s));
     if (spare) {
-      stopChild(spare.sid).catch(() => {});
+      spare.stopping = true;
+      try {
+        await stopChild(spare.sid);
+      } finally {
+        spare.stopping = false;
+      }
       return;
     }
     throw httpError(
@@ -216,27 +248,39 @@ export function createLcEngine({
     s.idleTimer.unref?.();
   }
 
-  async function stopChild(sid) {
+  /**
+   * Stop the child of `sid` and its scope. One stop at a time per session; a spawn of the same
+   * session waits for it (the scope stop at its end must never hit the next child of that name).
+   */
+  function stopChild(sid) {
     const s = S(sid);
     clearTimeout(s.idleTimer);
     s.idleTimer = null;
+    if (s.stopPromise) return s.stopPromise;
     const session = s.session;
-    if (session) {
-      s.expectedExit = true;
-      await session.stop().catch(() => {});
-      if (s.session === session) s.session = null;
-    }
-    stopScope(sid);
+    s.stopPromise = (async () => {
+      if (session) {
+        const pid = session.childPid;
+        session.expectedExit = true; // per child: a late exit of this one must not mark the next child's crash as expected
+        await session.stop().catch(() => {});
+        if (s.session === session) s.session = null;
+        // A child that needed SIGKILL leaves its lets-code-sessions/<pid>.json behind.
+        removeStaleRegistry(pid, { root: registryRoot });
+      }
+      stopScope(sid);
+    })().finally(() => {
+      s.stopPromise = null;
+    });
+    return s.stopPromise;
   }
 
   function onChildExit(sid, session, { code, signal } = {}) {
     const s = S(sid);
-    if (s.session !== session) return;
+    if (s.session !== session) return; // an older child (stopped while idle) exiting late
     s.session = null;
     clearTimeout(s.idleTimer);
     s.idleTimer = null;
-    const expected = s.expectedExit;
-    s.expectedExit = false;
+    const expected = Boolean(session.expectedExit);
     if (!expected) stopScope(sid); // subagents and the sandbox's socat live in the scope too
     if (s.waiter) {
       const w = s.waiter;
@@ -290,6 +334,7 @@ export function createLcEngine({
   /** Spawn the child of `sid` unless one is running. @returns {Promise<boolean>} whether it spawned */
   async function ensureChild(sid) {
     const s = S(sid);
+    if (s.stopPromise) await s.stopPromise;
     if (s.session?.running) return false;
     if (s.starting) {
       await s.starting;
@@ -301,6 +346,15 @@ export function createLcEngine({
       const sessionDir = join(storeDir, "lc-sessions", sid);
       mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
       const resume = rec.piSessionFile && existsSync(rec.piSessionFile) ? rec.piSessionFile : undefined;
+      // lets-code's subagents are plain pi processes in this cwd without our `-e`: they get the guard
+      // from the project-local copy (trusted by the parent's even-guard.ts, see there).
+      try {
+        installProjectGuard(row.cwd);
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: project guard not written (${err.message}); subagents run without the even guard`);
+      }
+      // A failed scope of the same name (left by an OOM kill) would block the unit name.
+      if (wrapper === "systemd-run") resetFailedScope(sid, { env: scopeEnv, run });
       const launch = lcLaunch({ sid, cwd: row.cwd, sessionDir, model: modelArg(row), bin, guardExt, caps: effectiveCaps, wrapper, sandbox, baseEnv, extraEnv: childEnv });
       launches.set(sid, launch);
       const session = new LcSession(emitTo, {
@@ -317,7 +371,11 @@ export function createLcEngine({
         clientCount: () => clientCount(sid),
         onNotify: (text) => onNotify(sid, text),
         onAgentEnd: (sess) => finish(sid, sess),
-        onToolEnd: (name, args) => writeEntry(sid, LC_TOOL, summarizePiToolCall(name, args)),
+        onToolEnd: (name, args) => {
+          if (++s.tools <= LC_TOOL_ENTRIES_MAX) writeEntry(sid, LC_TOOL, summarizePiToolCall(name, args));
+          else s.toolsDropped += 1;
+        },
+        onActivity: () => markSent(sid),
         onExit: (sess, info) => onChildExit(sid, sess, info),
       });
       s.session = session;
@@ -354,6 +412,9 @@ export function createLcEngine({
     if (session && s.session !== session) return;
     const text = String(session?.answerText ?? "").trim().slice(0, LC_ANSWER_MAX);
     const lastLine = lastLineOf(text);
+    if (s.toolsDropped) writeEntry(sid, LC_TOOL, `(+${s.toolsDropped} more tool calls)`);
+    s.tools = s.toolsDropped = 0;
+    s.queued = [];
     if (text) writeEntry(sid, LC_ANSWER, text);
     updateRecord(sid, (d) => {
       d.runs += 1;
@@ -365,6 +426,18 @@ export function createLcEngine({
     s.waiter = null;
     w?.resolve({ lastLine });
     armIdle(sid);
+  }
+
+  /** lets-code accepted the running task's prompt (a response or any event after it): a restart now sends the cut-off prompt. */
+  function markSent(sid) {
+    const s = S(sid);
+    const taskId = s.pendingSend;
+    if (taskId == null) return;
+    s.pendingSend = null;
+    s.sentTaskId = taskId;
+    updateRecord(sid, (d) => {
+      d.sentTaskId = taskId;
+    });
   }
 
   const sleep = (ms, signal) =>
@@ -390,16 +463,22 @@ export function createLcEngine({
       if (s.busy) {
         const rec = await readRecord(sid);
         if (requestId && rec.lastRequestId === requestId) return { deduped: true };
-        if (requestId) remember(s, requestId);
         if (s.session?.running && !s.starting && s.waiter) await s.session.steer(text);
         else s.queued.push(text); // the child is (re)starting: sent right after the run's prompt
+        if (requestId) remember(s, requestId); // only once it was steered or queued
         writeEntry(sid, LC_USER, text);
         if (requestId) updateRecord(sid, (d) => (d.lastRequestId = requestId));
         return { deduped: false, steered: true };
       }
-      admit(sid);
-      if (requestId) remember(s, requestId);
+      s.reserved = true; // counts toward maxLive while admit waits (concurrent prompts)
+      try {
+        await admit(sid);
+      } catch (err) {
+        s.reserved = false;
+        throw err;
+      }
       s.busy = true;
+      s.reserved = false;
       clearTimeout(s.idleTimer);
       s.idleTimer = null;
       let taskId;
@@ -419,28 +498,33 @@ export function createLcEngine({
         s.busy = false;
         return { deduped: true };
       }
+      if (requestId) remember(s, requestId); // after the commit: a failed one may be retried
       s.taskId = taskId;
       return { deduped: false, taskId };
     },
 
     /** The run task's phase (see task.mjs). Resolves at the end of the run; rejects LC_EXIT when the child died mid-turn. */
-    async drive(sid, { text, attempt }, signal) {
+    async drive(sid, { text, attempt, taskId }, signal) {
       const s = S(sid);
       const row = map.get(sid);
       if (!row || row.archived) throw new Error("the session is gone");
       s.busy = true;
       clearTimeout(s.idleTimer);
       s.idleTimer = null;
+      s.tools = s.toolsDropped = 0;
       let send = text;
       if (attempt > 1) {
         const rec = await readRecord(sid);
         removeStaleRegistry(rec.childPid, { root: registryRoot });
-        if (s.crashed && crashDelayMs > 0) await sleep(crashDelayMs, signal);
-        const delivered = Boolean(rec.piSessionFile && existsSync(rec.piSessionFile));
-        if (delivered) {
+        const crashed = s.crashed;
+        if (crashed) emitTo(sid, { type: "error", message: `lets-code exited mid-turn; starting it again (attempt ${attempt} of ${LC_RESTART_LIMIT + 1})` });
+        if (crashed && crashDelayMs > 0) await sleep(crashDelayMs, signal);
+        const sent = taskId != null && (s.sentTaskId === taskId || rec.sentTaskId === taskId);
+        if (sent) {
+          // The prompt reached lets-code: continue that work, never re-send it.
           const runId = findFactoryRun(row.cwd, factoryRoot);
-          send = runId ? `/factory resume ${runId}` : LC_CUTOFF_PROMPT;
-        } // else nothing reached the model: the prompt itself again, in a fresh session file
+          send = runId ? `/factory resume ${runId}` : crashed ? LC_CRASH_PROMPT : LC_CUTOFF_PROMPT;
+        } // else lets-code never accepted it: the user's prompt itself again (never replaced by a cut-off prompt)
         await updateRecord(sid, (d) => {
           d.restarts += 1;
         });
@@ -462,11 +546,13 @@ export function createLcEngine({
         );
       });
       done.catch(() => {});
+      s.pendingSend = taskId ?? null;
       const sent = session.runLc(send);
       // Steers that arrived while the child was starting.
       for (const q of s.queued.splice(0)) session.steer(q).catch(() => {});
       sent.then(
         (res) => {
+          if (res && res.success !== false) markSent(sid);
           if (s.session !== session || !s.waiter) return;
           if (res && res.success === false) {
             const w = s.waiter;
@@ -492,6 +578,7 @@ export function createLcEngine({
     /** The run task ended without an answer (limit, error): say so and go idle. */
     runFailed(sid, message) {
       const s = S(sid);
+      s.queued = []; // steers of a run that ended without an answer are stale
       s.busy = false;
       s.taskId = null;
       s.waiter = null;
@@ -627,6 +714,11 @@ export function createLcEngine({
     async setFactory(sid, on, { ticket, howToRun } = {}) {
       const row = map.get(sid);
       if (!row || row.archived) throw httpError(404, "Session not found");
+      if (on && ticket) {
+        // Experts are host-wide lets-code state: only the operator enables them (ruling 4, R-C2).
+        const ex = expertsEnabled({ stateFile });
+        if (!ex.ok) throw Object.assign(httpError(409, `${LC_EXPERTS_DISABLED} (missing: ${ex.missing.join(", ")})`), { reason: "experts_disabled", missing: ex.missing });
+      }
       await updateRecord(sid, (d) => {
         d.factory = Boolean(on);
       });
@@ -665,7 +757,7 @@ export function createLcEngine({
         s.idleTimer = null;
         if (s.session) {
           sids.push(s.sid);
-          s.expectedExit = true;
+          s.session.expectedExit = true;
           await s.session.stop().catch(() => {});
           s.session = null;
         }

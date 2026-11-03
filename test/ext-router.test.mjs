@@ -564,6 +564,7 @@ function stubDurableLc({ engines = ["native", "lets-code"] } = {}) {
     if (!sid.startsWith("dur-")) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
     if (sid === "dur-native") throw Object.assign(new Error("the factory needs the lets-code engine"), { statusCode: 409 });
     if (sid === "dur-mute") throw Object.assign(new Error("lets-code did not confirm the mode"), { statusCode: 504 });
+    if (sid === "dur-noexperts") throw Object.assign(new Error("factory experts must be enabled by the operator (missing: tester)"), { statusCode: 409, reason: "experts_disabled" });
     d.calls.factory.push([sid, on, opts]);
     return { factory: on };
   };
@@ -665,6 +666,9 @@ test("factory on a native agent is 409", async (t) => {
   assert.deepEqual(await r.json(), { error: "lets-code did not confirm the mode" });
   r = await postJson(`${base}/api/agents/nope/factory`, { on: true });
   assert.equal(r.status, 404);
+  r = await postJson(`${base}/api/agents/dur-noexperts/factory`, { on: true, ticket: "Fix the CI" });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "factory experts must be enabled by the operator (missing: tester)", reason: "experts_disabled" });
 });
 
 test("/agents/:sid/factory falls through without the durable provider", async (t) => {

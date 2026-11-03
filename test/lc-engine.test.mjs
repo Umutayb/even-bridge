@@ -11,7 +11,8 @@ import { createDurableProvider } from "../src/providers/durable/provider.mjs";
 import { getOwner } from "../src/ownership.mjs";
 import { fakeModelsJson } from "./helpers/fake-openai.mjs";
 import { LcSessionDoc } from "../src/providers/durable/lc/record.mjs";
-import { LC_CUTOFF_PROMPT, LC_RESTART_LIMIT, LC_RUN_TASK } from "../src/providers/durable/lc/task.mjs";
+import { LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_RESTART_LIMIT, LC_RUN_TASK } from "../src/providers/durable/lc/task.mjs";
+import { FACTORY_EXPERTS } from "../src/providers/durable/lc/launch.mjs";
 import { LC_IDLE_KEEP_MS, LC_MAX_LIVE_DEFAULT, LC_MODE_ACK_MS } from "../src/providers/durable/lc/engine.mjs";
 
 const FAKE = fileURLToPath(new URL("./helpers/fake-pi-rpc.mjs", import.meta.url));
@@ -50,6 +51,9 @@ function makeCase({ lc = {}, extra = {}, warn } = {}) {
   const registryRoot = join(dir, "lc-registry");
   const runsRoot = join(dir, "lc-runs");
   mkdirSync(registryRoot, { recursive: true });
+  // lets-code's host-wide state with the factory's experts on (the operator's job, ruling 4).
+  const stateFile = join(dir, "lets-code-state.json");
+  writeFileSync(stateFile, JSON.stringify({ experts: Object.fromEntries(FACTORY_EXPERTS.map((x) => [x, true])) }));
   const open = (more = {}) => {
     const p = createDurableProvider((sid, frame) => frames.push({ sid, ...frame }), {
       hub: { clientCount: () => 0 },
@@ -76,6 +80,7 @@ function makeCase({ lc = {}, extra = {}, warn } = {}) {
         registryRoot,
         runsRoot,
         childEnv: { FAKE_PI_LOG: logFile },
+        stateFile,
         ...lc,
         ...(more.lc ?? {}),
       },
@@ -96,6 +101,7 @@ function makeCase({ lc = {}, extra = {}, warn } = {}) {
     factoryRoot,
     registryRoot,
     runsRoot,
+    stateFile,
     open,
     log,
     spawns: () => log().filter((l) => l.spawn),
@@ -677,4 +683,157 @@ test("the factory never enables experts", async (t) => {
   await p.setFactory(sid, false);
   assert.ok(c.prompts().length >= 4);
   assert.ok(!c.prompts().some((x) => x.message.startsWith("/experts")));
+});
+
+// ── fix round 1 ──────────────────────────────────────────────────────────────
+
+test("a prompt lets-code never accepted is sent again after a crash, never replaced by a cut-off prompt", async (t) => {
+  const c = makeCase({ lc: { idleKeepMs: 0 } });
+  const marker = join(c.dir, "die-once");
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_DIE_ONCE: marker, FAKE_PI_DIE_TEXT: "b" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "a", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await until(() => p._lc.liveCount() === 0, 5000, "idle stop");
+  assert.ok(existsSync((await recordOf(p, sid)).piSessionFile), "the session file exists: the old heuristic would have sent the cut-off prompt");
+  await p.prompt(sid, "b");
+  await idleAfter(c, sid, 2);
+  assert.ok(existsSync(marker), "the child died at prompt b");
+  const spawns = c.spawns();
+  assert.equal(spawns.length, 3);
+  assert.deepEqual(c.prompts().filter((x) => x._pid === spawns[2].pid).map((x) => x.message), ["b"]);
+  assert.ok(!c.prompts().some((x) => x.message === LC_CUTOFF_PROMPT || x.message === LC_CRASH_PROMPT));
+  assert.equal(c.frames.filter((f) => f.sid === sid && f.type === "text_delta").map((f) => f.text).join("|"), "ok: a|ok: b");
+});
+
+test("a crash after lets-code accepted the prompt continues with the crash prompt and says so", async (t) => {
+  const c = makeCase();
+  const marker = join(c.dir, "crash-once");
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_CRASH_ONCE: marker } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "work", c.work, { engine: "lets-code" });
+  await until(() => c.prompts().some((x) => x.message === LC_CRASH_PROMPT), 8000, "crash prompt");
+  await idleAfter(c, sid);
+  assert.equal(c.prompts().filter((x) => x.message === "work").length, 1, "never re-sent");
+  assert.equal(c.prompts().filter((x) => x.message === LC_CRASH_PROMPT).length, 1);
+  assert.ok(!c.prompts().some((x) => x.message === LC_CUTOFF_PROMPT), "not a bridge restart");
+  assert.ok(c.frames.some((f) => f.sid === sid && f.type === "error" && /^lets-code exited mid-turn; starting it again \(attempt 2 of 6\)$/.test(f.message)));
+  assert.equal((await recordOf(p, sid)).sentTaskId != null, true);
+});
+
+test("a respawn first resets a failed scope of the same name, and the scope is collected", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { wrapper: "systemd-run", spawnWrap: () => [] } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.ok(c.runs.some((r) => r.join(" ") === `systemctl --user reset-failed even-lc-${sid}.scope`), JSON.stringify(c.runs));
+  assert.ok(p._lc._launches.get(sid).wrap.includes("--collect"));
+});
+
+test("the spawn writes the project-local guard for the subagents", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  const f = join(c.work, ".pi", "extensions", "even-guard.ts");
+  assert.ok(existsSync(f));
+  assert.match(readFileSync(f, "utf8"), /guard-core\.mjs/);
+});
+
+test("an idle-kept child is stopped before the new one is admitted (admit is awaited)", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: a } = await p.prompt(undefined, "one", c.work, { engine: "lets-code" });
+  await idleAfter(c, a);
+  assert.equal(p._lc.liveCount(), 1);
+  await p.prompt(undefined, "two", c.work, { engine: "lets-code" });
+  assert.equal(p._lc._states.get(a).session, null, "stopped by the time the prompt returned");
+});
+
+test("two new agents at once at the limit: one 429 and no empty row", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const results = await Promise.allSettled([
+    p.prompt(undefined, "HANG", c.work, { engine: "lets-code" }),
+    p.prompt(undefined, "HANG", c.work, { engine: "lets-code" }),
+  ]);
+  assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+  assert.equal(results.find((r) => r.status === "rejected").reason.statusCode, 429);
+  assert.equal([...p._map.rows()].length, 1, "the refused start left no row");
+});
+
+test("a run resumed after a restart counts toward the live limit", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const a = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile } } });
+  await a.prompt(undefined, "HANG", c.work, { engine: "lets-code" });
+  await until(() => c.prompts().length === 1, 5000, "HANG");
+  await a.stopAll();
+  const b = c.open();
+  await b.ready;
+  await assert.rejects(b.prompt(undefined, "x", c.work, { engine: "lets-code" }), (e) => e.statusCode === 429);
+});
+
+test("a child stopped while idle leaves no lets-code-sessions/<pid>.json", async (t) => {
+  const c = makeCase({ lc: { idleKeepMs: 400 } });
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  const pid = (await recordOf(p, sid)).childPid;
+  const reg = join(c.registryRoot, `${pid}.json`);
+  writeFileSync(reg, "{}");
+  await until(() => p._lc.liveCount() === 0, 5000, "idle stop");
+  await until(() => !existsSync(reg), 3000, "registry file removed");
+});
+
+test("lc.tool entries are capped per run", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "TOOLS25", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await until(async () => (await entriesOf(p, sid)).some((e) => e.kind === "lc.answer"), 5000, "answer");
+  await sleep(200);
+  const tools = (await entriesOf(p, sid)).filter((e) => e.kind === "lc.tool").map((e) => e.data.text);
+  assert.equal(tools.length, 21);
+  assert.equal(tools.at(-1), "(+5 more tool calls)");
+});
+
+test("a retried requestId whose first try failed before its commit is accepted", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "first", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  const h = p._harness;
+  const orig = h.commit.bind(h);
+  let fail = true;
+  h.commit = (fn, ...rest) => (fail ? ((fail = false), Promise.reject(new Error("store hiccup"))) : orig(fn, ...rest));
+  await assert.rejects(p.prompt(sid, "x", undefined, { requestId: "r9" }), /store hiccup/);
+  h.commit = orig;
+  await p.prompt(sid, "x", undefined, { requestId: "r9" });
+  await idleAfter(c, sid, 2);
+  assert.equal(c.prompts().filter((x) => x.message === "x").length, 1);
+});
+
+test("setFactory with a ticket is refused 409 experts_disabled while the experts are off; nothing is written or sent", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  writeFileSync(c.stateFile, JSON.stringify({ experts: { researcher: true, developer: true } }));
+  const before = readFileSync(c.stateFile, "utf8");
+  await assert.rejects(p.setFactory(sid, true, { ticket: "Fix the CI" }), (e) => e.statusCode === 409 && e.reason === "experts_disabled" && /factory experts must be enabled by the operator/.test(e.message));
+  assert.ok(!existsSync(join(c.work, ".factory")), "no ticket written");
+  assert.ok(!c.prompts().some((x) => x.message.startsWith("/factory") || x.message.startsWith("/mode")));
+  assert.equal(readFileSync(c.stateFile, "utf8"), before, "the state file is only read");
+  assert.equal((await recordOf(p, sid)).factory, false);
+  // Without a ticket the toggle itself still works (no factory run starts).
+  assert.equal((await p.setFactory(sid, true)).factory, true);
 });
