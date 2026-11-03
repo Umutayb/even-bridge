@@ -18,7 +18,8 @@ import { startFakeOpenAI, fakeModelsJson } from "./helpers/fake-openai.mjs";
 
 // A local fake even-search: `/search` answers `searchReply(q)` (7 results by default),
 // `/fetch` answers `{text}` from `pages` keyed by URL. A URL containing "hang" never
-// answers; `searchMode` "500" / "hang" breaks /search. Every request URL is kept.
+// answers; `searchMode` "500" / "hang" breaks /search, "html" answers a non-JSON 200, "mixed" mixes
+// a non-http(s) result in. Every request URL is kept.
 let es;
 let fake;
 let root;
@@ -35,6 +36,7 @@ const pages = new Map([
   ["https://site0.example/page", LONG],
   ["https://site2.example/page", "two"],
   ["https://read.example/a", HUGE],
+  ["https://user:secret@read.example/a", "auth"],
 ]);
 const hung = new Set();
 
@@ -45,6 +47,11 @@ before(async () => {
     if (u.pathname === "/search") {
       if (searchMode === "hang") return void hung.add(res);
       if (searchMode === "500") return void res.writeHead(500).end("boom");
+      if (searchMode === "html") return void res.writeHead(200, { "content-type": "text/html" }).end("<html>secret page body</html>");
+      if (searchMode === "mixed") {
+        const mixed = [{ title: "ftp", url: "ftp://files.example/x", snippet: "f" }, { title: "web", url: "https://site0.example/page", snippet: "w" }];
+        return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ results: mixed }));
+      }
       res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ results: RESULTS }));
       return;
     }
@@ -153,6 +160,52 @@ test("web_fetch: cuts text, refuses non-http(s) without a request, reports failu
   assert.deepEqual(bad, { url: "https://missing.example/", text: "", error: "fetch failed" });
 });
 
+test("web_fetch: a URL with an embedded newline cannot forge log lines; only the normalised href is used", async () => {
+  lines.length = 0;
+  seen.length = 0;
+  const raw = "https://read.example/a\n[durable] forged";
+  const href = new URL(raw).href; // the parser drops the newline
+  assert.ok(!href.includes("\n"));
+  const out = await run(ext(), "web_fetch", { url: raw });
+  assert.equal(out.url, href);
+  assert.equal(lines.length, 1);
+  assert.ok(!lines[0].includes("\n"), JSON.stringify(lines[0]));
+  assert.equal(lines[0], `[durable:web] fetch ${href} -> failed (HTTP 502)`);
+  assert.equal(seen.length, 1);
+  assert.equal(new URL(seen[0], "http://x").searchParams.get("url"), href);
+});
+
+test("web_fetch: userinfo is requested but never logged", async () => {
+  lines.length = 0;
+  seen.length = 0;
+  const out = await run(ext(), "web_fetch", { url: "https://user:secret@read.example/a" });
+  assert.deepEqual(out, { url: "https://user:secret@read.example/a", text: "auth" });
+  assert.equal(new URL(seen[0], "http://x").searchParams.get("url"), "https://user:secret@read.example/a");
+  assert.deepEqual(lines, ["[durable:web] fetch https://read.example/a -> 4 chars"]);
+});
+
+test("web_fetch: the tool call's abort signal stops the request", async () => {
+  lines.length = 0;
+  const ac = new AbortController();
+  ac.abort();
+  const res = await tool(ext(), "web_fetch").execute({ url: "https://slow.example/hang" }, {}, { abortSignal: ac.signal });
+  assert.deepEqual(JSON.parse(res.output[0].text), { url: "https://slow.example/hang", text: "", error: "fetch failed" });
+  assert.deepEqual(lines, ["[durable:web] fetch https://slow.example/hang -> failed (aborted)"]);
+});
+
+test("web_search: a non-JSON body logs a fixed reason, never the body; non-http(s) results are dropped", async () => {
+  lines.length = 0;
+  searchMode = "html";
+  assert.deepEqual(await run(ext(), "web_search", { query: "q" }), { results: [], error: "search unavailable" });
+  assert.deepEqual(lines, ['[durable:web] search "q" failed: bad JSON']);
+  searchMode = "mixed";
+  seen.length = 0;
+  const out = await run(ext(), "web_search", { query: "q" });
+  assert.deepEqual(out.results.map((r) => r.url), ["https://site0.example/page"]);
+  assert.ok(!seen.some((u) => u.includes("ftp")), "the ftp result is never fetched");
+  searchMode = "ok";
+});
+
 // The provider installs the extension only with a base URL, and conversations are offered its tools.
 let n = 0;
 function setup(extra = {}) {
@@ -216,5 +269,26 @@ test("provider with EVEN_BRIDGE_WEB_SEARCH_URL: web_search is offered and runs t
   const payload = JSON.parse(results.find((t) => t.includes("results")));
   assert.equal(payload.results.length, 5);
   assert.ok(plog.includes('[durable:web] search "top stories" -> 5 results'));
+  await provider.stopAll();
+});
+
+test("subagent children keep the web tools unless their tools list leaves them out", async () => {
+  const agents = new Map([
+    ["general", { name: "general", description: "Runs tasks", body: "Do the task.", extra: {} }],
+    ["scout", { name: "scout", description: "Recon", tools: ["read", "bash"], body: "Look around.", extra: {} }],
+  ]);
+  const { provider, frames } = setup({ env: { EVEN_BRIDGE_WEB_SEARCH_URL: base() }, agents, allowedAgents: ["general", "scout"] });
+  const childTools = async (agent, task) => {
+    const from = fake.requests.length;
+    const { sessionId } = await provider.prompt(undefined, `TOOL subagent ${JSON.stringify({ agent, task })}`, undefined, {});
+    await until(() => idle(frames, sessionId));
+    const child = fake.requests.slice(from).find((r) => (r.messages ?? []).some((m) => m.role === "user" && contentText(m.content) === task));
+    assert.ok(child, `the ${agent} child made a request`);
+    return toolNames(child);
+  };
+  const g = await childTools("general", "general child task");
+  assert.ok(g.includes("web_search") && g.includes("web_fetch"), `general: ${g}`);
+  const sc = await childTools("scout", "scout child task");
+  assert.ok(!sc.includes("web_search") && !sc.includes("web_fetch") && sc.includes("read"), `scout: ${sc}`);
   await provider.stopAll();
 });

@@ -62,13 +62,32 @@ async function getJson(fetchImpl, url, ms, context) {
   return await res.json();
 }
 
-const isHttpUrl = (s) => {
+/**
+ * The normalised http(s) URL of `s` (`href`) and its form for the log (`shown`, no userinfo), or null.
+ * The URL parser drops tabs and newlines, so only `href` is ever requested, logged or returned
+ * (a raw string could forge bridge log lines).
+ */
+export function httpUrl(s) {
+  let u;
   try {
-    const u = new URL(String(s));
-    return u.protocol === "http:" || u.protocol === "https:";
+    u = new URL(String(s ?? "").trim());
   } catch {
-    return false;
+    return null;
   }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  const href = u.href;
+  u.username = "";
+  u.password = "";
+  return { href, shown: u.href };
+}
+
+/** A fixed reason for the log: never upstream content (a JSON parse error quotes the body). */
+const reasonOf = (err) => {
+  if (err?.name === "TimeoutError") return "timeout";
+  if (err?.name === "AbortError") return "aborted";
+  if (/^HTTP \d+$/.test(err?.message ?? "")) return err.message;
+  if (err instanceof SyntaxError) return "bad JSON";
+  return "unreachable";
 };
 
 /**
@@ -107,11 +126,13 @@ export function createWebExtension({ baseUrl, log, fetchImpl = globalThis.fetch,
         const data = await getJson(fetchImpl, searchUrl(query), searchMs, context);
         const items = Array.isArray(data?.results) ? data.results : [];
         results = items
-          .filter((it) => it && typeof it === "object" && it.url)
+          .filter((it) => it && typeof it === "object")
+          .map((it) => ({ it, u: httpUrl(it.url) }))
+          .filter(({ u }) => u) // only http(s) results are kept (and fetched)
           .slice(0, WEB_SEARCH_N)
-          .map((it) => ({ title: String(it.title ?? ""), url: String(it.url), snippet: String(it.snippet ?? "").slice(0, WEB_SNIPPET_MAX), text: "" }));
+          .map(({ it, u }) => ({ title: String(it.title ?? ""), url: u.href, snippet: String(it.snippet ?? "").slice(0, WEB_SNIPPET_MAX), text: "" }));
       } catch (err) {
-        info(`[durable:web] search ${JSON.stringify(query)} failed: ${err?.name === "TimeoutError" ? "timeout" : err?.message ?? err}`);
+        info(`[durable:web] search ${JSON.stringify(query)} failed: ${reasonOf(err)}`);
         return json(unavailable);
       }
       await Promise.all(
@@ -134,15 +155,16 @@ export function createWebExtension({ baseUrl, log, fetchImpl = globalThis.fetch,
     parameters: FETCH_PARAMETERS,
     replay: "safe",
     async execute(args, _api, context) {
-      const url = String(args?.url ?? "").trim();
-      if (!isHttpUrl(url)) return json({ error: "only http(s) URLs" });
+      const u = httpUrl(args?.url);
+      if (!u) return json({ error: "only http(s) URLs" });
+      const url = u.href;
       try {
         const text = await pageText(url, WEB_FETCH_MAX, context);
-        info(`[durable:web] fetch ${url} -> ${text.length} chars`);
+        info(`[durable:web] fetch ${u.shown} -> ${text.length} chars`);
         return json({ url, text });
       } catch (err) {
         const why = err?.name === "TimeoutError" ? "timeout" : "fetch failed";
-        info(`[durable:web] fetch ${url} -> failed (${why})`);
+        info(`[durable:web] fetch ${u.shown} -> failed (${reasonOf(err)})`);
         return json({ url, text: "", error: why });
       }
     },

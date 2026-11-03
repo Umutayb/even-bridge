@@ -186,7 +186,12 @@ trafilatura on the LAN, the same service the glasses' own web search uses):
 
 Neither tool throws into the model. They are not bash and never touch the
 filesystem, so the guard does not vet them; every page is fetched by
-even-search, never by the bridge host. Subagent children keep the
+even-search, never by the bridge host. The tools are not a network boundary:
+`web_fetch` passes any http(s) URL, LAN and loopback hosts included, and
+even-search fetches it from the LAN (bash may already reach any host with
+curl/wget). Only the normalised URL (no tabs or newlines) is requested, logged
+and returned, and the log drops any `user:password@`; search results that are
+not http(s) are dropped. Subagent children keep the
 extension, subject to their agent file's `tools` / `disallowed` lists (an
 agent whose `tools` list does not name `web_search` does not get it). The
 tool descriptions tell the model when to search (current information, news,
