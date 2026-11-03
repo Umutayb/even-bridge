@@ -92,11 +92,13 @@ export async function findExternalPi(cwd, { excludePids = [], procRoot = "/proc"
 }
 
 /**
- * Find a tmux pane running `pi` with its current path == `cwd`.
+ * Find a tmux pane running `pi` with its current path == `cwd`. With `pid`, only the pane hosting THAT pi
+ * process (pane_pid is the process or one of its ancestors): two pi terminals can share a cwd.
  * @returns {Promise<string|null>} pane id (e.g. "%7") or null.
  */
-export async function findPiTmuxPane(cwd, { tmuxBin = "tmux", procRoot = "/proc" } = {}) {
+export async function findPiTmuxPane(cwd, { tmuxBin = "tmux", procRoot = "/proc", pid } = {}) {
   if (!cwd) return null;
+  if (pid != null) return findPaneFor(cwd, pid, ["pi"], { tmuxBin, procRoot });
   const fmt = "#{session_name} #{window_index} #{pane_id} #{pane_current_command} #{pane_current_path}";
   let out;
   try {
@@ -123,17 +125,28 @@ export async function findPiTmuxPane(cwd, { tmuxBin = "tmux", procRoot = "/proc"
   return null;
 }
 
+/** Characters a single typed line may never carry: C0/C1 controls, DEL, line and paragraph separators. */
+export const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
 /**
  * Deliver `text` to a tmux pane's foreground program (the pi TUI) as if typed,
- * then press Enter. Multi-line text is pasted verbatim via a load-buffer so
- * newlines land inside the prompt, not as submits.
+ * then press Enter. A single line is typed LITERALLY (`send-keys -l -- text`, so
+ * "C-d", "Escape" or a leading "-" are characters, never key names or options),
+ * then Enter as a separate key. Multi-line text (the phone only) is pasted
+ * verbatim via a load-buffer so newlines land inside the prompt, not as submits.
+ * `singleLine: true` (the overseer's messages): any newline or control character
+ * is refused (never pasted).
  *
  * @returns {Promise<void>} rejects when tmux is unavailable.
  */
-export async function tmuxDeliver(paneId, text, { tmuxBin = "tmux" } = {}) {
+export async function tmuxDeliver(paneId, text, { tmuxBin = "tmux", singleLine: only = false } = {}) {
   const singleLine = !text.includes("\n");
+  if (only && CONTROL_CHARS_RE.test(text)) {
+    throw Object.assign(new Error("a typed message must be one line without control characters"), { statusCode: 400 });
+  }
   if (singleLine) {
-    await runTmux(tmuxBin, ["send-keys", "-t", paneId, text, "Enter"]);
+    await runTmux(tmuxBin, ["send-keys", "-t", paneId, "-l", "--", text]);
+    await runTmux(tmuxBin, ["send-keys", "-t", paneId, "Enter"]);
     return;
   }
   // Multi-line: paste the whole text, then submit once.
@@ -285,6 +298,57 @@ async function isBridgeDescendant(ppid, procRoot, myPid) {
     cur = next;
   }
   return false;
+}
+
+/** The pane (in `cwd`) whose foreground command is one of `commands` and whose pane_pid is `pid` or its ancestor. */
+async function findPaneFor(cwd, pid, commands, { tmuxBin = "tmux", procRoot = "/proc" } = {}) {
+  const fmt = "#{session_name} #{window_index} #{pane_id} #{pane_pid} #{pane_current_command} #{pane_current_path}";
+  let out;
+  try {
+    const { stdout } = await new Promise((resolve, reject) =>
+      execFile(tmuxBin, ["list-panes", "-a", "-F", fmt], { timeout: 5000 }, (err, stdout) =>
+        err ? reject(err) : resolve({ stdout: String(stdout ?? "") })
+      )
+    );
+    out = stdout;
+  } catch {
+    return null;
+  }
+  for (const line of out.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 6) continue;
+    const panePid = Number(parts[3]);
+    const command = parts[4];
+    if (parts.slice(5).join(" ") !== cwd) continue;
+    if (!commands.some((c) => command === c || command.endsWith("/" + c))) continue;
+    if (panePid && (await isBridgeDescendant(pid, procRoot, panePid))) return parts[2];
+  }
+  return null;
+}
+
+/**
+ * Right before typing (after any wait): does `paneId` still run one of `commands` in the foreground, with
+ * pane_pid an ancestor of (or equal to) `pid`? A program that exited leaves a shell there, which would EXECUTE
+ * the typed text; a pane that now hosts another process is someone else's.
+ * @returns {Promise<boolean>}
+ */
+export async function paneRunsPid(paneId, pid, { commands = ["pi"], tmuxBin = "tmux", procRoot = "/proc" } = {}) {
+  let out;
+  try {
+    const { stdout } = await new Promise((resolve, reject) =>
+      execFile(tmuxBin, ["display-message", "-p", "-t", paneId, "#{pane_current_command} #{pane_pid}"], { timeout: 5000 }, (err, stdout) =>
+        err ? reject(err) : resolve({ stdout: String(stdout ?? "") })
+      )
+    );
+    out = stdout.trim();
+  } catch {
+    return false;
+  }
+  const [command = "", panePidS = ""] = out.split(/\s+/);
+  const panePid = Number(panePidS);
+  if (!commands.some((c) => command === c || command.endsWith("/" + c))) return false;
+  if (!panePid || pid == null) return false;
+  return isBridgeDescendant(pid, procRoot, panePid);
 }
 
 /**

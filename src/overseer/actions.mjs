@@ -19,7 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { defineDoc } from "@earendil-works/pi-durable";
 import { HANDOFF_MODEL, OVERSEER_SID, OverseerHandoffs, OverseerOutbox, pushOutbox, ROOT_CONVERSATION_ID } from "./docs.mjs";
 import { hhmm } from "./checkins.mjs";
-import { cannotMessage, defuse, KIND_WORD } from "./host.mjs";
+import { cannotMessage, defuse, KIND_WORD, SESSION_TEXT_MAX, startsWithCommand, textProblem } from "./host.mjs";
 
 export const ACTION_TTL_MS = 90000;
 export const ACTION_KINDS = Object.freeze(["session_start", "session_message", "session_interrupt", "session_stop", "model_switch", "standing_order"]);
@@ -48,6 +48,7 @@ export const TASK_MAX = 400;
 /** What the summary shows of a task (Even AI's one gate may send up to TASK_MAX). */
 export const SUMMARY_TASK_MAX = 140;
 /** Proposal text never starts a command (lets-code reads "/mode", "/factory", "!cmd" from the prompt RPC). */
+/** A leading "/" or "!" (after whitespace): kept for callers; the gate uses host.mjs textProblem / startsWithCommand. */
 export const COMMAND_RE = /^\s*[\/!]/;
 export const NO_COMMANDS = "the overseer cannot send commands";
 export const ONE_PENDING = "another action is waiting for your answer";
@@ -67,6 +68,8 @@ export const REPLY_MAX_MS = 30 * 60 * 1000;
 export const REPLY_QUIET_MS = 15000;
 export const REPLY_TEXT_MAX = 200;
 export const REPLY_WATCH_MAX = 8;
+/** Consecutive failed reads (state or history) a reply watch tolerates before it gives up. */
+export const REPLY_MISSES = 3;
 
 const latest = { scope: "conversation", history: "latest", fork: "initial", checkpointWhen: () => true };
 export const OverseerActions = defineDoc({ kind: "even.overseer.actions", version: 1, ...latest, initial: () => ({ items: [] }) });
@@ -264,7 +267,7 @@ export function createOverseerActions({
       const label = strArg(args.label, "label", { max: LABEL_MAX });
       if (!LABEL_RE.test(label)) throw httpError(400, "'label' may hold letters, digits, space, '_', '.' or '-'");
       const task = strArg(args.task, "task", { max: origin === "overseer" ? OVERSEER_TASK_MAX : TASK_MAX });
-      if (COMMAND_RE.test(task)) throw httpError(400, NO_COMMANDS);
+      if (startsWithCommand(task)) throw httpError(400, NO_COMMANDS);
       const engines = Array.isArray(durable.engines) ? durable.engines : ["native"];
       const engine = args.engine ?? (engines.includes("lets-code") ? "lets-code" : "native");
       if (!engines.includes(engine)) throw httpError(400, `the ${oneLine(engine, 20)} engine is not available`);
@@ -302,8 +305,12 @@ export function createOverseerActions({
     // The target's kind, for the summary ("Send pi session '…'"); a bridge agent's args are as before.
     const target = d.kind !== "durable" ? { target: d.kind } : {};
     if (kind === "session_message") {
-      const text = strArg(args.text, "text", { max: origin === "overseer" ? OVERSEER_TEXT_MAX : EVENAI_TEXT_MAX });
-      if (COMMAND_RE.test(text)) throw httpError(400, NO_COMMANDS);
+      // A pi / Claude Code / RC target gets at most 140 characters from every origin (the summary the user
+      // confirms shows all of it); a bridge agent keeps the per-origin limits.
+      const max = d.kind !== "durable" ? SESSION_TEXT_MAX : origin === "overseer" ? OVERSEER_TEXT_MAX : EVENAI_TEXT_MAX;
+      const text = strArg(args.text, "text", { max });
+      const bad = textProblem(text);
+      if (bad) throw httpError(400, bad);
       const steer = args.steer == null ? false : args.steer;
       if (typeof steer !== "boolean") throw httpError(400, "'steer' must be true or false");
       return { id, label, text, steer, ...target };
@@ -311,7 +318,8 @@ export function createOverseerActions({
     if (kind === "standing_order") {
       // The later messages are sent without a confirm, so the text is short enough to be read in full.
       const text = strArg(args.text, "text", { max: OVERSEER_TEXT_MAX });
-      if (COMMAND_RE.test(text)) throw httpError(400, NO_COMMANDS);
+      const bad = textProblem(text);
+      if (bad) throw httpError(400, bad);
       const maxTimes = args.maxTimes;
       if (!Number.isInteger(maxTimes) || maxTimes < 1 || maxTimes > STANDING_MAX_TIMES) {
         throw httpError(400, `'maxTimes' must be an integer from 1 to ${STANDING_MAX_TIMES}`);
@@ -615,17 +623,20 @@ export function createOverseerActions({
   const watches = new Set();
 
   async function replyBaseline(id) {
+    if (typeof host.replySnapshot !== "function") return null;
     try {
-      return typeof host.lastReply === "function" ? String((await host.lastReply(id)) ?? "") : null;
+      return (await host.replySnapshot(id)) ?? null;
     } catch {
-      return "";
+      return null;
     }
   }
 
-  async function pushReply(item, text) {
+  async function pushReply(item, text, quote) {
     try {
       const box = await harness.commit(
-        async (tx) => ({ ...pushOutbox(await tx.doc(OverseerOutbox, ROOT_CONVERSATION_ID), { kind: "reply", text, tag: item.id, at: now() }) }),
+        async (tx) => ({
+          ...pushOutbox(await tx.doc(OverseerOutbox, ROOT_CONVERSATION_ID), { kind: "reply", text, tag: item.id, at: now(), ...(quote ? { quote } : {}) }),
+        }),
         ctx,
       );
       onOutbox(box);
@@ -635,10 +646,16 @@ export function createOverseerActions({
   }
 
   /**
-   * Watch the target of a confirmed message: "waiting" → "<Kind> '<label>' is waiting for an answer."; back to
-   * idle with a new answer → "<Kind> '<label>' replied: <its newest answer, one line, ≤ 200 chars>"; idle after a
-   * busy phase without a new answer → "… finished its turn without a new answer." Nothing after REPLY_MAX_MS.
-   * The reply text is the session's own (untrusted): defused, one line, cut; it reaches only the outbox.
+   * Watch the target of a confirmed message for its next status change, as ONE outbox item of kind "reply":
+   *   - waiting (a permission / question prompt): "<Kind> '<label>' is waiting for an answer.";
+   *   - idle, with a history tail that changed since the send (by its items, not its text, so an identical "Done."
+   *     still counts), the newest item an answer, and unchanged for REPLY_QUIET_MS (a terminal pi reports idle
+   *     throughout, and its first "Let me look…" is not the reply): "<Kind> '<label>' replied." with the answer as
+   *     `quote` (defused, one line, ≤ 200 characters: the session's own words, untrusted, kept apart from the host
+   *     text);
+   *   - idle after a busy phase with no new answer for REPLY_QUIET_MS: "… finished its turn without a new answer."
+   * A transient failure (unknown state or history) is tolerated REPLY_MISSES times in a row. Nothing after
+   * REPLY_MAX_MS. In this process only (a restart ends the watch).
    */
   function watchReply(item, baseline) {
     if (closed || baseline == null || typeof host.stateOf !== "function") return;
@@ -655,32 +672,43 @@ export function createOverseerActions({
       watches.delete(oldest);
     }
     let seenBusy = false;
+    let misses = 0;
+    let lastFp = baseline.fp;
+    let changedAt = t0;
     const end = () => watches.delete(w);
     const tick = async () => {
       if (closed || w.stop) return end();
       let st = null;
+      let snap = null;
       try {
         st = await host.stateOf(id);
+        snap = await host.replySnapshot(id);
       } catch {
-        /* unknown this time */
+        /* a miss */
       }
-      if (st === "waiting") {
-        end();
-        return pushReply(item, `${who} is waiting for an answer.`);
-      }
-      if (st === "busy") seenBusy = true;
-      else if (st === "idle" && (seenBusy || now() - t0 >= replyQuietMs)) {
-        const r = await replyBaseline(id);
-        if (r && r !== baseline) {
-          end();
-          return pushReply(item, `${who} replied: ${defuse(r, { oneLine: true, max: REPLY_TEXT_MAX })}`);
+      if (st == null || snap == null) {
+        if (++misses >= REPLY_MISSES) return end();
+      } else {
+        misses = 0;
+        if (snap.fp !== lastFp) {
+          lastFp = snap.fp;
+          changedAt = now();
         }
-        if (seenBusy) {
+        const quiet = now() - changedAt >= replyQuietMs;
+        if (st === "waiting") {
+          end();
+          return pushReply(item, `${who} is waiting for an answer.`);
+        }
+        if (st === "busy") seenBusy = true;
+        else if (quiet && snap.fp !== baseline.fp && snap.lastRole === "assistant" && snap.text) {
+          end();
+          return pushReply(item, `${who} replied.`, defuse(snap.text, { oneLine: true, max: REPLY_TEXT_MAX }));
+        } else if (quiet && seenBusy) {
           end();
           return pushReply(item, `${who} finished its turn without a new answer.`);
         }
       }
-      if (now() - t0 >= replyMaxMs || st == null) return end();
+      if (now() - t0 >= replyMaxMs) return end();
       w.timer = setTimeout(tick, replyPollMs);
       w.timer.unref?.();
     };

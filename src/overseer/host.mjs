@@ -23,6 +23,7 @@
 // own function (src/session-twins.mjs).
 import { basename } from "node:path";
 import { bytes, READ_CAP_BYTES } from "./docs.mjs";
+import { CONTROL_CHARS_RE } from "../providers/pi/detect.mjs";
 import { dropRcTwins } from "../session-twins.mjs";
 
 const LIST_LIMIT = 10; // rows per provider
@@ -31,10 +32,35 @@ export const ACTIVE_WINDOW_MS = 12 * 3600 * 1000;
 /** What a session kind is called in summaries and spoken lines. */
 export const KIND_WORD = Object.freeze({ durable: "agent", pi: "pi session", "cc-local": "Claude session", rc: "Claude RC session" });
 /** Why a session cannot receive a message (host text; the shim maps it to a fixed sentence). */
+/** A message to a pi / Claude Code / RC session is at most this long for every origin: the summary shows all of it. */
+export const SESSION_TEXT_MAX = 140;
+/** How long describe() reuses the inventory it built (one action's propose and confirm read the same labels). */
+export const DESCRIBE_CACHE_MS = 15000;
+export const NO_COMMANDS = "the overseer cannot send commands";
+export const NOT_ONE_LINE = "a message must be one line without control characters";
+/** Leading whitespace and invisible format characters (zero-width space/joiners, BOM, bidi marks): skipped before the "/" "!" check. */
+const LEAD_RE = /^[\s\p{Cf}]*/u;
+
+/**
+ * Why a text may not be sent as a message (null when it may): any control character (newline, CR, ESC, C-…, DEL,
+ * C1, line/paragraph separators) — a typed line must be exactly what the user confirmed — or a "/" or "!" after any
+ * leading whitespace or zero-width characters (a slash command or a shell escape in Claude Code, pi and lets-code).
+ */
+export function textProblem(text) {
+  const t = String(text ?? "");
+  if (CONTROL_CHARS_RE.test(t)) return NOT_ONE_LINE;
+  if (/^[\/!]/.test(t.replace(LEAD_RE, ""))) return NO_COMMANDS;
+  return null;
+}
+
+/** A task's leading command check (a task goes to a durable agent's prompt, never typed into a terminal). */
+export const startsWithCommand = (text) => /^[\/!]/.test(String(text ?? "").replace(LEAD_RE, ""));
+
 export const WHY_NOT = Object.freeze({
   "terminal-no-tmux": "it runs in a terminal outside tmux, so nothing can type into it",
   "no-terminal": "no terminal runs it; open it in tmux first",
   "phone-claude": "the phone's Claude bridge runs it; message it from the phone",
+  "driver-unknown": "who drives it could not be checked",
   unknown: "its kind is unknown",
 });
 const LINE_MAX = 160; // characters of a last line / title in a list row
@@ -60,11 +86,15 @@ const msOf = (ts) => {
   return Number.isFinite(n) ? n : null;
 };
 
-/** idle | busy | waiting from a provider's own state word (unknown words count as busy: never "idle" by guess). */
+/**
+ * idle | busy | waiting from a provider's own state word. No state at all, and the words of a finished or failed
+ * turn (idle, done, completed, stopped, ended, failed, error, unknown), are idle; a turn that waits for the user
+ * (await…, wait…, permission, question, input, requires_action, approval) is waiting; any other word is busy.
+ */
 export function normalizeState(state) {
-  const s = String(state ?? "").toLowerCase();
-  if (!s || s === "idle" || s === "done" || s === "stopped" || s === "ended" || s === "unknown") return "idle";
-  if (/await|wait|permission|question|input/.test(s)) return "waiting";
+  const s = String(state ?? "").toLowerCase().trim();
+  if (!s || /^(idle|done|completed?|stopped|ended|failed|error|errored|unknown|archived)$/.test(s)) return "idle";
+  if (/await|wait|permission|question|input|requires_action|approv/.test(s)) return "waiting";
   return "busy";
 }
 
@@ -83,27 +113,60 @@ export function messageRoute(kind, driver) {
   if (kind === "pi" || kind === "cc-local") {
     if (d === "terminal-tmux") return { canMessage: true, via: "tmux" };
     if (d === "terminal") return { canMessage: false, why: "terminal-no-tmux" };
+    // The driver probe failed: never spawn an RPC child next to a terminal that may own the session.
+    if (d === "unknown") return { canMessage: false, why: "driver-unknown" };
     if (kind === "pi") return { canMessage: true, via: "pi-rpc" };
     return { canMessage: false, why: d === "bridge" ? "phone-claude" : "no-terminal" };
   }
   return { canMessage: false, why: "unknown" };
 }
 
+const slug = (v, max) => String(v ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, max).replace(/-+$/, "");
+/** The id's letters and digits without its kind prefix (cse_, dur-), lowercased. */
+const idChars = (id) => String(id ?? "").replace(/^cse_/, "").replace(/^dur-/, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
 /**
  * A label for a session that is safe to speak and to put in a summary: a bridge agent's own name (set by the
- * user or the shim), else `<folder>-<first 6 of the id>` in [a-z0-9-] (the session's title is its own text,
- * untrusted, and never used).
+ * user or the shim; its sid when it has none), else `<folder>-<last N of the id>` in [a-z0-9-]. The id's TAIL is
+ * used: pi ids are UUIDv7 and RC ids ULID-like, whose heads are timestamps shared by sessions hours apart. The
+ * session's title is its own text, untrusted, and never used. `n` (default 6) grows when labels collide
+ * (uniqueLabels).
  */
-export function safeLabel(kind, id, cwd, name) {
+export function safeLabel(kind, id, cwd, name, n = 6) {
   if (kind === "durable") {
-    const n = defuse(name ?? "", { oneLine: true, max: 40 }).replace(/'/g, "’");
-    if (n) return n;
+    const nm = defuse(name ?? "", { oneLine: true, max: 40 }).replace(/'/g, "’");
+    return nm || defuse(id, { oneLine: true, max: 80 });
   }
-  const slug = (v, max) => String(v ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, max).replace(/-+$/, "");
-  const short = slug(String(id ?? "").replace(/^cse_/, "").replace(/^dur-/, ""), 64).replace(/-/g, "").slice(0, 6);
+  const chars = idChars(id);
+  const tail = chars.slice(Math.max(0, chars.length - n));
   const dir = cwd ? slug(basename(String(cwd)), 20) : "";
-  const prefix = dir || { pi: "pi", "cc-local": "claude", rc: "rc", durable: "agent" }[kind] || "session";
-  return short ? `${prefix}-${short}` : prefix;
+  const prefix = dir || { pi: "pi", "cc-local": "claude", rc: "rc" }[kind] || "session";
+  return tail ? `${prefix}-${tail}` : prefix;
+}
+
+/**
+ * Labels unique within one inventory (case-insensitive): colliding rows get a longer id tail (10, 16, the whole
+ * id), and as a last resort "-2", "-3", … in list order. Mutates and returns `rows`.
+ */
+export function uniqueLabels(rows) {
+  const key = (l) => String(l).toLowerCase();
+  for (const n of [10, 16, 64]) {
+    const count = new Map();
+    for (const r of rows) count.set(key(r.label), (count.get(key(r.label)) ?? 0) + 1);
+    const clash = rows.filter((r) => count.get(key(r.label)) > 1);
+    if (!clash.length) return rows;
+    for (const r of clash) {
+      r.label = r.kind === "durable" ? `${safeLabel(r.kind, r.id, r.cwd, r.title)}-${idChars(r.id).slice(-Math.min(n, 64))}` : safeLabel(r.kind, r.id, r.cwd, r.title, n);
+    }
+  }
+  const seen = new Map();
+  for (const r of rows) {
+    const k = key(r.label);
+    const c = (seen.get(k) ?? 0) + 1;
+    seen.set(k, c);
+    if (c > 1) r.label = `${r.label}-${c}`;
+  }
+  return rows;
 }
 
 /** The tail of `body` that fits in `budget` bytes, with a `[… N bytes cut]` line in front when cut. */
@@ -138,9 +201,10 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     }
   }
 
-  async function durableRows() {
+  async function durableRows(all = false) {
     if (!durable?.listAgents) return [];
-    const agents = await durable.listAgents();
+    // `all`: every agent (archived or older than 7 days too), so a describe() still names it by its name.
+    const agents = await (all ? durable.listAgents({ all: true }) : durable.listAgents());
     return agents.map((a) => ({
       id: a.sid,
       kind: "durable",
@@ -159,7 +223,8 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     const rows = [];
     for (const s of sessions ?? []) {
       if (!s?.id) continue;
-      const driver = await safe(`${kind} driver ${s.id}`, () => p.driverOf?.(s.id) ?? "none", "none");
+      // A failed probe is "unknown" (no route), never "none" (which would mean pi RPC).
+      const driver = await safe(`${kind} driver ${s.id}`, async () => (await p.driverOf?.(s.id)) ?? "none", "unknown");
       const state = s.status ?? (await safe(`${kind} status ${s.id}`, () => p.getSessionStatus?.(s.id), null)) ?? "idle";
       const hist = await safe(`${kind} history ${s.id}`, () => p.getHistory?.(s.id, 2), []);
       const t = msOf(s.timestamp);
@@ -184,7 +249,15 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     const route = messageRoute(r.kind, r.driver);
     return { ...r, label: safeLabel(r.kind, r.id, r.cwd, r.title), state: normalizeState(r.state), ...route };
   };
-  const isActive = (r) => r.kind === "durable" || r.state !== "idle" || r.driver !== "none" || (r.lastActivity != null && now() - r.lastActivity <= ACTIVE_WINDOW_MS);
+  // Driven by a terminal or a bridge child counts as active; an RC row's driver is always "rc", so RC counts by its
+  // state and last activity like any other.
+  const isActive = (r) =>
+    r.kind === "durable" ||
+    r.state !== "idle" ||
+    ["bridge", "terminal", "terminal-tmux"].includes(r.driver) ||
+    (r.lastActivity != null && now() - r.lastActivity <= ACTIVE_WINDOW_MS);
+  /** The last inventory built with all=true (describe() reuses it for DESCRIBE_CACHE_MS). */
+  let cache = null;
 
   /**
    * THE session inventory: durable first, then pi, cc-local, rc; a failing provider is skipped (logged).
@@ -193,7 +266,7 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
   async function sessionsList({ all = false } = {}) {
     const ccList = (n) => (cc.recentSessions ?? cc.listSessions).call(cc, n);
     const [dur, piRaw, ccRaw, rcRaw] = await Promise.all([
-      durable ? safe("durable list", durableRows, []) : [],
+      durable ? safe("durable list", () => durableRows(all), []) : [],
       pi ? safe("pi list", async () => (await pi.listSessions(limit)) ?? [], []) : [],
       cc ? safe("cc list", async () => (await ccList(limit)) ?? [], []) : [],
       rc ? safe("rc list", async () => (await rc.listSessions(limit)) ?? [], []) : [],
@@ -206,6 +279,9 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       ...(cc ? await safe("cc rows", async () => fileRows(cc, "cc-local", await ccKept), []) : []),
       ...(rc ? await safe("rc rows", () => rcRows(rcCopy), []) : []),
     ].map(finish);
+    // Unique among every listed row (all of them), so the active view and describe() agree on each label.
+    uniqueLabels(out);
+    if (all) cache = { at: now(), rows: out };
     return all ? out : out.filter(isActive);
   }
 
@@ -224,7 +300,9 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     const kind = await kindOf(id);
     if (kind === "durable") return "bridge";
     if (kind === "rc") return "rc";
-    if (kind === "pi" || kind === "cc-local") return (await safe(`${kind} driver ${id}`, () => providerOf(kind).driverOf?.(id), null)) ?? "none";
+    if (kind === "pi" || kind === "cc-local") {
+      return (await safe(`${kind} driver ${id}`, async () => (await providerOf(kind).driverOf?.(id)) ?? "none", "unknown")) ?? "none";
+    }
     return "none";
   }
 
@@ -240,7 +318,11 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       const kind = await kindOf(id);
       if (!kind) return null;
       const driver = await driverOf(id);
-      const row = (await safe(`${kind} row ${id}`, () => sessionsList({ all: true }), [])).find((r) => r.id === id && r.kind === kind);
+      // The inventory of the last DESCRIBE_CACHE_MS (an action's propose and confirm read the same labels);
+      // rebuilt once when it is older or does not hold the id.
+      const find = (rows) => (rows ?? []).find((r) => r.id === id && r.kind === kind);
+      let row = cache && now() - cache.at <= DESCRIBE_CACHE_MS ? find(cache.rows) : null;
+      if (!row) row = find(await safe(`${kind} row ${id}`, () => sessionsList({ all: true }), []));
       const label = row?.label ?? safeLabel(kind, id, "", "");
       return { kind, driver, label, ...messageRoute(kind, driver) };
     },
@@ -253,13 +335,17 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       return normalizeState(st ?? "idle");
     },
 
-    /** The newest assistant text of one session (untrusted; the caller fences or defuses it), or "". */
-    async lastReply(id) {
+    /**
+     * The tail of one session's history as a fingerprint (`fp`: its last 6 items), the newest item's role and the
+     * newest assistant text (untrusted; the caller defuses it). Null for an unknown id or an unreadable history.
+     */
+    async replySnapshot(id) {
       const kind = await kindOf(id);
-      if (!kind) return "";
-      const hist = (await safe(`${kind} history ${id}`, () => providerOf(kind).getHistory?.(id, 4), [])) ?? [];
+      if (!kind) return null;
+      const hist = await safe(`${kind} history ${id}`, () => providerOf(kind).getHistory?.(id, 6), null);
+      if (!Array.isArray(hist)) return null;
       const a = hist.filter((h) => h?.role === "assistant" && h.text).at(-1);
-      return a ? String(a.text) : "";
+      return { fp: JSON.stringify(hist.map((h) => [h?.role ?? "", String(h?.text ?? "")])), lastRole: hist.at(-1)?.role ?? null, text: a ? String(a.text) : "" };
     },
 
     /**
@@ -270,9 +356,11 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     async execute(action) {
       const { id, kind, args, origin } = action;
       const requestId = "ovs-act:" + id;
-      // Defense in depth (actions.mjs refuses it at propose): proposal text never starts a command.
-      for (const t of [args?.task, args?.text]) {
-        if (typeof t === "string" && /^\s*[\/!]/.test(t)) throw Object.assign(new Error("the overseer cannot send commands"), { statusCode: 400 });
+      // Defense in depth (actions.mjs refuses it at propose): no command, no control character, one line.
+      if (typeof args?.task === "string" && startsWithCommand(args.task)) throw Object.assign(new Error(NO_COMMANDS), { statusCode: 400 });
+      if (typeof args?.text === "string") {
+        const bad = textProblem(args.text);
+        if (bad) throw Object.assign(new Error(bad), { statusCode: 400 });
       }
       if (kind === "session_start") {
         const opts = { engine: args.engine, name: args.label, model: args.model, origin: origin === "evenai" ? "evenai" : "overseer", requestId, ttlS: args.ttlS };
@@ -287,14 +375,25 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
         // The route is probed again here (a terminal may have come or gone since the yes).
         const route = messageRoute(k, await driverOf(args.id));
         if (!route.canMessage) throw refuse(cannotMessage(args.id, k, route.why));
-        if (k === "durable") await durable.prompt(args.id, args.text, undefined, { requestId, whenBusy: args.steer ? "steer" : "followUp" });
-        else if (k === "rc") await rc.prompt(args.id, args.text);
-        else if (k === "pi") await pi.prompt(args.id, args.text); // tmux pane of its terminal, else pi RPC
-        else {
-          // cc-local: only into the tmux pane of the terminal claude that runs it; any other outcome is not "sent".
-          const r = await cc.prompt(args.id, args.text);
-          if (!r || r.passThrough || r.blocked) throw Object.assign(new Error(`${args.id}: the message was not delivered (no terminal took it)`), { statusCode: 409 });
+        if (k !== "durable" && String(args.text).length > SESSION_TEXT_MAX) {
+          throw Object.assign(new Error(`'text' must be a string of 1-${SESSION_TEXT_MAX} characters`), { statusCode: 400 });
         }
+        const notDelivered = () => Object.assign(new Error(`${args.id}: the message was not delivered (no terminal took it)`), { statusCode: 409 });
+        let r;
+        if (k === "durable") r = await durable.prompt(args.id, args.text, undefined, { requestId, whenBusy: args.steer ? "steer" : "followUp" });
+        else if (k === "rc") r = await rc.prompt(args.id, args.text);
+        else if (route.via === "tmux") {
+          // pi and Claude Code in tmux: one literal line into the pane bound to that terminal's pid, checked again
+          // right before typing; never a resume, a spawn or the official router.
+          const p = providerOf(k);
+          if (typeof p.deliverToTerminal !== "function") throw notDelivered();
+          r = await p.deliverToTerminal(args.id, args.text);
+        } else {
+          // pi RPC: refused (blocked) if a terminal took the session over since the probe.
+          r = await pi.prompt(args.id, args.text, undefined, { noTerminal: true });
+        }
+        // Only a delivery is "sent": a blocked or passed-through prompt is a failed action (409), never a result.
+        if (k !== "durable" && (r?.blocked || r?.passThrough)) throw notDelivered();
         return { sessionId: args.id };
       }
       if (k !== "durable") throw refuse(kind === "session_stop" ? "only bridge agents can be stopped" : "only bridge agents can be interrupted");

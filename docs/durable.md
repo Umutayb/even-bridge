@@ -276,14 +276,15 @@ A row (`/api/overseer/sessions`):
 | field | meaning |
 |---|---|
 | `id`, `kind` | `durable` \| `pi` \| `cc-local` \| `rc` (+ `engine` for durable) |
-| `label` | a bridge agent's name; otherwise `<folder>-<first 6 of the id>` in `[a-z0-9-]`. A session's own title is never used: it is text the session wrote. |
-| `state` | `idle` \| `busy` \| `waiting` (a permission or question prompt); unknown provider words count as busy |
+| `label` | a bridge agent's name (its sid when it has none); otherwise `<folder>-<last 6 of the id>` in `[a-z0-9-]` (the TAIL: pi ids are UUIDv7 and RC ids ULID-like, whose heads are timestamps shared for hours). Unique within the inventory: colliding labels get a longer tail, then `-2`, `-3`. A session's own title is never used: it is text the session wrote. |
+| `state` | `idle` \| `busy` \| `waiting` (a permission or question prompt, `requires_action`); no state, or a finished / failed turn, is idle; other words count as busy |
 | `driver` | `bridge`, `terminal-tmux`, `terminal`, `rc`, `none` |
 | `lastActivity`, `ageS` | epoch ms of the last write / seen, and its age |
 | `canMessage`, `via` / `why` | see below |
 
 Active = every non-archived durable agent (seen in 7 days), plus any other session that is
-driven, not idle, or touched within 12 h (`ACTIVE_WINDOW_MS`); `all=1` drops that filter.
+driven by a terminal or a bridge child, not idle, or touched within 12 h (`ACTIVE_WINDOW_MS`); an RC
+row counts by its state and age; `all=1` drops that filter.
 Each provider lists at most 10 rows.
 
 Who can receive a message (`messageRoute`), and through which transport:
@@ -294,13 +295,36 @@ Who can receive a message (`messageRoute`), and through which transport:
 | rc | rc | the Remote Control engine (`/api/prompt` upstream) |
 | pi | `none` / `bridge` | pi RPC: the bridge's `pi --mode rpc` child, resumed with `--session` if needed (`pi-rpc`) |
 | pi, cc-local | `terminal-tmux` | typed into the terminal's tmux pane (`tmux`); the terminal stays the only writer |
+| pi, cc-local | `unknown` (the driver probe failed) | no (`driver-unknown`): never an RPC child next to a terminal that may own it |
 | pi, cc-local | `terminal` | no (`terminal-no-tmux`) |
 | cc-local | `none` | no (`no-terminal`): nothing runs it, and the bridge does not spawn a claude for a message |
 | cc-local | `bridge` | no (`phone-claude`): the phone's Claude bridge runs it |
 
-This supersedes the plan's Q7/Q8 rulings (terminal pi and cc-local observe-only) at the
-user's request (Task 6b): a terminal in tmux receives a confirmed message; a terminal outside
-tmux never does, and no session is ever driven twice.
+This supersedes the plan's Q7/Q8 rulings (terminal pi and cc-local observe-only), as the Task 6b
+brief asks: a terminal in tmux receives a confirmed message; a terminal outside tmux never does,
+and no session is ever driven twice.
+
+Typing into a terminal is code execution if done carelessly, so the tmux route is narrow:
+
+- The text is ONE plain line: any control character (newline, CR, ESC, C-…, DEL, C1, U+2028/2029)
+  is refused, and so is a `/` or `!` after any leading whitespace or zero-width/format characters
+  (`\p{Cf}`). Both at propose and again at execute, for every origin and for standing orders. A pi /
+  Claude Code / RC target takes at most 140 characters from every origin, so the summary the user
+  confirms shows all of it.
+- It is typed literally: `tmux send-keys -t <pane> -l -- <text>`, then `send-keys -t <pane> Enter`
+  as a separate key ("C-d", "Escape" or a leading "-" are characters, never key names or options);
+  never through a paste buffer.
+- The pane is bound to the terminal's own process: pi's external pid (with two pi terminals in one
+  folder, the pane whose screen shows this conversation, else none), Claude Code's owner pid. Right
+  before typing (after the per-pane gap) the pane must still run `pi` / `claude` with `pane_pid` an
+  ancestor of that pid; a shell in the foreground (the program exited) is never typed into.
+- Claude Code goes only through `cc.deliverToTerminal`: never the official router and never the
+  Remote Control resume (`EVEN_BRIDGE_CC_RESUME_RC`), with no watcher change. pi RPC goes through
+  `pi.prompt(…, {noTerminal: true})`. A terminal that went away, or took the session over, is
+  `{blocked: true}` → the action fails with 409 and no reply watch starts; only a delivery is "sent".
+- A message to an existing pi session over RPC runs the user's pi (its normal tools, no sandbox) in
+  that session's own folder, which can be anywhere, as on the phone: the "agents work only below
+  ~/sandbox/agents" constraint covers new agents, not messages to existing pi sessions.
 
 `session_message` goes through the same gate as every action: the overseer proposes it (or
 Even AI stages `message_session` and proposes it through `POST /api/overseer/actions` at the
@@ -313,16 +337,21 @@ before the send. A Claude Code pane that did not take the text (the terminal wen
 failed action (409), never "sent". A standing order may cover messages to any of these kinds.
 
 Replies reach the glasses through the outbox. After a confirmed message the target is polled
-every 5 s for up to 30 min (in the bridge process; a restart ends the watch) and its next status
-change becomes ONE outbox item of kind `reply`, tagged with the action id:
+every 5 s for up to 30 min (in the bridge process; a restart ends the watch; three failed reads in
+a row end it too) and its next status change becomes ONE outbox item of kind `reply`, tagged with
+the action id:
 
-- `<Kind> '<label>' replied: <its newest answer, one line, defused, at most 200 characters>`
-  when it is idle again with a new answer (looked for after a busy phase, or after 15 s idle);
+- `<Kind> '<label>' replied.` with the answer in a separate `quote` field (the session's own words:
+  defused, one line, at most 200 characters) when it is idle, its history tail changed since the
+  send (compared by items, so an identical "Done." still counts), the newest item is an answer, and
+  nothing changed for 15 s (a terminal pi reports idle throughout; its first "Let me look…" is not
+  the reply);
 - `<Kind> '<label>' is waiting for an answer.` when it stops at a permission or question prompt;
 - `<Kind> '<label>' finished its turn without a new answer.` after a busy phase without one.
 
-Even AI's "what's new" says `reply` items as host lines. The answer is the session's own text:
-it reaches only the outbox (never the overseer's context, never an action).
+Even AI's "what's new" says the host text, then the quote as the session's words ("It says: …"),
+filtered like overseer notes. The quote reaches only the outbox (never the overseer's context,
+never an action).
 
 ## Restart and resume
 

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIVE_WINDOW_MS, createOverseerHost, messageRoute, normalizeState, publicRow, rowLine, safeLabel } from "../src/overseer/host.mjs";
+import { ACTIVE_WINDOW_MS, createOverseerHost, messageRoute, normalizeState, publicRow, rowLine, safeLabel, textProblem, uniqueLabels } from "../src/overseer/host.mjs";
 import { createPiProvider } from "../src/providers/pi/provider.mjs";
 import { findExternalPi } from "../src/providers/pi/detect.mjs";
 import { encodeCwdDir } from "../src/providers/pi/session-files.mjs";
@@ -160,7 +160,7 @@ test("session_read of an unknown id says so", async () => {
 
 // ── Task 6b: one inventory of both harnesses, with a safe label, a state and whether a message can be sent ──
 
-/** One fake per kind (pi rows across two drivers, cc-local in and outside tmux, an RC session and its twin). */
+/** One fake per kind (pi rows across drivers, cc-local in and outside tmux, an RC session and its twin). */
 function everyKind({ piStatus = "idle" } = {}) {
   const ago = (ms) => new Date(NOW - ms).toISOString();
   const durable = stubDurable([
@@ -181,6 +181,7 @@ function everyKind({ piStatus = "idle" } = {}) {
     getSessionStatus: async (id) => (id === "aaaa1111-pi" ? piStatus : "idle"),
     getHistory: () => [],
     prompt: async () => ({}),
+    deliverToTerminal: async () => ({}),
   };
   const ccRows = [
     { id: "c1c1c1c1", title: "cc in tmux", cwd: "/home/u/proj", timestamp: ago(1000), status: null },
@@ -194,6 +195,7 @@ function everyKind({ piStatus = "idle" } = {}) {
     driverOf: async (id) => ccDrivers[id] ?? "none",
     getSessionStatus: async (id) => (id === "c1c1c1c1" ? "awaiting_permission" : "idle"),
     getHistory: () => [],
+    deliverToTerminal: async () => ({}),
   };
   const rc = {
     listSessions: async () => [{ id: "cse_01ABCDEF", title: "", cwd: "", timestamp: ago(1000), status: "busy" }],
@@ -212,22 +214,50 @@ test("the inventory lists every active session of both harnesses with label, sta
     [
       ["dur-1", "durable", "docs", "busy", true, "durable"],
       ["dur-2", "durable", "old", "idle", true, "durable"], // listAgents decides which agents exist
-      ["aaaa1111-pi", "pi", "even-bridge-aaaa11", "idle", true, "pi-rpc"],
-      ["bbbb2222-pi", "pi", "notes-bbbb22", "idle", true, "tmux"], // driven: active although old
-      ["dddd4444-pi", "pi", "x-dddd44", "idle", false, "terminal-no-tmux"],
+      ["aaaa1111-pi", "pi", "even-bridge-1111pi", "idle", true, "pi-rpc"], // driven by a bridge child: active
+      ["bbbb2222-pi", "pi", "notes-2222pi", "idle", true, "tmux"], // driven: active although old
+      ["dddd4444-pi", "pi", "x-4444pi", "idle", false, "terminal-no-tmux"],
       ["c1c1c1c1", "cc-local", "proj-c1c1c1", "waiting", true, "tmux"],
       ["c2c2c2c2", "cc-local", "proj-c2c2c2", "idle", false, "no-terminal"],
-      ["cse_01ABCDEF", "rc", "remote-01abcd", "busy", true, "rc"],
+      ["cse_01ABCDEF", "rc", "remote-abcdef", "busy", true, "rc"],
     ],
   );
-  // cccc3333 (idle, undriven, 2 days) is not active; the RC twin c3c3c3c3 is dropped and lends its folder.
   const all = await host.sessionsList({ all: true });
   assert.ok(all.some((r) => r.id === "cccc3333-pi"));
   assert.ok(!all.some((r) => r.id === "c3c3c3c3"), "the RC session's local transcript is not listed twice");
   assert.equal(all.find((r) => r.id === "cse_01ABCDEF").cwd, "/home/u/remote");
-  // The untrusted title never becomes the label; lastActivity is epoch ms.
   assert.ok(!rows.some((r) => /IGNORE/i.test(r.label)));
   assert.equal(rows.find((r) => r.id === "aaaa1111-pi").lastActivity, NOW - 60_000);
+});
+
+test("labels are unique: three UUIDv7 pi sessions 2 h apart in one folder (I1)", async () => {
+  // UUIDv7: the first 48 bits are the ms timestamp, so ids hours apart share their first 6 hex characters.
+  const v7 = (ms, rand) => {
+    const h = ms.toString(16).padStart(12, "0");
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-7${rand.slice(0, 3)}-8${rand.slice(3, 6)}-${rand.slice(6, 18)}`;
+  };
+  const t = Math.floor(1_793_700_000_000 / 2 ** 24) * 2 ** 24 + 1000; // the start of one 4.66 h block of the 48-bit time
+  const ids = [v7(t, "a1b2c3d4e5f6a7b8c9d0"), v7(t + 7_200_000, "0f1e2d3c4b5aa7b8c9d0"), v7(t + 14_400_000, "9988776655447766c9d0")]; // 2 h apart
+  assert.equal(new Set(ids.map((i) => i.slice(0, 6))).size, 1, "the UUIDv7 heads collide");
+  const rows = ids.map((id) => ({ id, title: "t", cwd: "/home/u/notes", timestamp: new Date(NOW - 1000).toISOString() }));
+  const pi = { listSessions: async () => rows, probe: (id) => ids.includes(id), driverOf: async () => "none", getSessionStatus: async () => "idle", getHistory: () => [] };
+  const host = createOverseerHost({ pi, log: quiet, now: () => NOW });
+  const labels = (await host.sessionsList()).map((r) => r.label);
+  assert.equal(new Set(labels).size, 3, labels.join(", "));
+  for (const l of labels) assert.match(l, /^notes-[0-9a-f]{6,}$/);
+  // describe names each by the same label the list said
+  for (const [i, id] of ids.entries()) assert.equal((await host.describe(id)).label, labels[i]);
+  // same tails too: longer tails, then a counter
+  const same = uniqueLabels([
+    { id: "x-aaaaaaaaaaaaaaaaaa-1234567", kind: "pi", cwd: "/n", label: "n-234567" },
+    { id: "y-bbbbbbbbbbbbbbbbbb-1234567", kind: "pi", cwd: "/n", label: "n-234567" },
+  ]).map((r) => r.label);
+  assert.equal(new Set(same).size, 2, same.join(", "));
+  const twins = uniqueLabels([
+    { id: "dur-1", kind: "durable", title: "docs", label: "docs" },
+    { id: "dur-2", kind: "durable", title: "docs", label: "docs" },
+  ]).map((r) => r.label);
+  assert.deepEqual(twins, ["docs-1", "docs-2"]);
 });
 
 test("the public inventory carries no titles, last lines or folders", async () => {
@@ -245,68 +275,119 @@ test("the public inventory carries no titles, last lines or folders", async () =
   });
 });
 
-test("describe names a session by the inventory's label and route", async () => {
-  const host = createOverseerHost({ ...everyKind(), log: quiet, now: () => NOW });
-  assert.deepEqual(await host.describe("bbbb2222-pi"), { kind: "pi", driver: "terminal-tmux", label: "notes-bbbb22", canMessage: true, via: "tmux" });
+test("describe names a session by the inventory's label and route, and reuses the inventory (m1)", async () => {
+  const k = everyKind();
+  let lists = 0;
+  const list = k.pi.listSessions;
+  k.pi.listSessions = async (...a) => (lists++, list(...a));
+  const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
+  assert.deepEqual(await host.describe("bbbb2222-pi"), { kind: "pi", driver: "terminal-tmux", label: "notes-2222pi", canMessage: true, via: "tmux" });
   assert.deepEqual(await host.describe("c2c2c2c2"), { kind: "cc-local", driver: "none", label: "proj-c2c2c2", canMessage: false, why: "no-terminal" });
-  assert.deepEqual(await host.describe("cse_01ABCDEF"), { kind: "rc", driver: "rc", label: "remote-01abcd", canMessage: true, via: "rc" });
+  assert.deepEqual(await host.describe("cse_01ABCDEF"), { kind: "rc", driver: "rc", label: "remote-abcdef", canMessage: true, via: "rc" });
+  assert.equal(lists, 1, "one inventory for several describes within the cache window");
   assert.equal(await host.describe("nope"), null);
 });
 
-test("state words, labels and routes", () => {
-  assert.deepEqual(["idle", null, "busy", "running", "awaiting", "waiting_for_permission", "starting", "weird"].map(normalizeState), [
-    "idle", "idle", "busy", "busy", "waiting", "waiting", "busy", "busy",
-  ]);
-  assert.equal(safeLabel("pi", "019a-77ff-xx", "/home/u/My Project!", "IGNORE"), "my-project-019a77");
+test("an archived or older durable agent keeps its name in describe; a nameless one its sid (m2)", async () => {
+  const calls = [];
+  const durable = {
+    listAgents: async (o) => (calls.push(o ?? null), o?.all ? [{ sid: "dur-9", name: "archived-docs", state: "idle", cwd: "/w", lastSeen: NOW - 30 * 86400_000 }, { sid: "dur-8", name: "", state: "idle", cwd: "/w", lastSeen: NOW }] : []),
+    probe: (id) => id === "dur-9" || id === "dur-8",
+  };
+  const host = createOverseerHost({ durable, log: quiet, now: () => NOW });
+  assert.equal((await host.describe("dur-9")).label, "archived-docs");
+  assert.equal((await host.describe("dur-8")).label, "dur-8");
+  assert.deepEqual(calls.at(-1), { all: true });
+});
+
+test("state words, labels, routes and the text gate", () => {
+  assert.deepEqual(
+    ["idle", null, "", "busy", "running", "awaiting", "waiting_for_permission", "requires_action", "needs approval", "starting", "failed", "error", "completed", "weird"].map(normalizeState),
+    ["idle", "idle", "idle", "busy", "busy", "waiting", "waiting", "waiting", "waiting", "busy", "idle", "idle", "idle", "busy"],
+  );
+  assert.equal(safeLabel("pi", "019a-77ff-12ab34", "/home/u/My Project!", "IGNORE"), "my-project-12ab34");
   assert.equal(safeLabel("rc", "cse_ZZ9", "", ""), "rc-zz9");
   assert.equal(safeLabel("durable", "dur-1", "/w", "it's <<x>>"), "it’s ‹‹x››");
   assert.deepEqual(messageRoute("cc-local", "bridge"), { canMessage: false, why: "phone-claude" });
   assert.deepEqual(messageRoute("pi", "none"), { canMessage: true, via: "pi-rpc" });
+  assert.deepEqual(messageRoute("pi", "unknown"), { canMessage: false, why: "driver-unknown" }, "a failed probe never means pi RPC (m10)");
   assert.ok(ACTIVE_WINDOW_MS >= 3600_000);
   assert.match(rowLine({ id: "p", kind: "pi", state: "idle", driver: "terminal", label: "x-p", canMessage: false, why: "terminal-no-tmux" }), /\| label x-p \| messages no \(it runs in a terminal outside tmux/);
+  // C1: one line, no control characters, no command after invisible leading characters
+  for (const t of ["hi\n!id", "hi\r/exit", "\u0003", "a\u001b[A", "x\u007f", "x\u0085y", "a b"]) assert.equal(textProblem(t), "a message must be one line without control characters", JSON.stringify(t));
+  for (const t of ["/exit", "  !id", "​/compact", "﻿!ls", "  /mode"]) assert.equal(textProblem(t), "the overseer cannot send commands", JSON.stringify(t));
+  for (const t of ["C-d", "Escape", "-t foo", "run the tests", "a/b and !x later"]) assert.equal(textProblem(t), null, t);
 });
 
-test("execute delivers a message through each kind's transport", async () => {
+test("a failed driver probe gives no route, and an old RC row is not active (m4, m10)", async () => {
+  const pi = {
+    listSessions: async () => [{ id: "p1", title: "", cwd: "/n", timestamp: new Date(NOW - 1000).toISOString() }],
+    probe: (id) => id === "p1",
+    driverOf: async () => {
+      throw new Error("proc unreadable");
+    },
+    getSessionStatus: async () => "idle",
+    getHistory: () => [],
+  };
+  const rc = { listSessions: async () => [{ id: "cse_OLD", title: "", cwd: "", timestamp: new Date(NOW - 3 * 86400_000).toISOString(), status: "idle" }], probe: async () => false };
+  const host = createOverseerHost({ pi, rc, log: quiet, now: () => NOW });
+  const rows = await host.sessionsList();
+  assert.deepEqual(rows.map((r) => [r.id, r.driver, r.canMessage, r.why]), [["p1", "unknown", false, "driver-unknown"]]);
+  assert.equal((await host.describe("p1")).why, "driver-unknown");
+});
+
+test("execute delivers a message through each kind's transport, typing only into a verified pane", async () => {
   const calls = [];
   const k = everyKind();
   k.durable.prompt = async (id, text, cwd, o) => calls.push(["durable", id, text, o.whenBusy]);
-  k.pi.prompt = async (id, text) => calls.push(["pi", id, text]);
+  k.pi.prompt = async (id, text, cwd, o) => (calls.push(["pi-rpc", id, text, o]), { sessionId: id });
+  k.pi.deliverToTerminal = async (id, text) => (calls.push(["pi-tmux", id, text]), { sessionId: id });
   k.rc.prompt = async (id, text) => calls.push(["rc", id, text]);
   let ccResult = { sessionId: "c1c1c1c1", provider: "claude" };
-  k.cc.prompt = async (id, text) => (calls.push(["cc", id, text]), ccResult);
+  k.cc.deliverToTerminal = async (id, text) => (calls.push(["cc-tmux", id, text]), ccResult);
+  k.cc.prompt = async () => {
+    throw new Error("cc.prompt (official router / RC resume) must never be used for an overseer message");
+  };
   const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
   const msg = (id, text, steer = false) => host.execute({ id: "act-1", kind: "session_message", args: { id, text, steer }, origin: "overseer" });
   assert.deepEqual(await msg("dur-1", "hello", true), { sessionId: "dur-1" });
   assert.deepEqual(await msg("aaaa1111-pi", "to rpc"), { sessionId: "aaaa1111-pi" });
-  assert.deepEqual(await msg("bbbb2222-pi", "to tmux"), { sessionId: "bbbb2222-pi" });
-  assert.deepEqual(await msg("c1c1c1c1", "to claude"), { sessionId: "c1c1c1c1" });
+  assert.deepEqual(await msg("bbbb2222-pi", "C-d"), { sessionId: "bbbb2222-pi" });
+  assert.deepEqual(await msg("c1c1c1c1", "-t to claude"), { sessionId: "c1c1c1c1" });
   assert.deepEqual(await msg("cse_01ABCDEF", "to rc"), { sessionId: "cse_01ABCDEF" });
   assert.deepEqual(calls, [
     ["durable", "dur-1", "hello", "steer"],
-    ["pi", "aaaa1111-pi", "to rpc"],
-    ["pi", "bbbb2222-pi", "to tmux"],
-    ["cc", "c1c1c1c1", "to claude"],
+    ["pi-rpc", "aaaa1111-pi", "to rpc", { noTerminal: true }],
+    ["pi-tmux", "bbbb2222-pi", "C-d"],
+    ["cc-tmux", "c1c1c1c1", "-t to claude"],
     ["rc", "cse_01ABCDEF", "to rc"],
   ]);
-  // No transport: refused before any call; a pane that did not take it is not "sent".
   calls.length = 0;
+  // No transport, or a text that is not one plain line: refused before any call.
   await assert.rejects(msg("dddd4444-pi", "x"), (e) => e.statusCode === 403 && /driven from a terminal outside tmux/.test(e.message));
   await assert.rejects(msg("c2c2c2c2", "x"), (e) => e.statusCode === 403 && /can't receive messages: no terminal runs it/.test(e.message));
+  for (const t of ["hi\n!id", "hi\r/exit", "\u0003", "​/compact", "/compact"]) {
+    await assert.rejects(msg("bbbb2222-pi", t), (e) => e.statusCode === 400, JSON.stringify(t));
+  }
+  await assert.rejects(msg("bbbb2222-pi", "y".repeat(141)), (e) => e.statusCode === 400);
   assert.deepEqual(calls, []);
+  // A terminal that went away (I4) or a pi blocked at the last moment (I3): 409, never a result.
   ccResult = { sessionId: "c1c1c1c1", provider: "claude", blocked: true };
   await assert.rejects(msg("c1c1c1c1", "x"), (e) => e.statusCode === 409 && /not delivered/.test(e.message));
-  ccResult = { passThrough: true };
-  await assert.rejects(msg("c1c1c1c1", "x"), (e) => e.statusCode === 409);
-  await assert.rejects(msg("c1c1c1c1", "/compact"), (e) => e.statusCode === 400);
+  k.pi.deliverToTerminal = async (id) => ({ sessionId: id, blocked: true });
+  await assert.rejects(msg("bbbb2222-pi", "x"), (e) => e.statusCode === 409);
+  k.pi.prompt = async (id) => ({ sessionId: id, provider: "claude", blocked: true });
+  await assert.rejects(msg("aaaa1111-pi", "x"), (e) => e.statusCode === 409);
 });
 
-test("stateOf and lastReply read the session through its provider", async () => {
+test("stateOf and replySnapshot read the session through its provider", async () => {
   const k = everyKind({ piStatus: "busy" });
   k.pi.getHistory = (id) => (id === "aaaa1111-pi" ? [{ role: "user", text: "q" }, { role: "assistant", text: "the answer" }] : []);
   const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
   assert.equal(await host.stateOf("aaaa1111-pi"), "busy");
   assert.equal(await host.stateOf("c1c1c1c1"), "waiting");
   assert.equal(await host.stateOf("nope"), null);
-  assert.equal(await host.lastReply("aaaa1111-pi"), "the answer");
-  assert.equal(await host.lastReply("cse_01ABCDEF"), "");
+  const snap = await host.replySnapshot("aaaa1111-pi");
+  assert.deepEqual([snap.lastRole, snap.text], ["assistant", "the answer"]);
+  assert.equal(await host.replySnapshot("nope"), null);
 });

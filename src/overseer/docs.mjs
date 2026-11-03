@@ -18,7 +18,7 @@ export const NOTIFY_MAX_CHARS = 500;
 export const NOTIFY_PER_RUN = 3;
 /** Settled asks remembered after they left `pending` (a retried requestId never lands in the outbox twice). */
 export const ASKS_DONE_KEEP = 200;
-// reply: host text about a messaged session's next status change (its own answer quoted, defused, ≤ 200 chars).
+// reply: host text about a messaged session's next status change; its answer, if any, in `quote` (defused, ≤ 200 chars).
 export const OUTBOX_KINDS = Object.freeze(["answer", "notify", "action", "checkin", "system", "reply"]);
 export { ROOT_CONVERSATION_ID };
 
@@ -71,9 +71,11 @@ export const OverseerHandoffs = defineDoc({ kind: "even.overseer.handoffs", vers
  * Append one item to an outbox draft (inside a commit): the next seq, the newest OUTBOX_KEEP kept.
  * @returns {object} the item
  */
-export function pushOutbox(box, { kind, text, requestId, tag, at = Date.now() }) {
+export function pushOutbox(box, { kind, text, requestId, tag, quote, at = Date.now() }) {
   box.seq = (box.seq ?? 0) + 1;
   const item = { seq: box.seq, at, kind, text: String(text ?? "") };
+  // A reply's quote: the session's own words (untrusted), kept apart from the host text.
+  if (quote != null) item.quote = String(quote);
   if (requestId != null) item.requestId = String(requestId);
   if (tag != null) item.tag = String(tag);
   box.items ??= [];

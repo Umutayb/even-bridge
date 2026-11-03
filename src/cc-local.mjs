@@ -38,6 +38,7 @@ import {
   capturePane,
   findClaudeTmuxPane,
   findExternalClaude,
+  paneRunsPid,
   screenShowsFragments,
   tmuxDeliver,
 } from "./providers/pi/detect.mjs";
@@ -286,6 +287,43 @@ export function createCcLocalProvider(
       watch.stop(sessionId);
       seededOffsets.delete(sessionId);
       return { passThrough: true };
+    },
+
+    /**
+     * The overseer's route (tmux only): type ONE literal line into the pane of the terminal claude that runs
+     * THIS conversation, then Enter. The pane is bound to that claude's pid (its own record, else the one pane
+     * whose screen shows this conversation), and right before typing it must still run claude with that pid.
+     * Never the official router, never a resume (EVEN_BRIDGE_CC_RESUME_RC), never a watcher change: when the
+     * terminal is gone it returns `{ blocked: true }` with no side effects.
+     */
+    async deliverToTerminal(sessionId, text) {
+      const file = fileOf(sessionId);
+      if (!file) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+      const blocked = { sessionId, provider: "claude", blocked: true };
+      const meta = ccMeta(file);
+      const external = await driversOf(sessionId, meta.cwd);
+      const owner = external.find((p) => p.sessionId === sessionId);
+      let target = null;
+      if (owner) {
+        const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner.pid }).catch(() => null);
+        if (pane) target = { pane, pid: owner.pid };
+      } else {
+        const frags = recentCcPromptFragments(file);
+        const shows = [];
+        for (const p of external) {
+          const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: p.pid }).catch(() => null);
+          if (!pane) continue;
+          const screen = await capturePane(pane, { tmuxBin }).catch(() => null);
+          if (screenShowsFragments(screen, frags)) shows.push({ pane, pid: p.pid });
+        }
+        if (shows.length === 1) target = shows[0];
+      }
+      if (!target) return blocked;
+      if (!(await paneRunsPid(target.pane, target.pid, { commands: ["claude"], tmuxBin, procRoot }))) return blocked;
+      await tmuxDeliver(target.pane, text, { tmuxBin, singleLine: true });
+      claim(sessionId, CC_LOCAL_NAME);
+      log?.(`[bridge] cc-local overseer message -> tmux pane ${target.pane} (claude ${target.pid}, cwd ${meta.cwd})`);
+      return { sessionId, provider: "claude" };
     },
 
     /**
