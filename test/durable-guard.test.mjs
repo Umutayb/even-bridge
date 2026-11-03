@@ -676,3 +676,49 @@ test("scopes: each bash call gets --unit=even-durable-<sid>-<n>; stopScopes stop
   assert.deepEqual(calls[0], ["systemctl", "--user", "stop", "even-durable-*.scope"]);
   assert.equal(stopScopes({ run: () => ({ status: 0 }) }), true);
 });
+
+// ───────────────────────────── last round: the token drop-in through ordinary commands
+
+test("the drop-in cannot be reached through systemctl, journalctl, globs, cd, recursive reads or interpreters", () => {
+  const s = sandbox();
+  const probes = [
+    "systemctl cat even-bridge",
+    "systemctl show even-bridge -p Environment",
+    "systemctl list-unit-files",
+    "systemctl --no-pager cat even-bridge.service",
+    "journalctl -u even-bridge",
+    "journalctl --user -n 50",
+    "cat /etc/sys*/system/even-bridge.service.d/*.conf",
+    "cat /etc/systemd/**",
+    "cat /etc/[s]ystemd/system/even-bridge.service.d/pi-lets-code.conf",
+    "cat /e?c/sy{s,x}temd/system/x.conf",
+    "ls /etc/syst?md",
+    "cd /etc; grep -r TOKEN systemd",
+    "cd /etc && cat systemd/system/x.conf",
+    "cd /etc; cat sys*/system/*",
+    'find /etc -name "*.conf" -exec cat {} +',
+    "find /etc -print0 | xargs -0 grep TOKEN",
+    "grep -r TOKEN /etc",
+    "grep -R LETS_CODE /etc/",
+    "rg TOKEN /etc",
+    "tar c /etc | tar t",
+    `python3 -c "open('/etc/systemd/x')"`,
+    `python3 -c "print(open('/etc/even-terminal.env').read())"`,
+    `node -e "require('fs').readFileSync('/etc/systemd/system/even-bridge.service.d/pi-lets-code.conf')"`,
+    "cat /etc/../etc/systemd/x",
+    "cd /home && ls",
+  ];
+  for (const cmd of probes) assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+  for (const cmd of ["grep -r TODO src", 'find . -name "*.mjs"', "grep -rn foo .", "cat /etc/hostname", "ls /etc", "grep -r foo /usr/include", "cd /usr/lib && ls", "systemctl status even-bridge --no-pager | head -1"]) {
+    assert.equal(blocked(cmd, s), undefined, `should allow: ${cmd}`);
+  }
+  s.done();
+});
+
+test("the text scan also covers the denied home dirs as globs", () => {
+  const s = sandbox();
+  for (const cmd of ["cat ~/.ss*/id_ed25519", "ls ~/.[s]sh", `python3 -c "open('${s.home}/.ssh/id_ed25519')"`, "grep -r key ~"]) {
+    assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+  }
+  s.done();
+});

@@ -61,7 +61,7 @@ All of them are read at startup only.
   inside or containing the bridge checkout, `~/.local`, `~/.nvm`,
   `~/.even-terminal`, `~/.pi` or a `PATH` dir is refused.
 - Every bash command runs under `systemd-run --user --scope -q
-  --unit=even-durable-<sid>-<n> -p MemoryMax=600M -p CPUQuota=200%` (or `bwrap`
+  --unit=even-durable-<sid>-<startMs>-<n> -p MemoryMax=600M -p CPUQuota=200%` (or `bwrap`
   with `BWRAP=1`). Under the system unit there is no login session, so the
   provider defaults `XDG_RUNTIME_DIR=/run/user/<uid>` (and the user bus) when
   that dir exists and probes `systemd-run --user --scope -q true` once at
@@ -90,7 +90,14 @@ Every conversation runs `CodingTools` behind the `even-guard` extension. Its
   paths, `$HOME/…`, symlinks out of the cwd).
 - **Secrets.** `/etc/systemd` (unit drop-ins hold `Environment=` tokens),
   `/etc/even-terminal.env` and `/run/user` are refused for reading and
-  writing, and `/proc/self/environ`/`cmdline` are no longer readable.
+  writing, and `/proc/self/environ`/`cmdline` are no longer readable. Every
+  absolute (or `~`/`$HOME`) path anywhere in the command text, also inside
+  quoted interpreter code and with globs (`/etc/sys*/…`, `/etc/systemd/**`,
+  `/etc/[s]ystemd`), is matched against the denied dirs; a recursive read of
+  an ancestor of one (`grep -r … /etc`, `find /etc …`, `rg`, `tar`, …) is
+  refused, and so is a `cd` into such an ancestor (`cd /etc`), so relative
+  paths after it cannot reach them. `systemctl cat/show/list-unit-files/edit`
+  and `journalctl` are refused.
 - **Host control.** `systemctl` start/stop/…, `systemctl --user`,
   `systemd-run`, `loginctl`, `crontab`, `pkill`/`killall`, `tmux`, `screen`,
   `busctl`, `dbus-send`, `gdbus`, and `ps` with process environments (`ps e`,
@@ -99,12 +106,25 @@ Every conversation runs `CodingTools` behind the `even-guard` extension. Its
   and the bridge logs `[durable:guard] blocked <tool> (<command>): <why>`.
 
 **Residual exposure (same uid).** Agent bash runs as the bridge's user, so
-anything that user can read, a determined agent can read: the bridge's own
-`/proc/<pid>/environ` (it holds `LETS_CODE_TOKEN`) through an interpreter
-(`python3 -c 'open("/proc/…/environ")'`) or a path the lexer cannot resolve,
-`ps eww` spelled in a way the pattern misses, and so on. The guard refuses the
-obvious spellings; only `bwrap --unshare-pid` (not installed) or running agents
-as a separate uid closes this. Read-only agents still get through with
+anything that user can read, a determined agent can read. The routes that stay
+open are:
+
+- the bridge's own `/proc/<pid>/environ` (it holds `LETS_CODE_TOKEN`): the
+  text scan only sees literal paths, so a path built at run time inside an
+  interpreter (`python3 -c` with string concatenation, `os.listdir("/proc")`)
+  or a script the agent wrote first and runs later still reaches it;
+- any program that reads files for the agent on its own: a build script, a
+  test runner, an npm lifecycle script, a git hook, a tool with a config file
+  — the guard judges the command line, not what the program then opens;
+- every file the bridge user can read that the denied list does not name.
+
+Only `bwrap --unshare-pid` (not installed) or running agents as a separate
+uid closes this. Because of it, the token drop-in **must** be made
+unreadable to the bridge user at deployment: `sudo chmod 0600
+/etc/systemd/system/even-bridge.service.d/pi-lets-code.conf` (root-owned;
+deployment checklist item 1) — systemd still reads it, and agents no longer
+can even by a route the guard misses. The token then exists only in the
+bridge process's environment (first bullet). Read-only agents still get through with
 `curl -o`, `tar x`, `chmod`, `npm i` and other programs that write on their
 own. `NoNewPrivileges=yes` in the unit breaks a setuid `bwrap`, so enabling
 `BWRAP=1` later needs a non-setuid (user-namespace) `bwrap`.

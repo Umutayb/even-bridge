@@ -129,6 +129,9 @@ export const RULES = [
   { re: /(?:^|[;&|(\n]|\$\()\s*(?:shutdown|reboot|poweroff|halt)(?=\s|$)/, why: "powering the host off is refused" },
   { re: r(`\\bsystemctl\\b${A}\\s(?:start|stop|restart|reload|kill|disable|enable|mask|isolate|poweroff|reboot)${E}`), why: "service control is refused" },
   { re: r(`\\bsystemctl\\b${A}\\s--user${E}`), why: "systemctl --user is refused" },
+  // Unit files, drop-ins and the journal hold `Environment=` tokens and logs: no reading them either.
+  { re: r(`\\bsystemctl\\b${A}\\s(?:cat|show|list-unit-files|edit)${E}`), why: "reading unit files and properties (systemctl cat/show/list-unit-files) is refused" },
+  { re: /(?<![\w.-])journalctl(?![\w./-])/, why: "journalctl is refused (logs and unit environments)" },
 ];
 
 // ================================================================ paths
@@ -205,6 +208,80 @@ export function confinePath(p, cwd, home = homedir(), { tmp = TMP, base = cwd, m
   if (mode === "read" && (READ_SYSTEM.some((root) => within(real, resolveReal(root) ?? root)) || procOk(isAbsolute(expanded) ? expanded : `${base}/${expanded}`))) return { ok: true, real };
   const where = mode === "read" ? "the workspace, /tmp and the system dirs" : `the workspace (${tilde(realCwd, home)} and ${tmp})`;
   return { ok: false, why: `'${p}' is outside ${where}${mode === "write" ? " for writing" : ""}`, real };
+}
+
+// ================================================================ text scan
+// Every absolute (or ~/$HOME) path-like token anywhere in the command text, also
+// inside quoted interpreter code, with shell globs (`*`, `**`, `?`, `[..]`,
+// `{a,b}`) taken as patterns. A token that names (or may name) something inside
+// or equal to a denied dir is refused; a token that is an ANCESTOR of one is
+// refused when the command reads recursively (grep -r, find, rg, tar, ...).
+const PATH_TOKEN = /(?<![\w.~$}\/-])(?:~|\$\{HOME\}|\$HOME)?\/[^\s'"`;|&()<>,]*/g;
+const RECURSIVE = /(?:^|[\s;&|(`'"])(?:find|rg|ag|ack|tar|zip|rsync|tree|du|locate|fd|fdfind)(?=[\s;&|)`'"]|$)|(?:^|\s)-[A-Za-z]*[rR][A-Za-z]*(?=\s|$)|--recursive\b|--dereference-recursive\b|\bos\.walk\b|\brglob\b|\breaddirSync\b|\bglob\.glob\b/;
+
+/** One path component as a shell-glob regex (anchored). `**` matches any run of components (handled by the caller). */
+function componentRe(c) {
+  let out = "";
+  for (let i = 0; i < c.length; i++) {
+    const ch = c[i];
+    if (ch === "*") out += "[^/]*";
+    else if (ch === "?") out += "[^/]";
+    else if (ch === "[") {
+      const j = c.indexOf("]", i + 2);
+      if (j < 0) { out += "\\["; continue; }
+      let body = c.slice(i + 1, j);
+      if (body.startsWith("!") || body.startsWith("^")) body = "^" + body.slice(1);
+      out += `[${body.replace(/\\/g, "\\\\")}]`;
+      i = j;
+    } else if (ch === "{") {
+      const j = c.indexOf("}", i);
+      if (j < 0) { out += "\\{"; continue; }
+      out += `(?:${c.slice(i + 1, j).split(",").map((a) => a.replace(/[.+^$()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")).join("|")})`;
+      i = j;
+    } else out += ch.replace(/[.+^$()|\\]/g, "\\$&");
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/** How pattern components `pc` relate to path components `dc`: "inside" (pc reaches dc or below), "ancestor", or null. */
+function relate(pc, dc) {
+  for (let i = 0; i < pc.length; i++) {
+    if (pc[i] === "**") return "inside"; // matches dc itself and anything below
+    if (i >= dc.length) return "inside";
+    if (!componentRe(pc[i]).test(dc[i])) return null;
+  }
+  return pc.length >= dc.length ? "inside" : "ancestor";
+}
+
+/** The denied dir strictly below `dir` (a real path), if any. */
+function deniedBelow(dir, home) {
+  const pc = dir.split("/").filter(Boolean);
+  for (const d of [...DENIED_ABS, ...DENIED_PREFIX, ...DENIED_IN_HOME.map((x) => join(home, x))]) {
+    if (relate(pc, d.split("/").filter(Boolean)) === "ancestor") return d;
+  }
+  return undefined;
+}
+
+function scanDenied(text, home) {
+  const denied = [...DENIED_ABS, ...DENIED_PREFIX, ...DENIED_IN_HOME.map((d) => join(home, d))];
+  const recursive = RECURSIVE.test(text);
+  for (const m of text.matchAll(PATH_TOKEN)) {
+    let t = m[0].replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/)/, home);
+    // `..` and `.` components: normalize lexically (globs stay as they are).
+    const pc = [];
+    for (const c of t.split("/").filter(Boolean)) {
+      if (c === ".") continue;
+      if (c === "..") pc.pop();
+      else pc.push(c);
+    }
+    for (const d of denied) {
+      const dc = d.split("/").filter(Boolean);
+      const rel = relate(pc, dc);
+      if (rel === "inside") return `${tilde(d, home)} is off limits (via '${m[0]}')`;
+      if (rel === "ancestor" && recursive) return `a recursive read of '${m[0]}' would reach ${tilde(d, home)}, which is off limits`;
+    }
+  }
+  return undefined;
 }
 
 // ================================================================ lexing
@@ -420,6 +497,7 @@ function judge(cmd, cwd0, home, tmp, depth, readonly = false) {
     const homes = [home, "~", "$HOME", "${HOME}"].map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
     if (new RegExp(`(?:${homes.join("|")})/+${tail}`).test(text)) return `~/${d} is off limits`;
   }
+  { const v = scanDenied(text, home); if (v) return v; }
 
   const confine = (p, base, mode = "write") => confinePath(p, cwd0, home, { tmp, base, mode });
   const realCwd0 = resolveReal(resolve(cwd0));
@@ -553,10 +631,13 @@ function judge(cmd, cwd0, home, tmp, depth, readonly = false) {
       const args = argv.slice(1).filter((a) => !/^-[LPe@]+$/.test(a) && a !== "--");
       if (!args.length) return "cd to ~ leaves the workspace";
       const d = expand(args[0]);
-      if (args[0] === "-" || unresolved(d) || hasGlob(d)) { cwd = UNKNOWN; continue; }
+      // A cd target must be literal and must not be an ancestor of a denied dir: relative
+      // paths after `cd /etc` (`grep -r TOKEN systemd`) would escape the text scan.
+      if (args[0] === "-" || unresolved(d) || hasGlob(d)) return `cd ${args[0]}: a computed, glob or previous dir cannot be checked; use a literal path inside the workspace`;
       if (cwd === UNKNOWN && !isAbsolute(d) && !d.startsWith("~")) continue;
       const res = confine(d, cwd ?? cwd0, "read");
       if (!res.ok) return `cd ${args[0]}: ${res.why}`;
+      { const d0 = deniedBelow(res.real, home); if (d0) return `cd ${args[0]}: ${tilde(d0, home)} lies below it, so relative paths there cannot be judged; cd elsewhere or use absolute paths`; }
       if (within(res.real, "/proc")) return `cd ${args[0]}: cd into /proc is refused`;
       cwd = res.real;
       continue;
@@ -702,7 +783,7 @@ export function probeWrapper(wrapper, { env = process.env, run = runSync, warn =
 
 export const SCOPE_PREFIX = "even-durable-";
 
-/** The transient scope unit of one bash call: `even-durable-<sid>-<n>.scope` (systemd-safe characters only). */
+/** The transient scope unit of one bash call: `even-durable-<sid>-<n>.scope`, `n` = `<startMs>-<seq>` (systemd-safe characters only). */
 export function scopeUnit(sid, n) {
   return `${SCOPE_PREFIX}${String(sid ?? "unknown").replace(/[^A-Za-z0-9:_.-]/g, "_")}-${n}`;
 }

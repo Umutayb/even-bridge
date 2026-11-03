@@ -737,9 +737,13 @@ test("scopes: named per session, stale ones stopped before resume and at shutdow
   assert.deepEqual(calls, ["systemctl --user stop even-durable-*.scope"], "stopped before resume");
   const sid = provider._map.create({ name: "u", cwd: "/w", modelRef: { provider: "fake", modelId: "fake-model" }, origin: "phone" });
   provider._map.setConversation(sid, 4242);
-  assert.equal(provider._unitOf(4242), `even-durable-${sid}-1`);
-  assert.equal(provider._unitOf(4242), `even-durable-${sid}-2`);
-  assert.equal(provider._unitOf(9999), "even-durable-unknown-3");
+  const u1 = provider._unitOf(4242);
+  const m = new RegExp(`^even-durable-${sid}-(\\d{13})-1$`).exec(u1);
+  assert.ok(m, u1);
+  const startMs = Number(m[1]);
+  assert.ok(Math.abs(Date.now() - startMs) < 60_000, "seeded with the process start time");
+  assert.equal(provider._unitOf(4242), `even-durable-${sid}-${startMs}-2`);
+  assert.equal(provider._unitOf(9999), `even-durable-unknown-${startMs}-3`);
   await provider.stopAll();
   assert.deepEqual(calls, ["systemctl --user stop even-durable-*.scope", "systemctl --user stop even-durable-*.scope"]);
 });

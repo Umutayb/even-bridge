@@ -254,8 +254,9 @@ export function createDurableProvider(
     if (wrapper === "systemd-run") stopScopes({ env: shellEnv, run: scopeRunner });
   };
   let unitSeq = 0;
-  /** The scope of the next bash call: even-durable-<session id>-<n> (a child uses its root session's id). */
-  const unitOf = (conversationId) => scopeUnit(rootRowOf(conversationId)?.sid, ++unitSeq);
+  const unitEpoch = Date.now(); // seeds the sequence: names never clash with a scope a previous process left
+  /** The scope of the next bash call: even-durable-<session id>-<startMs>-<n> (a child uses its root session's id). */
+  const unitOf = (conversationId) => scopeUnit(rootRowOf(conversationId)?.sid, `${unitEpoch}-${++unitSeq}`);
   /** Conversations of runs being aborted at startup: no cwd, so the guard blocks their tools. */
   const stale = new Set();
   const map = new SessionMap(storePath);
