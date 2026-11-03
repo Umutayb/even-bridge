@@ -96,6 +96,14 @@ export function lcOptions(env = process.env) {
   };
 }
 
+/**
+ * The overseer (the Durable root conversation as `dur-overseer`, /api/overseer/*):
+ * EVEN_BRIDGE_OVERSEER_ENABLE=1, and only with the durable provider on.
+ */
+export function overseerEnabled(env = process.env) {
+  return durableEnabled(env) && String(env.EVEN_BRIDGE_OVERSEER_ENABLE ?? "").trim() === "1";
+}
+
 /** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
 export const DURABLE_DEFAULT_ROOT = "~/sandbox/agents";
 
@@ -175,17 +183,57 @@ export async function startServer({ flags = {}, cwd } = {}) {
   let durableProvider = null;
   let durableState = "off";
   const durableOpts = durableOptions(process.env);
+  // The overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1): its modules load only then. Its extension is in
+  // the durable registry from the start and its host is bound before the store resumes any run.
+  let overseer = null;
+  let overseerMods = null;
+  let overseerState = "off";
+  const overseerHost = {};
+  if (durableOpts && overseerEnabled(process.env)) {
+    try {
+      overseerMods = {
+        ...(await import("./overseer/overseer.mjs")),
+        ...(await import("./overseer/extension.mjs")),
+        ...(await import("./overseer/host.mjs")),
+      };
+      const extension = overseerMods.createOverseerExtension({ host: overseerHost });
+      durableOpts.overseer = overseerMods.overseerProviderOptions({ extension });
+    } catch (err) {
+      overseerMods = null;
+      overseerState = `failed: ${err.message}`;
+    }
+  }
   if (durableOpts) {
     let p = null;
     try {
       const { createDurableProvider } = await import("./providers/durable/provider.mjs");
       p = createDurableProvider(emit, { hub, ...durableOpts });
+      if (overseerMods) {
+        Object.assign(overseerHost, overseerMods.createOverseerHost({ durable: p, pi: piProvider, cc: ccProvider, rc: rcProvider }));
+      }
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
       durableState = `on wrapper=${p.wrapper ?? "none"} lc=${p.lcBanner ?? "off"}`;
     } catch (err) {
       durableState = `failed: ${err.message}`;
       p?.stopAll().catch(() => {});
+    }
+    if (durableProvider && overseerMods) {
+      try {
+        const o = overseerMods.createOverseer({
+          durable: durableProvider,
+          host: overseerHost,
+          // Item kinds and numbers only: the texts may carry session output.
+          emit: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+        });
+        await o.ready;
+        overseer = o;
+        overseerState = "on";
+      } catch (err) {
+        overseerState = `failed: ${err.message}`;
+      }
+    } else if (overseerMods) {
+      overseerState = "failed: durable is not running";
     }
     if (durableProvider && !cwdAllowed(durableOpts.defaultCwd, durableOpts.allowedCwds)) {
       console.warn(
@@ -213,13 +261,15 @@ export async function startServer({ flags = {}, cwd } = {}) {
   }
 
   console.log(
-    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}, durable=${durableState}`
+    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}, durable=${durableState}` +
+      (overseerEnabled(process.env) ? `, overseer=${overseerState}` : ""),
   );
 
   const extRouter = createExtRouter({
     hub,
     providers: [rcProvider, piProvider, durableProvider, ccProvider],
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
+    overseer,
   });
 
   // ── App (mirrors dist/index.js) ───────────────────────────────────────────
@@ -307,6 +357,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
   function shutdown() {
     stopCodexAppServer();
     piProvider?.stopAll().catch(() => {});
+    overseer?.close();
     // No abort: unfinished durable runs stay pending and resume on the next start.
     durableClosing ??= durableProvider?.stopAll();
     durableClosing?.catch(() => {});

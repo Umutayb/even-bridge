@@ -545,6 +545,23 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       return null;
     },
 
+    /**
+     * Who drives this session (the overseer's single-writer check): "bridge" (our own child),
+     * "terminal-tmux" / "terminal" (a terminal pi runs THIS conversation, with or without a tmux
+     * pane), else "none". A durable lets-code child (an `even-lc-*` scope) is never a terminal:
+     * findExternalPi skips it.
+     */
+    async driverOf(sessionId) {
+      if (sessions.has(sessionId)) return "bridge";
+      const file = findSessionFile(sessionId, cfg.agentDir);
+      if (!file) return "none";
+      const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
+      const ext = await probeExternalCached(cwd0);
+      if (ext.length === 0 || !(await externalOwnsSession(sessionId, file, cwd0))) return "none";
+      if (cfg.tmuxEnabled && (await probeTmuxPane(cwd0).catch(() => null))) return "terminal-tmux";
+      return "terminal";
+    },
+
     /** Release a dead subprocess for a session (call after pi exits). */
     forgetSession(sessionId) {
       const s = sessions.get(sessionId);

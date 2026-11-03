@@ -123,7 +123,29 @@ export function factoryOpts({ on, ticket, howToRun } = {}) {
  *   rcTranscriptBase?: string,             // ~/.claude/projects base (tests)
  * }} deps
  */
-export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase } = {}) {
+/** POST /api/overseer/ask limits (the overseer's wait is capped at 15 s). */
+export const OVERSEER_LIMITS = Object.freeze({ questionMax: 2000, requestIdMax: 128, waitMsMax: 15000 });
+
+/** Validate an overseer ask body: `{ question, requestId, waitMs }` or `{ error }`. */
+export function overseerAskOpts({ question, requestId, waitMs } = {}) {
+  if (typeof question !== "string" || !question.trim()) return { error: "Missing 'question'" };
+  if (question.length > OVERSEER_LIMITS.questionMax) return { error: `'question' must be 1-${OVERSEER_LIMITS.questionMax} characters` };
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > OVERSEER_LIMITS.requestIdMax) {
+    return { error: `'requestId' must be 1-${OVERSEER_LIMITS.requestIdMax} characters` };
+  }
+  if (waitMs != null && (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > OVERSEER_LIMITS.waitMsMax)) {
+    return { error: `'waitMs' must be 0-${OVERSEER_LIMITS.waitMsMax}` };
+  }
+  return { question, requestId, waitMs: waitMs ?? OVERSEER_LIMITS.waitMsMax };
+}
+
+const seqParam = (v) => {
+  if (v == null || v === "") return 0;
+  const n = typeof v === "number" ? v : /^\d+$/.test(String(v)) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+};
+
+export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null } = {}) {
   const ext = providers.filter(Boolean); // [{name, probe, listSessions, ...}]
   const router = Router();
 
@@ -487,6 +509,46 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
       res.status(statusCode).json({ error: err.message, ...(err.reason ? { reason: err.reason } : {}) });
+    }
+  });
+
+  // ── /api/overseer — the overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1) ───────────
+  // Without it every route falls through (next()), as before they existed.
+  const fail = (res, err) => {
+    const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
+    res.status(statusCode).json({ error: err.message });
+  };
+
+  router.post("/overseer/ask", async (req, res, next) => {
+    if (!overseer) return next();
+    const checked = overseerAskOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      res.json(await overseer.ask(checked.question, { requestId: checked.requestId, waitMs: checked.waitMs }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.get("/overseer/outbox", async (req, res, next) => {
+    if (!overseer) return next();
+    const since = seqParam(req.query.since);
+    if (since == null) return res.status(400).json({ error: "'since' must be a non-negative integer" });
+    try {
+      res.json(await overseer.outbox({ since }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/outbox/read", async (req, res, next) => {
+    if (!overseer) return next();
+    const upTo = req.body?.upTo;
+    if (!Number.isSafeInteger(upTo) || upTo < 0) return res.status(400).json({ error: "'upTo' must be a non-negative integer" });
+    try {
+      res.json(await overseer.markRead(upTo));
+    } catch (err) {
+      fail(res, err);
     }
   });
 

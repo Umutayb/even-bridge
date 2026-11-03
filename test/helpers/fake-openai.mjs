@@ -3,6 +3,8 @@
 // `POST /v1/chat/completions` with an SSE stream:
 //   - when the last message is a user message containing `TOOL <name> <json>`,
 //     one `tool_calls` delta calling <name> with <json> as arguments;
+//   - `CALL <name>` (last message a user message): the same with `{}` as arguments;
+//   - `SLOW` anywhere in the last user text: the answer waits 300 ms first;
 //   - otherwise text chunks of `reply(request)` (default: "ok: <last user text>").
 // `hold()` makes the next responses wait until `release()`, so a test can act
 // while a run is in flight. Every request body is kept in `requests`.
@@ -43,7 +45,13 @@ export async function startFakeOpenAI({ reply, chunkSize = 4 } = {}) {
     const base = { id: `chatcmpl-${calls}`, object: "chat.completion.chunk", created: 1, model: body.model };
     const messages = body.messages ?? [];
     const last = messages.at(-1);
-    const toolAsk = last?.role === "user" ? /TOOL (\w+) (\{.*\})/s.exec(lastUserText(messages)) : null;
+    if (/\bSLOW\b/.test(lastUserText(messages))) await new Promise((r) => setTimeout(r, 300));
+    let toolAsk = null;
+    if (last?.role === "user") {
+      const said = lastUserText(messages);
+      const call = /\bCALL (\w+)/.exec(said);
+      toolAsk = /TOOL (\w+) (\{.*\})/s.exec(said) ?? (call ? [call[0], call[1], "{}"] : null);
+    }
     if (toolAsk) {
       send({ ...base, choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: `call_${calls}`, type: "function", function: { name: toolAsk[1], arguments: toolAsk[2] } }] }, finish_reason: null }] });
       send({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });

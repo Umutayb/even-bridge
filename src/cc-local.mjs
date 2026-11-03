@@ -305,6 +305,28 @@ export function createCcLocalProvider(
       return out.slice(-limit);
     },
 
+    /** Recent sessions from the disk scan (the overseer's list; the phone's list has its own slot). */
+    recentSessions(limit = 10) {
+      return listCcSessions({ limit, base: ccBase });
+    },
+
+    /**
+     * Who drives this session (the overseer's single-writer check): "bridge" when the official
+     * provider holds it live, "terminal-tmux" / "terminal" when a terminal claude drives this
+     * conversation (with or without a reachable tmux pane), else "none".
+     */
+    async driverOf(sessionId) {
+      if (officialStatus(sessionId)) return "bridge";
+      const file = fileOf(sessionId);
+      if (!file) return "none";
+      const meta = ccMeta(file);
+      const drivers = await driversOf(sessionId, meta.cwd);
+      if (drivers.length === 0) return "none";
+      const owner = drivers.find((p) => p.sessionId === sessionId);
+      const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner?.pid }).catch(() => null);
+      return pane ? "terminal-tmux" : "terminal";
+    },
+
     async interrupt(sessionId) {
       const file = fileOf(sessionId);
       if (!file) {

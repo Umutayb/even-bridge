@@ -25,7 +25,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { createRegistry, defineExtension, LiveDoc } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, LiveDoc, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { claim, forget } from "../../ownership.mjs";
@@ -217,6 +217,10 @@ function parseMaxTurns(v) {
  * @param {string[]} [o.forbidden] dirs agents may not use (default forbiddenDirs()).
  * @param {object} [o.lc] the lets-code engine (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1): `{ bin, caps, maxLive, sandbox }`
  *   plus test seams (see lc/engine.mjs). Unset: no lets-code module is loaded and nothing changes.
+ * @param {object} [o.overseer] the overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1; src/overseer/overseer.mjs
+ *   `overseerProviderOptions`): `{ extension, sid, title, maxTurns, instructions }`. The root conversation is
+ *   created (or reconfigured) with only that extension before anything resumes, and is served as the virtual
+ *   session `sid`. Unset: nothing changes.
  */
 /** A factory flag on a prompt to an existing agent (the toggle has its own route). */
 export const FACTORY_ON_START = "'factory' is set when an agent starts; use /api/agents/:sid/factory";
@@ -246,6 +250,7 @@ export function createDurableProvider(
     scopeRunner = runSync,
     forbidden = forbiddenDirs({ env }),
     lc,
+    overseer,
   } = {},
 ) {
   const backoff = { ...REATTACH, ...reattach };
@@ -268,6 +273,36 @@ export function createDurableProvider(
   const stale = new Set();
   const map = new SessionMap(storePath);
   const { models, refs, default: defaultRef } = loadPiModels(modelsPath, env);
+  // The overseer: the root conversation as a virtual row of the map (never stored, never in
+  // listAgents/rows, so the shim's reaper never sees it). Every lookup by sid or conversation
+  // id finds it, so the watcher, history, seed, prompt and restart paths serve it unchanged.
+  const ov = overseer ?? null;
+  const startedS = Math.floor(Date.now() / 1000);
+  const overseerRow = () => ({
+    sid: ov.sid,
+    conversation_id: ROOT_CONVERSATION_ID,
+    name: ov.title,
+    cwd: defaultCwd ?? "",
+    model_provider: defaultRef.provider,
+    model_id: defaultRef.modelId,
+    created_at: startedS,
+    last_seen: Math.floor(Date.now() / 1000),
+    origin: "overseer",
+    archived: 0,
+    max_turns: ov.maxTurns,
+    engine: "native",
+    ttl_s: null,
+  });
+  if (ov) {
+    const get = map.get.bind(map);
+    const byConversation = map.byConversation.bind(map);
+    map.get = (sid) => (sid === ov.sid ? overseerRow() : get(sid));
+    map.byConversation = (id) => (id === ROOT_CONVERSATION_ID ? overseerRow() : byConversation(id));
+  }
+  const isOverseer = (sid) => Boolean(ov) && sid === ov.sid;
+  const notTheOverseer = (sid) => {
+    if (isOverseer(sid)) throw httpError(403, "The overseer cannot be stopped or archived");
+  };
   // Subagent children are owned conversations the sessions table does not know:
   // child conversation id → parent conversation id, and child → agent role.
   // Filled when the subagent tool creates (or, on a rerun, reuses) a child,
@@ -336,6 +371,7 @@ export function createDurableProvider(
   registry.install(CodingTools);
   registry.install(guardExt); // after CodingTools: the guard's bash (with resource caps) wins
   registry.install(subagentExt); // children keep the guard and drop this one
+  if (ov) registry.install(ov.extension); // selected by the root only (every other conversation names its own)
   const EXTENSIONS = [CodingTools, guardExt, subagentExt];
 
   /**
@@ -422,6 +458,22 @@ export function createDurableProvider(
           ...seams,
         });
         lcBox.engine = lcEngine;
+      }
+      if (ov) {
+        // The root with the overseer's agent, before anything resumes (a resumed root run needs its tools).
+        const agent = {
+          model: defaultRef,
+          thinkingLevel: thinkingLevelFor(defaultRef, settingsPath),
+          maxTurns: ov.maxTurns,
+          instructions: ov.instructions,
+          extensions: [ov.extension],
+        };
+        try {
+          const root = await durable.harness.root(durable.ctx, { agent });
+          await root.configure(agent, durable.ctx); // an existing root follows this build's agent
+        } catch (err) {
+          log.warn?.(`[durable] overseer root: ${err.message}`);
+        }
       }
       // After a restart, BEFORE anything runs (openDurable did not resume):
       // 1. scopes left by the last process are stopped (they outlive the unit);
@@ -771,10 +823,13 @@ export function createDurableProvider(
     },
 
     listSessions(limit = 10, cwd) {
-      return map
+      const rows = map
         .list({ limit, cwd })
         .filter((r) => r.conversation_id != null)
         .map((r) => ({ id: r.sid, title: r.name, timestamp: r.last_seen * 1000, cwd: r.cwd, provider: WIRE_PROVIDER, status: null }));
+      if (!ov || (cwd && cwd !== defaultCwd)) return rows;
+      // The overseer first (the phone Terminal opens it like any session).
+      return [{ id: ov.sid, title: ov.title, timestamp: Date.now(), cwd: defaultCwd ?? "", provider: WIRE_PROVIDER, status: null }, ...rows].slice(0, limit);
     },
 
     async getSessionStatus(sessionId) {
@@ -974,6 +1029,7 @@ export function createDurableProvider(
      * conversation is aborted first (fire and forget).
      */
     forgetSession(sessionId) {
+      notTheOverseer(sessionId);
       const row = map.get(sessionId);
       if (isLc(row)) {
         lcEngine?.forget(sessionId).catch((err) => log.warn?.(`[durable] forget ${sessionId} failed: ${err.message}`));
@@ -992,6 +1048,7 @@ export function createDurableProvider(
 
     /** Abort and archive (the shim's reaper / stop endpoint). */
     async stopSession(sessionId) {
+      notTheOverseer(sessionId);
       const lcRow = map.get(sessionId);
       if (isLc(lcRow)) {
         if (lcRow.archived) throw notFound();

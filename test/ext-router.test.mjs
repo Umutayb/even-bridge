@@ -72,7 +72,7 @@ function stubPi() {
 /** Build an app with ONLY the ext router + a fall-through sentinel.
  *  The official default provider is injected (hermetic — never touches
  *  the user's ~/.claude or ~/.codex). */
-async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase }) {
+async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase, overseer }) {
   const { createExtRouter } = await import("../src/ext-router.mjs");
   const hub = new Hub();
   const app = express();
@@ -85,6 +85,7 @@ async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscrip
       providers: [rc, pi, durable],
       getDefaultLocalProvider: () => local,
       rcTranscriptBase,
+      overseer,
     })
   );
   app.use((req, res) => {
@@ -709,4 +710,93 @@ test("a 409 experts_disabled keeps its reason on the wire", async (t) => {
   const r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
   assert.equal(r.status, 409);
   assert.deepEqual(await r.json(), { error: "factory experts must be enabled by the operator (missing: tester)", reason: "experts_disabled" });
+});
+
+// ── /api/overseer ─────────────────────────────────────────────────────────────
+
+function stubOverseer() {
+  const calls = { ask: [], outbox: [], read: [] };
+  return {
+    calls,
+    ask: async (question, opts) => {
+      calls.ask.push([question, opts]);
+      return { status: "done", answer: "two agents run" };
+    },
+    outbox: async (opts) => {
+      calls.outbox.push(opts);
+      return { seq: 3, readUpTo: 0, items: [{ seq: 3, at: 1, kind: "notify", text: "hi" }] };
+    },
+    markRead: async (upTo) => {
+      calls.read.push(upTo);
+      return { seq: 3, readUpTo: upTo };
+    },
+  };
+}
+
+test("POST /overseer/ask validates question and waitMs", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  const bad = async (body, error) => {
+    const r = await postJson(`${base}/api/overseer/ask`, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(await r.json(), { error });
+  };
+  await bad({ question: "", requestId: "r1" }, "Missing 'question'");
+  await bad({ requestId: "r1" }, "Missing 'question'");
+  await bad({ question: "x".repeat(2001), requestId: "r1" }, "'question' must be 1-2000 characters");
+  await bad({ question: "what runs?" }, "'requestId' must be 1-128 characters");
+  await bad({ question: "what runs?", requestId: "r".repeat(129) }, "'requestId' must be 1-128 characters");
+  await bad({ question: "what runs?", requestId: "r1", waitMs: 20000 }, "'waitMs' must be 0-15000");
+  await bad({ question: "what runs?", requestId: "r1", waitMs: -1 }, "'waitMs' must be 0-15000");
+  await bad({ question: "what runs?", requestId: "r1", waitMs: "5" }, "'waitMs' must be 0-15000");
+  assert.deepEqual(overseer.calls.ask, []);
+  let r = await postJson(`${base}/api/overseer/ask`, { question: "what runs?", requestId: "r1", waitMs: 0 });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { status: "done", answer: "two agents run" });
+  r = await postJson(`${base}/api/overseer/ask`, { question: "and now?", requestId: "r2" });
+  assert.equal(r.status, 200);
+  assert.deepEqual(overseer.calls.ask, [
+    ["what runs?", { requestId: "r1", waitMs: 0 }],
+    ["and now?", { requestId: "r2", waitMs: 15000 }],
+  ]);
+});
+
+test("GET /overseer/outbox passes since; POST /overseer/outbox/read passes upTo", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  let r = await fetch(`${base}/api/overseer/outbox?since=2`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { seq: 3, readUpTo: 0, items: [{ seq: 3, at: 1, kind: "notify", text: "hi" }] });
+  r = await fetch(`${base}/api/overseer/outbox`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(overseer.calls.outbox, [{ since: 2 }, { since: 0 }]);
+  r = await fetch(`${base}/api/overseer/outbox?since=-1`);
+  assert.equal(r.status, 400);
+  r = await fetch(`${base}/api/overseer/outbox?since=abc`);
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/overseer/outbox/read`, { upTo: 3 });
+  assert.deepEqual(await r.json(), { seq: 3, readUpTo: 3 });
+  r = await postJson(`${base}/api/overseer/outbox/read`, { upTo: "3" });
+  assert.equal(r.status, 400);
+  assert.deepEqual(overseer.calls.read, [3]);
+});
+
+test("overseer errors keep their status code", async (t) => {
+  const overseer = { ...stubOverseer(), ask: async () => { throw Object.assign(new Error("durable store failed"), { statusCode: 503 }); } };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  const r = await postJson(`${base}/api/overseer/ask`, { question: "q", requestId: "r" });
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), { error: "durable store failed" });
+});
+
+test("/overseer routes fall through without the overseer", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable() });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/overseer/ask`, { question: "q", requestId: "r" });
+  await fetch(`${base}/api/overseer/outbox?since=0`);
+  await postJson(`${base}/api/overseer/outbox/read`, { upTo: 1 });
+  assert.deepEqual(fellThrough, ["POST /api/overseer/ask", "GET /api/overseer/outbox", "POST /api/overseer/outbox/read"]);
 });

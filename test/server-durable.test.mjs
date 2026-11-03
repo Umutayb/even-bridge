@@ -6,7 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT } from "../src/server.mjs";
+import { cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT, overseerEnabled } from "../src/server.mjs";
 import { fakeModelsJson } from "./helpers/fake-openai.mjs";
 
 const CHILD = fileURLToPath(new URL("./helpers/server-child.mjs", import.meta.url));
@@ -186,6 +186,8 @@ test("server, flag unset: durable never imported, durable=off, /api/agents is au
   assert.equal(code, 0);
   assert.match(out, /\[bridge\] extensions: .*durable=off/);
   assert.doesNotMatch(out, /LOADED-DURABLE/, "src/providers/durable/* was imported with the flag off");
+  assert.doesNotMatch(out, /LOADED-OVERSEER/, "src/overseer/* was imported with the flag off");
+  assert.doesNotMatch(out, /overseer=/, "the banner is the one of before");
 });
 
 test("server, flag on: durable=on after ready, the default cwd is <root>/glasses, SIGTERM waits for the store to close", async (t) => {
@@ -209,6 +211,7 @@ test("server, flag on: durable=on after ready, the default cwd is <root>/glasses
   assert.equal(code, 0);
   assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=off/);
   assert.doesNotMatch(out, /LOADED-DURABLE .*\/lc\//, "flag off loads no lc module");
+  assert.doesNotMatch(out, /LOADED-OVERSEER/, "overseer flag unset: no overseer module");
   assert.doesNotMatch(out, /default cwd .* is not under EVEN_BRIDGE_DURABLE_CWDS/);
   assert.match(out, /\[bridge\] durable store closed/);
 });
@@ -264,4 +267,50 @@ test("server, flag on but the provider fails: durable=failed, the bridge stays u
   const { code, out } = await s.stop();
   assert.equal(code, 0);
   assert.match(out, /\[bridge\] extensions: .*durable=failed: models\.json/);
+});
+
+test("overseer options only with EVEN_BRIDGE_OVERSEER_ENABLE=1 and durable on", () => {
+  assert.equal(overseerEnabled({}), false);
+  assert.equal(overseerEnabled({ EVEN_BRIDGE_OVERSEER_ENABLE: "1" }), false, "needs durable");
+  assert.equal(overseerEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "1" }), false);
+  assert.equal(overseerEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "1", EVEN_BRIDGE_OVERSEER_ENABLE: "true" }), false);
+  assert.equal(overseerEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "1", EVEN_BRIDGE_OVERSEER_ENABLE: "1" }), true);
+  assert.equal(durableOptions({ EVEN_BRIDGE_DURABLE_ENABLE: "1", EVEN_BRIDGE_OVERSEER_ENABLE: "1" }).overseer, undefined, "durable options stay as before");
+});
+
+test("server, overseer on: dur-overseer is listed, /api/overseer answers, the agents list stays without it", async (t) => {
+  const s = await startChild(t, (home) => {
+    mkdirSync(join(home, "x", "y"), { recursive: true });
+    writeFileSync(join(home, "models.json"), JSON.stringify(fakeModelsJson("http://127.0.0.1:9/v1")));
+    return {
+      EVEN_BRIDGE_DURABLE_ENABLE: "1",
+      EVEN_BRIDGE_OVERSEER_ENABLE: "1",
+      EVEN_BRIDGE_DURABLE_STORE: join(home, "durable.sqlite"),
+      EVEN_BRIDGE_DURABLE_MODELS: join(home, "models.json"),
+      EVEN_BRIDGE_DURABLE_CWDS: "~/x",
+    };
+  });
+  let r = await fetch(`${s.base}/api/overseer/outbox`);
+  assert.equal(r.status, 401, "auth-gated");
+  r = await fetch(`${s.base}/api/overseer/outbox?since=0`, authed);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { seq: 0, readUpTo: 0, items: [] });
+  r = await fetch(`${s.base}/api/overseer/ask`, {
+    method: "POST",
+    headers: { ...authed.headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ question: "what runs?", requestId: "ovs-1", waitMs: 0 }),
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { status: "pending", requestId: "ovs-1" });
+  r = await fetch(`${s.base}/api/agents`, authed);
+  assert.deepEqual(await r.json(), { agents: [] }, "the overseer is not an agent (the reaper never sees it)");
+  r = await fetch(`${s.base}/api/sessions?provider=claude&limit=50`, authed);
+  const sessions = (await r.json()).sessions;
+  assert.ok(sessions.some((x) => x.id === "dur-overseer" && x.title === "Overseer"), JSON.stringify(sessions));
+  r = await fetch(`${s.base}/api/agents/dur-overseer/stop`, { method: "POST", ...authed });
+  assert.equal(r.status, 403);
+  const { code, out } = await s.stop();
+  assert.equal(code, 0);
+  assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=off, overseer=on/);
+  assert.match(out, /LOADED-OVERSEER .*\/overseer\.mjs/);
 });
