@@ -25,16 +25,17 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { createRegistry, LiveDoc } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, LiveDoc } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
-import { loadPiModels, thinkingLevelFor } from "./models.mjs";
+import { expandHome, loadPiModels, thinkingLevelFor } from "./models.mjs";
 import { openDurable } from "./harness.mjs";
 import { SessionMap } from "./sessions.mjs";
 import { ViewTranslator } from "./wire.mjs";
-import { createGuardExtension, detectWrapper, probeWrapper, runSync, scopeUnit, shellEnv as guardShellEnv, stopScopes, wrapperEnv } from "./guard.mjs";
+import { detectWrapper, probeWrapper, runSync, scopeUnit, shellEnv as guardShellEnv, stopScopes, wrapperEnv } from "./guard.mjs";
+import { createGuardExtension } from "./guard-ext.mjs";
 import { fileURLToPath } from "node:url";
 import { loadAgentFiles } from "./agent-files.mjs";
 import { allowedAgentsFrom, createSubagentExtension } from "./subagent.mjs";
@@ -214,6 +215,8 @@ function parseMaxTurns(v) {
  * @param {number} [o.pruneEveryMs] how often stale requestId rows are pruned (default 6 h).
  * @param {Function} [o.scopeRunner] runs systemd-run/systemctl argv synchronously (tests inject a fake).
  * @param {string[]} [o.forbidden] dirs agents may not use (default forbiddenDirs()).
+ * @param {object} [o.lc] the lets-code engine (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1): `{ bin, caps, maxLive, sandbox }`
+ *   plus test seams (see lc/engine.mjs). Unset: no lets-code module is loaded and nothing changes.
  */
 export function createDurableProvider(
   emitRaw,
@@ -239,6 +242,7 @@ export function createDurableProvider(
     pruneEveryMs = PRUNE_EVERY_MS,
     scopeRunner = runSync,
     forbidden = forbiddenDirs({ env }),
+    lc,
   } = {},
 ) {
   const backoff = { ...REATTACH, ...reattach };
@@ -370,7 +374,21 @@ export function createDurableProvider(
   let durable; // { harness, ctx, close }
   // `opened`: the harness is usable. `ready`: also re-attached after a restart.
   // Internal paths await `opened` (the resume step itself needs them).
-  const opened = openDurable({ storePath, storage, models, registry, envFor, settings, resume: false }).then(
+  // The lets-code engine's modules load only when it is on (flag off: byte-identical to before).
+  let lcMods = null;
+  let lcBox = null;
+  let lcEngine = null;
+  const isLc = (row) => Boolean(lc) && row?.engine === "lets-code";
+  const opened = (async () => {
+    if (lc) {
+      lcMods = await import("./lc/engine.mjs");
+      const made = lcMods.createLcTaskBox();
+      lcBox = made.box;
+      lcBox.task = made.task;
+      registry.install(defineExtension({ name: "even-lc", tasks: [made.task] }));
+    }
+    return openDurable({ storePath, storage, models, registry, envFor, settings, resume: false });
+  })().then(
     (d) => (durable = d),
     (err) => {
       throw httpError(503, `durable store failed to open: ${err.message}`, err);
@@ -379,6 +397,29 @@ export function createDurableProvider(
   const ready = (async () => {
     try {
       await opened;
+      if (lc) {
+        const { bin, caps, maxLive, sandbox, ...seams } = lc;
+        lcEngine = lcMods.createLcEngine({
+          harness: durable.harness,
+          ctx: durable.ctx,
+          map,
+          emit: (sid, frame) => onLcFrame(sid, frame),
+          storeDir: dirname(expandHome(storePath)),
+          task: lcBox.task,
+          bin,
+          caps,
+          maxLive,
+          sandbox,
+          wrapper: seams.wrapper ?? wrapper,
+          run: seams.run ?? scopeRunner,
+          log,
+          baseEnv: toolEnv,
+          clientCount: (sid) => clientsOf(sid) + (hub?.clientCount?.(sid) ?? 0),
+          defaultModel: `${defaultRef.provider}/${defaultRef.modelId}`,
+          ...seams,
+        });
+        lcBox.engine = lcEngine;
+      }
       // After a restart, BEFORE anything runs (openDurable did not resume):
       // 1. scopes left by the last process are stopped (they outlive the unit);
       // 2. child edges of rows seen in the 7-day window (older ones pruned);
@@ -390,6 +431,11 @@ export function createDurableProvider(
       // 4. resume. Rows outside the window are not read and report idle.
       clearScopes();
       const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
+      if (lcEngine) {
+        // Scopes of this store's lets-code rows only (never a glob: ruling 3).
+        const lcSids = [...map.rows({ seenSince: since })].filter((r) => r.engine === "lets-code").map((r) => r.sid);
+        lcMods.stopLcScopes(lcSids, { env: shellEnv, run: lc.run ?? scopeRunner });
+      }
       map.pruneChildren(since);
       loadChildren();
       const recent = new Map(); // sid → row
@@ -405,7 +451,9 @@ export function createDurableProvider(
         const row = rootRowOf(convId);
         if (row && !row.archived && row.last_seen >= since) {
           states.set(row.sid, "busy");
-          recent.set(row.sid, row);
+          if (isLc(row)) {
+            if (t.record.kind === lcMods.LC_RUN_TASK) lcEngine.noteRunning(row.sid, t.record.id);
+          } else recent.set(row.sid, row);
         } else {
           staleTasks.push(t.record.id);
           staleConvs.add(row?.conversation_id ?? convId);
@@ -473,6 +521,16 @@ export function createDurableProvider(
         queueMicrotask(() => maybeStop(sid));
       }
     }
+    try {
+      emitRaw(sid, frame);
+    } catch (err) {
+      log.warn?.(`[durable] emit for ${sid} failed: ${err.message}`);
+    }
+  }
+
+  /** Frames of a lets-code child: the same ring + hub feed; the status cache follows them. */
+  function onLcFrame(sid, frame) {
+    if (frame.type === "status" && (frame.state === "busy" || frame.state === "idle")) states.set(sid, frame.state);
     try {
       emitRaw(sid, frame);
     } catch (err) {
@@ -621,10 +679,14 @@ export function createDurableProvider(
   function createSession(phoneCwd, opts) {
     const origin = opts.origin ?? "phone";
     if (origin !== "evenai" && origin !== "phone") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
+    const engine = opts.engine ?? "native";
+    if (engine !== "native" && engine !== "lets-code") throw httpError(400, `Invalid engine ${JSON.stringify(engine)}`);
+    if (engine === "lets-code" && !lcEngine) throw httpError(400, "the lets-code engine is off");
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
-    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns });
+    if (engine === "lets-code") lcEngine.admit(null); // 503 without the sandbox, 429 at the live limit: before any row
+    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns, ...(engine === "lets-code" ? { engine } : {}) });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
   }
@@ -643,6 +705,15 @@ export function createDurableProvider(
   async function createConversationFor(sid) {
     const row = map.get(sid);
     await opened;
+    if (isLc(row)) {
+      // A record only: it never runs a model (ruling 1); the child does the work.
+      const conv = await durable.harness.createConversation(
+        { ownership: { kind: "ownerless" }, agent: { model: defaultRef, maxTurns: 1, instructions: "lets-code session record", extensions: [], cwd: row.cwd } },
+        ctx(),
+      );
+      map.setConversation(sid, conv.id);
+      return;
+    }
     const ref = { provider: row.model_provider, modelId: row.model_id };
     // From the row, validated when it was created: a repair after a crash uses the same budget.
     const maxTurns = parseMaxTurns(row.max_turns);
@@ -679,6 +750,12 @@ export function createDurableProvider(
     wrapper,
     /** cwd of a prompt that names none. */
     defaultCwd,
+    /** Engines a new agent may ask for (Task 3 advertises them on GET /api/agents). */
+    engines: lc ? ["native", "lets-code"] : ["native"],
+    /** The startup banner's lets-code part: on(sandbox|nosandbox|sandbox-missing,mem|nomem), or off. */
+    get lcBanner() {
+      return lcEngine?.banner ?? (lc ? "starting" : "off");
+    },
 
     /** Sync ownership probe: a "dur-" id the session map knows. */
     probe(sessionId) {
@@ -697,6 +774,7 @@ export function createDurableProvider(
     },
 
     async getSessionStatus(sessionId) {
+      if (isLc(map.get(sessionId))) return lcEngine?.status(sessionId) ?? "idle";
       try {
         const { conv } = await conversationOf(sessionId);
         if (!conv) return "idle";
@@ -716,6 +794,13 @@ export function createDurableProvider(
     },
 
     async getHistory(sessionId, limit = 10) {
+      const lcRow = map.get(sessionId);
+      if (isLc(lcRow)) {
+        if (lcRow.archived) return [];
+        await ready;
+        claim(sessionId, NAME);
+        return lcEngine.history(sessionId, limit);
+      }
       const { conv } = await conversationOf(sessionId);
       if (!conv) return [];
       claim(sessionId, NAME);
@@ -734,6 +819,15 @@ export function createDurableProvider(
     async seedTranscript(sessionId) {
       if (!sessionId || live.has(sessionId)) return;
       if (getMessages(sessionId, 0).length > 0) return;
+      const lcRow = map.get(sessionId);
+      if (isLc(lcRow)) {
+        if (lcRow.archived) return;
+        await ready.catch(() => {});
+        if (!lcEngine || getMessages(sessionId, 0).length > 0 || lcEngine.status(sessionId) !== "idle") return; // a live run feeds the ring
+        await lcEngine.seed(sessionId);
+        claim(sessionId, NAME);
+        return;
+      }
       const { conv } = await conversationOf(sessionId).catch(() => ({}));
       if (!conv) return;
       const page = await conv.entries({}, historyWindow, undefined, ctx());
@@ -753,8 +847,10 @@ export function createDurableProvider(
     },
 
     watchTranscript(sessionId) {
-      if (!map.get(sessionId)) return;
+      const row = map.get(sessionId);
+      if (!row) return;
       clientCounts.set(sessionId, clientsOf(sessionId) + 1);
+      if (isLc(row)) return; // the child feeds the ring itself; only the client count matters (dialog sweep)
       ensureWatcher(sessionId).catch(() => {});
     },
 
@@ -784,6 +880,11 @@ export function createDurableProvider(
       }
       await ensureConversation(sid);
       claim(sid, NAME);
+      if (isLc(map.get(sid))) {
+        const r = await lcEngine.prompt(sid, text, { requestId: opts.requestId });
+        map.touch(sid);
+        return { sessionId: sid, provider: WIRE_PROVIDER, ...(r.taskId != null ? { submissionId: r.taskId } : {}) };
+      }
       // Watch before submitting: the first view is the history, so the new
       // input arrives as a change and is reported exactly once.
       const w = await ensureWatcher(sid);
@@ -806,18 +907,25 @@ export function createDurableProvider(
       return { sessionId: sid, provider: WIRE_PROVIDER, submissionId: submission.id };
     },
 
-    respondPermission() {
-      return false; // Durable has no permission dialogs
+    respondPermission(sessionId, decision) {
+      if (isLc(map.get(sessionId))) return lcEngine?.respondPermission(sessionId, decision) ?? false;
+      return false; // native Durable has no permission dialogs
     },
 
-    /** A question ends the run (the agent stops); the answer is the next input. */
+    /** A question ends the run (the agent stops); the answer is the next input. lets-code: answers its open dialog. */
     respondQuestion(sessionId, answer) {
+      const row = map.get(sessionId);
+      if (isLc(row)) {
+        if (row.archived) throw notFound();
+        return lcEngine.respondQuestion(sessionId, answer);
+      }
       return provider.prompt(sessionId, answer);
     },
 
     interrupt(sessionId) {
       const row = map.get(sessionId);
       if (!row || row.archived || row.conversation_id == null) throw notFound();
+      if (isLc(row)) return lcEngine?.interrupt(sessionId);
       conversationOf(sessionId)
         .then(({ conv }) => conv?.abort(ctx()))
         .catch((err) => log.warn?.(`[durable] interrupt ${sessionId} failed: ${err.message}`));
@@ -831,6 +939,7 @@ export function createDurableProvider(
     getStatus(sessionId) {
       const row = map.get(sessionId);
       if (!row || row.archived) return null;
+      if (isLc(row)) return { state: lcEngine ? lcEngine.status(sessionId) : "busy", provider: WIRE_PROVIDER };
       const state = states.get(sessionId) ?? (resumed ? "idle" : "busy");
       return { state, provider: WIRE_PROVIDER };
     },
@@ -842,7 +951,9 @@ export function createDurableProvider(
      */
     forgetSession(sessionId) {
       const row = map.get(sessionId);
-      if (states.get(sessionId) === "busy" && row?.conversation_id != null && durable) {
+      if (isLc(row)) {
+        lcEngine?.forget(sessionId).catch((err) => log.warn?.(`[durable] forget ${sessionId} failed: ${err.message}`));
+      } else if (states.get(sessionId) === "busy" && row?.conversation_id != null && durable) {
         durable.harness
           .conversation(row.conversation_id, ctx())
           .then((conv) => conv?.abort(ctx()))
@@ -857,6 +968,15 @@ export function createDurableProvider(
 
     /** Abort and archive (the shim's reaper / stop endpoint). */
     async stopSession(sessionId) {
+      const lcRow = map.get(sessionId);
+      if (isLc(lcRow)) {
+        if (lcRow.archived) throw notFound();
+        await ready;
+        await lcEngine.stop(sessionId);
+        states.set(sessionId, "idle");
+        provider.forgetSession(sessionId);
+        return;
+      }
       const { row, conv } = await conversationOf(sessionId);
       if (!row || row.archived) throw notFound();
       if (conv) {
@@ -873,6 +993,7 @@ export function createDurableProvider(
      */
     async listAgents({ all = false } = {}) {
       await opened;
+      if (lc) await ready.catch(() => {}); // the lets-code engine is built after the store opens
       const seenSince = all ? 0 : Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
       const rows = [...map.rows({ seenSince })].filter((r) => r.conversation_id != null).reverse(); // newest first
       const out = [];
@@ -882,6 +1003,15 @@ export function createDurableProvider(
       return out;
 
       async function agentRow(r) {
+        if (isLc(r)) {
+          let rec = { factory: false, lastLine: "" };
+          try {
+            rec = await lcEngine.record(r.sid);
+          } catch (err) {
+            log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
+          }
+          return { ...baseRow(r, lcEngine.status(r.sid), rec.lastLine ?? ""), engine: "lets-code", factory: Boolean(rec.factory) };
+        }
         let state = states.get(r.sid) ?? "idle";
         let lastLine = "";
         try {
@@ -898,6 +1028,11 @@ export function createDurableProvider(
         } catch (err) {
           log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
         }
+        const out = baseRow(r, state, lastLine);
+        return lc ? { ...out, engine: "native", factory: false } : out; // flag off: rows as before
+      }
+
+      function baseRow(r, state, lastLine) {
         return {
           sid: r.sid,
           name: r.name,
@@ -930,19 +1065,35 @@ export function createDurableProvider(
       if (abort) {
         const busy = [...states].filter(([, s]) => s === "busy").map(([sid]) => sid);
         await Promise.all(
-          busy.map(async (sid) => {
+          busy.filter((sid) => isLc(map.get(sid))).map((sid) => lcEngine?.stop(sid).catch(() => {})),
+        );
+        await Promise.all(
+          busy.filter((sid) => !isLc(map.get(sid))).map(async (sid) => {
             const { conv } = await conversationOf(sid).catch(() => ({}));
             await conv?.abort(durable.ctx).catch(() => {});
           }),
         );
       }
       for (const sid of [...live.keys()]) stopWatcher(sid);
-      await durable.close();
+      await durable.close(); // signals the lets-code run tasks first: they stay pending for the next start
+      await lcEngine?.stopAll(); // then the children and their scopes
       clearScopes(); // bash still running in a scope would outlive the bridge
       map.close();
     },
 
+    /** Factory toggle of a lets-code agent (Task 3 routes it): `{ factory, mode }`. */
+    async setFactory(sessionId, on, opts = {}) {
+      const row = map.get(sessionId);
+      if (!row || row.archived) throw notFound();
+      if (!isLc(row)) throw httpError(409, "the factory needs the lets-code engine");
+      await ready;
+      return lcEngine.setFactory(sessionId, on, opts);
+    },
+
     _map: map,
+    get _lc() {
+      return lcEngine;
+    },
     get _harness() {
       return durable?.harness;
     },

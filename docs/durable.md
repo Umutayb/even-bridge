@@ -49,6 +49,11 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_DURABLE_AGENTS` | `scout,general,worker,reviewer,researcher,tester` | comma-separated lets-code agents (`~/.pi/agent/agents/*.md`) the `subagent` tool offers. Agent files and this list are read **once at bridge start**; edits apply after a restart |
 | `BWRAP` | off | `1` runs agent bash under `bwrap` when installed (it is not on borealis) |
 | `LETS_CODE_TOKEN` | — | vLLM key (`$LETS_CODE_TOKEN` in models.json); the live unit sets it in `even-bridge.service.d/pi-lets-code.conf` (keep that drop-in mode 0600, root-owned) |
+| `EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE` | off | `1` adds the lets-code engine (needs `EVEN_BRIDGE_DURABLE_ENABLE=1`): a prompt with `engine: "lets-code"` runs in an owned `lets-code --mode rpc` child (`--mandate ask --subagents --sandbox`, `-e even-guard.ts`) inside the scope `even-lc-<sid>`; banner `lc=on(sandbox,mem|nomem)` / `lc=off` |
+| `EVEN_BRIDGE_LC_BIN` | `EVEN_BRIDGE_PI_BIN`, else `lets-code` | the lets-code launcher (`pi-inference` works too) |
+| `EVEN_BRIDGE_LC_MAX_LIVE` | `1` | live lets-code children at once (an idle-kept child makes room; otherwise 429) |
+| `EVEN_BRIDGE_LC_MEMORY_MAX` | `500M` | `MemoryMax` of `even-lc-<sid>.scope`, applied only when `/sys/fs/cgroup/cgroup.controllers` lists `memory` (not on borealis today: one startup warning, banner `nomem`) |
+| `EVEN_BRIDGE_LC_SANDBOX` | on | `0` drops lets-code's `--sandbox` (tests only); on and without `bwrap`+`socat`, every lets-code start answers 503 |
 
 All of them are read at startup only.
 
@@ -280,3 +285,32 @@ By the model's own account the interrupted `bash` call came back as
 interrupted and it re-ran the command itself (the smoke does not inspect the
 entries to confirm this). Either way, a tool call with side effects can run
 twice across a restart; here that was harmless.
+
+### lets-code engine (plan Task 2), measured on borealis, 2026-11-03
+
+```sh
+cd ~/github/even-bridge
+bash -lc 'TMPDIR=~/tmp/ovs-tmp node scripts/durable-smoke.mjs --engine lets-code'
+bash -lc 'TMPDIR=~/tmp/ovs-tmp node scripts/durable-smoke.mjs --engine lets-code --kill-mid-turn --kill-signal SIGKILL'
+```
+
+Instance: store `~/tmp/ovs-smoke-store`, cwd `~/sandbox/agents/ovs-smoke`,
+`EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1`, `EVEN_BRIDGE_DURABLE_CWDS=~/sandbox/agents`,
+`EVEN_BRIDGE_LC_BIN=~/.local/bin/lets-code`, and **no** `LETS_CODE_TOKEN` in the
+bridge env (lets-code reads `~/.config/lets-code/config` and exports the token to
+pi itself; the child's `/proc/<pid>/environ` has no other token or key). The
+script removes the store, the cwd and `~/tmp/ovs-outside.txt` at the end.
+
+| check | result |
+| --- | --- |
+| (d) banner | `durable=on wrapper=systemd-run lc=on(sandbox,nomem)` and the one `no memory cgroup controller` warning |
+| (a) `Create hello.txt containing hi` | `hello.txt` = `hi`, no dialog, answer in `/api/history`; idle after 7.6 s (cold spawn included) |
+| (c) scope | `systemd-cgls --user-unit even-lc-<sid>.scope` lists `pi` and its sandbox `socat`; `/proc/<pi>/cgroup` ends in `even-lc-<sid>.scope`; no `lets-code-<pi pid>.scope`; after `POST /api/agents/<sid>/stop` the scope is gone; the live bridge's `/api/sessions` (read-only GET on 3456) does not list the session |
+| (a2) `Write hi to ~/tmp/ovs-outside.txt` | exactly one `permission_request` on the SSE stream after 1.0 s (`toolName` `mandate`, `write outside the project: /home/ay/tmp/ovs-outside.txt`, Yes/No), status `awaiting`; `deny` → file absent, the model says the write was not approved |
+| (b) SIGKILL 2 s into `sleep 20 && echo done > done.txt` | the old pi was still alive (its scope outlives the bridge) and is stopped by the next start's scope cleanup; restart → resumed run idle after 28.8 s; exactly one cut-off prompt in the child's session file (same file, `--session`); `done.txt` = `done`; no `~/.pi/agent/lets-code-sessions/<old pid>.json` |
+| (b') the same with SIGTERM | the old pi stopped at shutdown; resumed run idle after 25.8 s; one cut-off prompt; `done.txt` = `done` |
+| bridge RSS | 127.2 MiB → 132.9 MiB across (a)+(a2) (the child is its own process: idle lets-code pi ≈ 150 MB, see `docs/overseer-spike.md`) |
+
+`even-guard.ts` loads inside the real child (`-e`, a `.ts` importing
+`guard-core.mjs`): a `wc -c ~/.pi/agent/models.json` bash call came back as
+`even-guard: ~/.pi is off limits`.

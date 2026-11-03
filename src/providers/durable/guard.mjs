@@ -10,10 +10,12 @@
 //   shell, ...); on top of that a small lexer follows `cd`, removals, write
 //   targets and every path-like token, so `cd .. && rm -rf x`, absolute paths,
 //   `$HOME/...` and symlinks out of the workspace are refused.
-// - `createGuardExtension`: the Durable extension. Its `beforeTool` hook vets
+// - `createGuardExtension` (guard-ext.mjs): the Durable extension. Its `beforeTool` hook vets
 //   read/write/edit/bash; it re-declares `bash` so `prepare` can run each
 //   command under resource caps (systemd-run scope, or bwrap when BWRAP=1).
 //   Install it AFTER CodingTools: the later `bash` replaces the earlier one.
+//   It lives in its own file so this one needs no Durable: lets-code children load
+//   this file through lc/guard-core.mjs (even-guard.ts) and must not load pi-durable.
 //
 // `judgeCommand`, `confinePath`, `guardBeforeTool` and `guardPrepare` need no
 // Durable and are unit-tested directly.
@@ -47,10 +49,8 @@ import { lstatSync, readlinkSync, accessSync, existsSync, constants as FS } from
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
-import { createBashTool } from "@earendil-works/pi-durable/tools";
 
-const TMP = "/tmp";
+export const TMP = "/tmp";
 const DENIED_IN_HOME = [".ssh", ".aws", ".config", ".even-terminal", ".pi", ".gnupg"];
 // Read AND write: unit drop-ins hold tokens (`Environment=LETS_CODE_TOKEN=...`), the user bus is host control.
 const DENIED_ABS = ["/etc/ssh", "/etc/ssl/private", "/etc/netplan", "/etc/wpa_supplicant", "/etc/NetworkManager", "/etc/systemd", "/etc/even-terminal.env", "/run/user"];
@@ -463,6 +463,31 @@ export function judgeCommand(cmd, cwd, home = homedir(), { tmp = TMP, readonly =
   return why ? { block: why } : {};
 }
 
+/**
+ * The part of `judgeCommand` that does not depend on a workspace: the RULES (also inside
+ * nested shell bodies) and any mention of a denied dir (~/.ssh, ~/.pi, /etc/shadow, ...).
+ * lets-code sessions use only this (lc/guard-core.mjs): their workspace confinement is
+ * lets-code's own mandate, which asks before leaving the project.
+ * @returns {{ block?: string }}
+ */
+export function judgeHard(cmd, home = homedir(), depth = 0) {
+  if (typeof cmd !== "string") return { block: "no command" };
+  if (depth > MAX_DEPTH) return { block: "commands nested too deeply to check" };
+  const { text, shellBodies } = stripHeredocs(cmd);
+  for (const rule of RULES) if (rule.re.test(text)) return { block: rule.why };
+  for (const body of shellBodies) {
+    const v = judgeHard(body, home, depth + 1);
+    if (v.block) return v;
+  }
+  for (const d of DENIED_IN_HOME) {
+    const tail = d.replace(/\./g, "\\.") + "(?![\\w.-])";
+    const homes = [home, "~", "$HOME", "${HOME}"].map((h) => h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    if (new RegExp(`(?:${homes.join("|")})/+${tail}`).test(text)) return { block: `~/${d} is off limits` };
+  }
+  const v = scanDenied(text, home);
+  return v ? { block: v } : {};
+}
+
 // Read-only agents (agent file `role: readonly`): git verbs that only read, and
 // how a listing-only use of branch/tag/remote/config/stash looks.
 const GIT_READ_VERBS = new Set(["status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-tree", "rev-parse", "describe", "shortlog", "cat-file", "rev-list", "for-each-ref", "name-rev", "show-ref", "whatchanged", "reflog", "help", "version"]);
@@ -798,7 +823,7 @@ export function stopScopes({ env = process.env, run = runSync } = {}) {
   return status === 0;
 }
 
-const DEFAULT_CAPS = { memoryMax: "600M", cpuQuota: "200%" };
+export const DEFAULT_CAPS = { memoryMax: "600M", cpuQuota: "200%" };
 
 /**
  * The shell's environment: the allowlisted variables of `baseEnv` (PATH, HOME, LANG, LC_*,
@@ -853,23 +878,4 @@ export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = 
   const what = name === "bash" ? String(args.command ?? "").slice(0, 120) : String(args.path ?? "");
   log(`[durable:guard] blocked ${name} (${what}): ${why}`);
   return { block: `guard: ${why}` };
-}
-
-/**
- * The Durable extension. Install after CodingTools so its `bash` (with `prepare`) wins.
- * @param {object} o
- * @param {(conversationId: unknown) => string|undefined} o.cwdOf the workspace of a
- *   conversation. The caller owns this mapping: a child conversation (a subagent, Task 7)
- *   must map to its parent's cwd, and an unknown conversation must return undefined (blocks).
- * @param {(conversationId: unknown) => boolean} [o.readonlyOf] true for a read-only agent
- *   (agent file `role: readonly`): write/edit and writing, removing or git-mutating bash are blocked.
- * @param {(conversationId: unknown) => string|undefined} [o.unitOf] systemd scope name of the next bash call.
- * @param {object} [o.baseEnv] where the shell's allowlisted variables come from (default process.env).
- */
-export function createGuardExtension({ cwdOf, readonlyOf = () => false, unitOf, baseEnv = process.env, caps = DEFAULT_CAPS, wrapper = detectWrapper(), home = homedir(), tmp = TMP, log } = {}) {
-  return defineExtension({
-    name: "even-guard",
-    hooks: [hook(ToolTask, { beforeTool: (call, api) => guardBeforeTool(call, { cwd: cwdOf(api.conversationId), readonly: Boolean(readonlyOf(api.conversationId)), home, tmp, log }) })],
-    tools: [createBashTool({ prepare: (execution, api) => { guardPrepare(execution, { wrapper, caps, baseEnv, unit: unitOf?.(api?.conversationId) }); } })],
-  });
 }

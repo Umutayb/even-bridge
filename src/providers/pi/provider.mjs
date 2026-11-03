@@ -50,7 +50,8 @@ export function defaultPiBin(env = process.env) {
   }
   return "pi";
 }
-export const isLetsCode = (bin) => /^lets-code$/.test(basename(String(bin ?? "")));
+// pi-inference only `exec`s lets-code, so it takes lets-code's model ids too.
+export const isLetsCode = (bin) => /^(?:lets-code|pi-inference)$/.test(basename(String(bin ?? "")));
 // lets-code's --model is a model id on its own server: a "lets-code/<id>"
 // (pi's provider/id form) is given as <id>
 export function launcherModel(bin, model) {

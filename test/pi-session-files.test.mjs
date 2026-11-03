@@ -8,6 +8,7 @@ import {
   listSessionFiles,
   findSessionFile,
   readHistory,
+  readHistoryFile,
   readSessionCwd,
 } from "../src/providers/pi/session-files.mjs";
 
@@ -112,4 +113,23 @@ test("readHistory: user/assistant text turns only", () => {
   const limited = readHistory(ID_A, 2, agentDir);
   assert.equal(limited.length, 2);
   assert.equal(limited[0].role, "user");
+});
+
+test("readHistoryFile reads a session file by path", () => {
+  const file = findSessionFile(ID_A, agentDir);
+  assert.deepEqual(readHistoryFile(file, 10), readHistory(ID_A, 10, agentDir));
+  assert.deepEqual(readHistoryFile(join(root, "missing.jsonl"), 10), []);
+});
+
+test("a tool call without a result is kept", () => {
+  const file = writeSession(cwdA, "44444444-aaaa-bbbb-cccc-00000000000d", "2025-04-01T00:00:00.000Z", {
+    messages: [
+      { role: "user", content: "Run: sleep 20 && echo done > done.txt" },
+      { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "sleep 20 && echo done > done.txt" } }] },
+    ],
+  });
+  const h = readHistoryFile(file, 10);
+  assert.equal(h.length, 2);
+  assert.deepEqual(h[0], { role: "user", text: "Run: sleep 20 && echo done > done.txt" });
+  assert.deepEqual(h[1], { role: "assistant", text: "Bash sleep 20 && echo done > done.txt" });
 });

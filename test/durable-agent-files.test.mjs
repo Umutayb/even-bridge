@@ -101,7 +101,7 @@ test("append_prompt (live lets-code style) is read from the agent home and appen
     writeFileSync(join(agents, "ah-app.md"), fm("ah-app", "append_prompt: ah-app/prompt.md"));
     writeFileSync(join(agents, "both.md"), fm("both", "append_prompt: ah-app/prompt.md") + "Own body first.\n");
     writeFileSync(join(agents, "missing.md"), fm("missing", "append_prompt: missing/prompt.md"));
-    writeFileSync(join(agents, "escape.md"), fm("escape", "append_prompt: ../../etc/passwd"));
+    writeFileSync(join(agents, "escape.md"), fm("escape", "append_prompt: ../../../../../../../../../../../../../../../../etc/passwd"));
     writeFileSync(join(agents, "empty.md"), fm("empty", "role: readonly"));
     const warned = [];
     const map = loadAgentFiles(agents, { log: { warn: (l) => warned.push(l) } });
@@ -114,7 +114,7 @@ test("append_prompt (live lets-code style) is read from the agent home and appen
     assert.equal(map.get("both").prompt, "Own body first.\n\nDrive the AH app through the device farm.");
     const log = warned.join("\n");
     assert.match(log, /agent missing: append_prompt missing\/prompt.md unreadable/);
-    assert.match(log, /agent escape: append_prompt \.\.\/\.\.\/etc\/passwd leaves/);
+    assert.match(log, /agent escape: append_prompt (?:\.\.\/)+etc\/passwd leaves/);
     for (const n of ["missing", "escape", "empty"]) assert.match(log, new RegExp(`agent ${n}: no instructions .*not offered`));
   } finally {
     rmSync(home, { recursive: true, force: true });

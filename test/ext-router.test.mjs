@@ -495,6 +495,19 @@ test("/prompt validates the durable agent fields (400 with a clear error)", asyn
   });
 });
 
+test("/prompt passes a validated engine to the durable provider", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", engine: "docker" });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error, "'engine' must be one of native, lets-code");
+  assert.equal(durable.calls.prompt.length, 0);
+  const ok = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", engine: "lets-code" });
+  assert.equal(ok.status, 202);
+  assert.deepEqual(durable.calls.prompt[0].opts, { engine: "lets-code" });
+});
+
 test("GET /agents returns the durable provider's listAgents()", async (t) => {
   const durable = stubDurable();
   const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });

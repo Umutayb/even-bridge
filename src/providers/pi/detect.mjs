@@ -20,14 +20,19 @@ import { readdir, readFile, readlink, rm, mkdtemp } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+/** The cgroup of a durable lets-code child (`even-lc-<sid>.scope`): the bridge drives it, never a terminal. */
+export const LC_CGROUP_RE = /\/even-lc-[^/]*\.scope$/m;
+
 /**
  * Find running `pi` processes whose cwd matches `cwd` (i.e. a terminal pi
  * that could be driving a session of that project). Excludes the given pids
- * (our own bridge-spawned children) and this process.
+ * (our own bridge-spawned children), this process, and any process whose
+ * `/proc/<pid>/cgroup` matches `skipCgroup` (the durable provider's lets-code
+ * children; `null` turns the check off; a missing cgroup file never skips).
  *
  * @returns {Promise<Array<{pid: number, cwd: string}>>}
  */
-export async function findExternalPi(cwd, { excludePids = [], procRoot = "/proc", myPid = process.pid } = {}) {
+export async function findExternalPi(cwd, { excludePids = [], procRoot = "/proc", myPid = process.pid, skipCgroup = LC_CGROUP_RE } = {}) {
   if (!cwd) return [];
   const skip = new Set([myPid, ...excludePids]);
   let entries;
@@ -71,7 +76,17 @@ export async function findExternalPi(cwd, { excludePids = [], procRoot = "/proc"
     } catch {
       continue;
     }
-    if (pcwd === cwd) found.push({ pid, cwd: pcwd });
+    if (pcwd !== cwd) continue;
+    if (skipCgroup) {
+      let cg = "";
+      try {
+        cg = await readFile(join(procRoot, name, "cgroup"), "utf8");
+      } catch {
+        /* no cgroup file: not one of ours */
+      }
+      if (skipCgroup.test(cg)) continue;
+    }
+    found.push({ pid, cwd: pcwd });
   }
   return found;
 }

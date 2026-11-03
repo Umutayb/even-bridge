@@ -5,6 +5,13 @@
 //
 //   node scripts/durable-smoke.mjs                  # two prompts: create a file, then a guard-blocked read
 //   node scripts/durable-smoke.mjs --kill-mid-turn  # stop the bridge 2 s into a turn, restart, resume
+//   node scripts/durable-smoke.mjs --engine lets-code                 # (a) a file, (a2) a mandate ask denied, (c) scope, (d) banner
+//   node scripts/durable-smoke.mjs --engine lets-code --kill-mid-turn --kill-signal SIGKILL   # (b) restart mid-turn
+//
+// --engine lets-code: the durable lets-code engine (an owned lets-code RPC child per
+// session, plan Task 2). Store ~/tmp/ovs-smoke-store, cwd ~/sandbox/agents/ovs-smoke,
+// bin ~/.local/bin/lets-code; the bridge gets no LETS_CODE_TOKEN (lets-code reads its
+// own config), and the child's /proc environ is checked for tokens.
 //
 // Options:
 //   --kill-signal SIGKILL  with --kill-mid-turn: crash instead of the graceful close (default SIGTERM)
@@ -21,17 +28,24 @@
 // from the environment (export it before running), falling back to the systemd
 // drop-in of the live service only when that file is readable. Neither is ever printed.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, closeSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, closeSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const ROOT = "/tmp/durable-smoke";
-const WORK = join(ROOT, "work");
+const ENGINE = (() => {
+  const i = process.argv.indexOf("--engine");
+  return i >= 0 ? process.argv[i + 1] : "native";
+})();
+const LC = ENGINE === "lets-code";
+const ROOT = LC ? join(homedir(), "tmp", "ovs-smoke-store") : "/tmp/durable-smoke";
+const WORK = LC ? join(homedir(), "sandbox", "agents", "ovs-smoke") : join(ROOT, "work");
+const LC_BIN = join(homedir(), ".local", "bin", "lets-code");
+const OUTSIDE = join(homedir(), "tmp", "ovs-outside.txt");
 const STORE = join(ROOT, "durable.sqlite");
 const LOG = join(ROOT, "bridge.log");
 const PORT = 3466;
@@ -235,6 +249,7 @@ const BLOCKED_TEXT =
   "Only the byte count is printed, not the key. Use the bash tool with exactly that command and report what it returned.";
 
 async function main() {
+  if (LC) return mainLc();
   if (PORT === LIVE_PORT) fail("refusing to bind the live service port");
   if (await portInUse(PORT)) fail(`port ${PORT} is already in use`);
   rmSync(ROOT, { recursive: true, force: true });
@@ -350,6 +365,267 @@ async function killMidTurn(env, before) {
   say("SMOKE OK (kill-mid-turn: one user prompt, one assistant answer after resume)");
 }
 
+// ── --engine lets-code ──────────────────────────────────────────────────────
+
+const sh = (cmd, args) => {
+  try {
+    return execFileSync(cmd, args, { encoding: "utf8", timeout: 15_000 }).trim();
+  } catch (err) {
+    return String(err.stdout ?? "").trim();
+  }
+};
+
+/** Pids in a user scope (cgroup v2 `cgroup.procs`), with their comm. */
+function scopeProcs(unit) {
+  const cg = sh("systemctl", ["--user", "show", "-p", "ControlGroup", "--value", unit]);
+  if (!cg) return [];
+  let pids = [];
+  try {
+    pids = readFileSync(`/sys/fs/cgroup${cg}/cgroup.procs`, "utf8").split("\n").filter(Boolean).map(Number);
+  } catch {
+    return [];
+  }
+  return pids.map((pid) => {
+    let comm = "?";
+    try {
+      comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    } catch {
+      /* gone */
+    }
+    return { pid, comm };
+  });
+}
+
+/** Read the SSE stream of a session into `frames` until `stop()`. */
+function sse(sid, frames) {
+  const ac = new AbortController();
+  (async () => {
+    try {
+      const res = await fetch(`${BASE}/events?sessionId=${encodeURIComponent(sid)}`, { headers: { authorization: `Bearer ${TOKEN}` }, signal: ac.signal });
+      let buf = "";
+      for await (const chunk of res.body) {
+        buf += Buffer.from(chunk).toString();
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          for (const line of block.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            try {
+              const m = JSON.parse(line.slice(5).trim());
+              frames.push(m.message ?? m);
+            } catch {
+              /* keepalive */
+            }
+          }
+        }
+      }
+    } catch {
+      /* stopped */
+    }
+  })();
+  return () => ac.abort();
+}
+
+function lcEnvFor() {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) if (k.startsWith("EVEN_BRIDGE_") || k.startsWith("EVEN_TERMINAL_EXPOSE") || k === "LETS_CODE_TOKEN") delete env[k];
+  Object.assign(env, {
+    PORT: String(PORT),
+    BRIDGE_TOKEN: TOKEN,
+    PROJECT_DIR: WORK,
+    TMPDIR: join(homedir(), "tmp", "ovs-tmp"),
+    EVEN_BRIDGE_DURABLE_ENABLE: "1",
+    EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1",
+    EVEN_BRIDGE_DURABLE_STORE: STORE,
+    EVEN_BRIDGE_DURABLE_CWDS: join(homedir(), "sandbox", "agents"),
+    EVEN_BRIDGE_LC_BIN: LC_BIN,
+    EVEN_BRIDGE_PI_ENABLE: "0",
+    EVEN_BRIDGE_RC_ENABLE: "0",
+    EVEN_BRIDGE_CC_DISABLED: "1",
+    EVEN_BRIDGE_SKIP_PATCH_DIST: "1",
+    EVEN_HOST_MODE: "interface",
+    EVEN_HOST_INTERFACE: "lo",
+    PI_TELEMETRY: "0",
+  });
+  return env;
+}
+
+function bannerLine() {
+  try {
+    return readFileSync(LOG, "utf8").split("\n").find((l) => l.includes("[bridge] extensions:")) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** The child's session file (from the record via history is not enough): newest jsonl under the store's lc-sessions/<sid>. */
+function sessionFileOf(sid) {
+  const dir = join(ROOT, "lc-sessions", sid);
+  try {
+    const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).sort();
+    return files.length ? join(dir, files.at(-1)) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitFor(cond, ms, what) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (await cond()) return;
+    await sleep(500);
+  }
+  fail(`timed out waiting for ${what}`);
+}
+
+async function lcStart() {
+  if (PORT === LIVE_PORT) fail("refusing to bind the live service port");
+  if (await portInUse(PORT)) fail(`port ${PORT} is already in use`);
+  rmSync(ROOT, { recursive: true, force: true });
+  rmSync(WORK, { recursive: true, force: true });
+  rmSync(OUTSIDE, { force: true });
+  mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+  mkdirSync(WORK, { recursive: true });
+  mkdirSync(join(homedir(), "tmp", "ovs-tmp"), { recursive: true });
+  const env = lcEnvFor();
+  say(`engine lets-code: bridge on 127.0.0.1:${PORT}, store ${STORE}, cwd ${WORK}, bin ${LC_BIN}`);
+  const c = startBridge(env);
+  await waitReady(c);
+  say(`bridge ready (pid ${c.pid}); ${bannerLine().replace(/^.*\[bridge\] /, "")}`);
+  if (!/lc=on\(sandbox,(?:mem|nomem)\)/.test(bannerLine())) fail("banner has no lc=on(sandbox,...)");
+  return { env, c };
+}
+
+async function mainLc() {
+  if (KILL_MID_TURN) return killMidTurnLc();
+  const { c } = await lcStart();
+  const before = rssOf(c.pid);
+  // (d) the banner
+  const banner = bannerLine();
+  say(`(d) banner: ${/lc=on\(sandbox,nomem\)/.test(banner) ? "nomem as expected (no memory controller)" : banner}`);
+
+  // (a) a file inside the project: no dialog
+  const frames = [];
+  let t = Date.now();
+  const r1 = await prompt({ text: "Create hello.txt containing hi", cwd: WORK, name: "ovs-smoke", engine: "lets-code", requestId: randomUUID() });
+  const sid = r1.sessionId;
+  const stopSse = sse(sid, frames);
+  say(`(a) prompt accepted: ${sid}`);
+  await sleep(1500);
+  // (c) while it runs: pi sits in even-lc-<sid>.scope
+  const procs = scopeProcs(`even-lc-${sid}.scope`);
+  say(`(c) even-lc-${sid}.scope procs: ${procs.map((p) => `${p.pid}:${p.comm}`).join(" ") || "(none yet)"}`);
+  await waitIdle(sid);
+  say(`(a) idle after ${((Date.now() - t) / 1000).toFixed(1)}s`);
+  const hello = join(WORK, "hello.txt");
+  if (!existsSync(hello)) fail("hello.txt was not created");
+  say(`(a) hello.txt: ${JSON.stringify(readFileSync(hello, "utf8"))}`);
+  const h1 = await history(sid);
+  printHistory(h1);
+  if (!h1.some((x) => x.role === "assistant")) fail("no assistant answer in /api/history");
+  if (frames.some((f) => f.type === "permission_request")) fail("a dialog was asked for a write inside the project");
+
+  // (c) the scope and the child env, with the child still idle-kept
+  const procs2 = scopeProcs(`even-lc-${sid}.scope`);
+  const pi = procs2.find((p) => p.comm === "pi") ?? procs2[0];
+  if (!pi) fail(`no process in even-lc-${sid}.scope`);
+  say(`(c) systemd-cgls --user-unit even-lc-${sid}.scope:\n${sh("systemd-cgls", ["--user-unit", `even-lc-${sid}.scope`, "--no-pager"])}`);
+  const cg = readFileSync(`/proc/${pi.pid}/cgroup`, "utf8").trim();
+  if (!cg.includes(`even-lc-${sid}.scope`)) fail(`pi ${pi.pid} is not in our scope: ${cg}`);
+  const ownScope = sh("systemctl", ["--user", "list-units", `lets-code-${pi.pid}.scope`, "--no-legend"]);
+  if (ownScope) fail(`lets-code moved pi into its own scope: ${ownScope}`);
+  say(`(c) pi ${pi.pid} cgroup ${cg.split("/").pop()}; no lets-code-${pi.pid}.scope`);
+  const environ = readFileSync(`/proc/${pi.pid}/environ`, "utf8").split("\0");
+  const names = environ.map((kv) => kv.split("=")[0]);
+  const tokens = names.filter((n) => /TOKEN|_KEY$/.test(n));
+  say(`(c) child env names: ${names.filter(Boolean).sort().join(" ")}`);
+  if (tokens.some((n) => n !== "LETS_CODE_TOKEN")) fail(`child env carries ${tokens.join(", ")}`);
+  if (tokens.includes("LETS_CODE_TOKEN")) say("(c) LETS_CODE_TOKEN in pi's env: exported by lets-code itself from ~/.config/lets-code/config (the bridge passed none)");
+  for (const k of ["LETS_CODE_MEM_WATCH=false", "LETS_CODE_MEM_GUARD=false"]) if (!environ.includes(k)) fail(`child env lacks ${k}`);
+
+  // (a2) a write outside the project: one mandate ask, denied
+  const askFrom = frames.length;
+  t = Date.now();
+  await prompt({ sessionId: sid, text: `Write hi to ~/tmp/ovs-outside.txt` });
+  await waitFor(() => frames.slice(askFrom).some((f) => f.type === "permission_request"), TURN_TIMEOUT_MS, "the mandate ask");
+  const ask = frames.slice(askFrom).find((f) => f.type === "permission_request");
+  say(`(a2) permission_request after ${((Date.now() - t) / 1000).toFixed(1)}s: ${JSON.stringify({ toolName: ask.toolName, description: ask.description, options: ask.options })}`);
+  const st = (await api("GET", `/status?sessionId=${encodeURIComponent(sid)}`)).json?.state;
+  say(`(a2) status while asking: ${st}`);
+  const pr = await api("POST", "/permission-response", { sessionId: sid, decision: "deny" });
+  if (pr.status !== 200) fail(`permission-response ${pr.status}: ${JSON.stringify(pr.json)}`);
+  await waitIdle(sid, { sawBusy: true });
+  if (existsSync(OUTSIDE)) fail(`${OUTSIDE} exists after a deny`);
+  const asks = frames.slice(askFrom).filter((f) => f.type === "permission_request").length;
+  say(`(a2) denied; ${OUTSIDE} absent; permission requests in this turn: ${asks}`);
+  printHistory((await history(sid)).slice(h1.length));
+
+  // stop: scope gone, the live bridge does not list it
+  const agents = (await api("GET", "/agents")).json?.agents ?? [];
+  for (const a of agents) say(`agent ${a.sid} engine=${a.engine} factory=${a.factory} state=${a.state} lastLine=${short(a.lastLine ?? "", 100)}`);
+  const stop = await api("POST", `/agents/${encodeURIComponent(sid)}/stop`);
+  if (stop.status !== 200) fail(`stop ${stop.status}: ${JSON.stringify(stop.json)}`);
+  stopSse();
+  await sleep(1000);
+  const left = sh("systemctl", ["--user", "list-units", `even-lc-${sid}.scope`, "--no-legend"]);
+  if (left) fail(`scope still there after stop: ${left}`);
+  say(`(c) after stop: systemctl --user list-units 'even-lc-${sid}*' is empty`);
+  const liveSessions = await fetch(`http://127.0.0.1:${LIVE_PORT}/api/sessions`, { headers: { authorization: `Bearer ${TOKEN}` }, signal: AbortSignal.timeout(15_000) })
+    .then((r) => r.json())
+    .catch((err) => ({ error: err.message }));
+  const listed = JSON.stringify(liveSessions).includes(sid) || JSON.stringify(liveSessions).includes(pi.pid);
+  say(`(c) live bridge /api/sessions (read-only GET): ${Array.isArray(liveSessions?.sessions) ? liveSessions.sessions.length + " sessions" : JSON.stringify(liveSessions).slice(0, 120)}; lists our session: ${listed}`);
+  if (listed) fail("the live bridge lists the throwaway session");
+  const after = rssOf(c.pid);
+  say(`bridge RSS ${mib(before.rss)} → ${mib(after.rss)} (peak ${mib(after.hwm)})`);
+  say("SMOKE OK (lets-code: a, a2, c, d)");
+}
+
+async function killMidTurnLc() {
+  const { env, c } = await lcStart();
+  const text = "Run: sleep 20 && echo done > done.txt\nUse the bash tool with exactly that command, then say done.";
+  const r = await prompt({ text, cwd: WORK, name: "ovs-kill", engine: "lets-code", requestId: randomUUID() });
+  const sid = r.sessionId;
+  say(`(b) prompt accepted: ${sid}`);
+  // Wait until the bash call is running (its toolCall is in the session file).
+  await waitFor(() => {
+    const f = sessionFileOf(sid);
+    return f && existsSync(f) && /"toolCall"[^\n]*sleep 20/.test(readFileSync(f, "utf8"));
+  }, TURN_TIMEOUT_MS, "the sleep tool call");
+  const procs = scopeProcs(`even-lc-${sid}.scope`);
+  const pi = procs.find((p) => p.comm === "pi");
+  say(`(b) running: scope procs ${procs.map((p) => `${p.pid}:${p.comm}`).join(" ")}`);
+  await sleep(2000);
+  const ex = await stopBridge(child, KILL_SIGNAL);
+  say(`(b) bridge stopped mid-turn with ${KILL_SIGNAL} (exit code=${ex?.code} signal=${ex?.signal})`);
+  const reg = pi ? join(homedir(), ".pi", "agent", "lets-code-sessions", `${pi.pid}.json`) : null;
+  say(`(b) old pi ${pi?.pid}: alive=${pi ? existsSync(`/proc/${pi.pid}`) : "?"}; registry file present=${reg ? existsSync(reg) : "?"}`);
+  const t = Date.now();
+  const c2 = startBridge(env);
+  await waitReady(c2);
+  say(`(b) bridge restarted (pid ${c2.pid})`);
+  await waitIdle(sid, { sawBusy: true });
+  say(`(b) resumed run idle after ${((Date.now() - t) / 1000).toFixed(1)}s`);
+  const file = sessionFileOf(sid);
+  const lines = readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const cutoffs = lines.filter((e) => e.type === "message" && e.message?.role === "user" && JSON.stringify(e.message.content).includes("You were cut off by a restart of the bridge")).length;
+  say(`(b) cut-off prompts in ${file.split("/").pop()}: ${cutoffs}`);
+  if (cutoffs !== 1) fail(`expected exactly one cut-off prompt, got ${cutoffs}`);
+  const done = join(WORK, "done.txt");
+  if (!existsSync(done)) fail("done.txt missing after the resume");
+  say(`(b) done.txt: ${JSON.stringify(readFileSync(done, "utf8"))}`);
+  if (reg && existsSync(reg)) fail(`stale registry file ${reg} still there`);
+  say(`(b) no lets-code-sessions/${pi?.pid}.json`);
+  printHistory(await history(sid));
+  const stop = await api("POST", `/agents/${encodeURIComponent(sid)}/stop`);
+  if (stop.status !== 200) fail(`stop ${stop.status}`);
+  await sleep(1000);
+  const left = sh("systemctl", ["--user", "list-units", `even-lc-${sid}.scope`, "--no-legend"]);
+  if (left) fail(`scope still there after stop: ${left}`);
+  say("SMOKE OK (lets-code kill-mid-turn: one cut-off prompt, done.txt, no stale registry)");
+}
+
 let code = 0;
 try {
   await main();
@@ -359,7 +635,12 @@ try {
   say(`bridge log: ${LOG}${KEEP ? "" : " (pass --keep to inspect it)"}`);
 } finally {
   await stopBridge(child);
-  if (!KEEP) rmSync(ROOT, { recursive: true, force: true });
-  else say(`kept ${ROOT}`);
+  if (!KEEP) {
+    rmSync(ROOT, { recursive: true, force: true });
+    if (LC) {
+      rmSync(WORK, { recursive: true, force: true });
+      rmSync(OUTSIDE, { force: true });
+    }
+  } else say(`kept ${ROOT}`);
 }
 process.exit(code);

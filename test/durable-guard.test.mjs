@@ -10,13 +10,13 @@ import {
   detectWrapper,
   guardBeforeTool,
   guardPrepare,
-  createGuardExtension,
   shellQuote,
   wrapperEnv,
   probeWrapper,
   scopeUnit,
   stopScopes,
 } from "../src/providers/durable/guard.mjs";
+import { createGuardExtension } from "../src/providers/durable/guard-ext.mjs";
 
 // A fake home and a workspace inside it, so nothing depends on the real ~.
 function sandbox() {

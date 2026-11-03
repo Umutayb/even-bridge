@@ -28,6 +28,7 @@ const STATUS_CHECK_COUNT = 10; // mirrors core.js
 // Durable prompt fields (POST /api/prompt): limits per the plan's rulings.
 export const AGENT_LIMITS = Object.freeze({ nameMax: 24, maxTurns: 60, requestIdMax: 128, modelMax: 32 });
 export const AGENT_ORIGINS = Object.freeze(["evenai", "phone"]);
+export const AGENT_ENGINES = Object.freeze(["native", "lets-code"]);
 const NAME_RE = /^[\w .-]+$/;
 
 /**
@@ -35,7 +36,7 @@ const NAME_RE = /^[\w .-]+$/;
  * out; `maxTurns` may be a number or a digit-only string and comes back a number.
  * @returns {{ opts: object } | { error: string }}
  */
-export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
+export function agentOpts({ name, model, maxTurns, requestId, origin, engine } = {}) {
   const opts = {};
   const L = AGENT_LIMITS;
   if (name != null) {
@@ -69,6 +70,12 @@ export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
       return { error: `'origin' must be one of ${AGENT_ORIGINS.join(", ")}` };
     }
     opts.origin = origin;
+  }
+  if (engine != null) {
+    if (!AGENT_ENGINES.includes(engine)) {
+      return { error: `'engine' must be one of ${AGENT_ENGINES.join(", ")}` };
+    }
+    opts.engine = engine;
   }
   return { opts };
 }
@@ -244,7 +251,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
   // ── POST /api/prompt ───────────────────────────────────────────────────────
   router.post("/prompt", async (req, res, next) => {
-    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin } = req.body ?? {};
+    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin, engine } = req.body ?? {};
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing 'text' field" });
     }
@@ -272,7 +279,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       let result;
       if (p.name === "durable") {
         // Agent fields: validated, and only the ones the caller sent.
-        const checked = agentOpts({ name, model, maxTurns, requestId, origin });
+        const checked = agentOpts({ name, model, maxTurns, requestId, origin, engine });
         if (checked.error) return res.status(400).json({ error: checked.error });
         result = await p.prompt(sessionId, text, effectiveCwd, checked.opts);
       } else {

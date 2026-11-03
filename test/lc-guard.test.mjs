@@ -1,0 +1,79 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { guardDecision } from "../src/providers/durable/lc/guard-core.mjs";
+
+const ID = "20261103-093221-c129";
+
+function sandbox(t, repo) {
+  const root = mkdtempSync(join(tmpdir(), "lc-guard-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const cwd = join(home, "sandbox", "agents", "w");
+  const factoryRoot = join(home, ".pi", "agent", "lets-code-factory");
+  mkdirSync(cwd, { recursive: true });
+  mkdirSync(join(factoryRoot, ID, "work"), { recursive: true });
+  writeFileSync(join(factoryRoot, ID, "ledger.json"), JSON.stringify({ v: 1, id: ID, repo: repo ?? cwd, status: "waiting", updated: 1 }));
+  return { home, cwd, factoryRoot, work: join(factoryRoot, ID, "work") };
+}
+
+test("a write in the cwd passes", (t) => {
+  const s = sandbox(t);
+  assert.equal(guardDecision("write", { path: join(s.cwd, "a.txt"), content: "x" }, s), undefined);
+  assert.equal(guardDecision("edit", { path: "a.txt" }, s), undefined);
+  assert.equal(guardDecision("bash", { command: "echo hi > a.txt && ls -la" }, s), undefined);
+});
+
+test("a write in ~/.pi/agent is blocked", (t) => {
+  const s = sandbox(t);
+  const d = guardDecision("write", { path: join(s.home, ".pi", "agent", "settings.json"), content: "{}" }, s);
+  assert.equal(d.block, true);
+  assert.match(d.reason, /^even-guard: /);
+  assert.match(d.reason, /\.pi is off limits/);
+  assert.equal(guardDecision("read", { path: "~/.ssh/id_ed25519" }, s).block, true);
+});
+
+test("the factory worktree of this cwd's run is allowed", (t) => {
+  const s = sandbox(t);
+  assert.equal(guardDecision("write", { path: join(s.work, "a.txt"), content: "x" }, s), undefined);
+  assert.equal(guardDecision("read", { path: join(s.work, "src", "b.js") }, s), undefined);
+  assert.equal(guardDecision("bash", { command: `cd ${s.work} && git status` }, s), undefined);
+  assert.equal(guardDecision("bash", { command: `ls ~/.pi/agent/lets-code-factory/${ID}/work` }, s), undefined);
+});
+
+test("the factory worktree of another repo is blocked", (t) => {
+  const s = sandbox(t, "/other");
+  assert.equal(guardDecision("write", { path: join(s.work, "a.txt"), content: "x" }, s).block, true);
+  assert.equal(guardDecision("bash", { command: `cat ${s.work}/a.txt` }, s).block, true);
+});
+
+test("a bash command with a ~/.pi path outside the worktree is blocked", (t) => {
+  const s = sandbox(t);
+  const d = guardDecision("bash", { command: "cat ~/.pi/agent/models.json" }, s);
+  assert.equal(d.block, true);
+  assert.match(d.reason, /^even-guard: /);
+  assert.equal(guardDecision("bash", { command: `cd ${s.work} && cat ../ledger.json ~/.pi/agent/auth.json` }, s).block, true);
+});
+
+test("a write outside the project is left to the mandate; RULES still block", (t) => {
+  const s = sandbox(t);
+  assert.equal(guardDecision("write", { path: join(s.home, "tmp", "ovs-outside.txt"), content: "hi" }, s), undefined);
+  assert.equal(guardDecision("bash", { command: "echo hi > ~/tmp/ovs-outside.txt" }, s), undefined);
+  assert.equal(guardDecision("bash", { command: "git push --force origin main" }, s).block, true);
+  assert.equal(guardDecision("unknown_tool", { path: "~/.pi/x" }, s), undefined);
+});
+
+test("even-guard.ts is a thin adapter over guardDecision", () => {
+  const src = readFileSync(new URL("../src/providers/durable/lc/even-guard.ts", import.meta.url), "utf8");
+  assert.match(src, /from "\.\/guard-core\.mjs"/);
+  assert.match(src, /pi\.on\("tool_call"/);
+  assert.match(src, /EVEN_GUARD_CWD/);
+});
+
+test("guard-core loads no pi-durable (it runs inside every lets-code child)", () => {
+  for (const f of ["../src/providers/durable/lc/guard-core.mjs", "../src/providers/durable/guard.mjs"]) {
+    assert.doesNotMatch(readFileSync(new URL(f, import.meta.url), "utf8"), /from "@earendil-works\//, f);
+  }
+});

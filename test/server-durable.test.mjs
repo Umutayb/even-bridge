@@ -49,6 +49,36 @@ test("durable options come from the env; CWDS is colon-separated", () => {
   );
 });
 
+test("lc options only with EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1", () => {
+  const on = { EVEN_BRIDGE_DURABLE_ENABLE: "1" };
+  assert.equal(durableOptions(on).lc, undefined, "engine flag unset: no lc key at all");
+  assert.equal(durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "0" }).lc, undefined);
+  assert.equal(durableOptions({ EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1" }), null, "needs durable");
+  assert.deepEqual(
+    durableOptions({
+      ...on,
+      EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1",
+      EVEN_BRIDGE_LC_BIN: "/opt/lc/lets-code",
+      EVEN_BRIDGE_PI_BIN: "/home/ay/.local/bin/pi-inference",
+      EVEN_BRIDGE_LC_MEMORY_MAX: "700M",
+      EVEN_BRIDGE_LC_MAX_LIVE: "2",
+      EVEN_BRIDGE_LC_SANDBOX: "0",
+    }).lc,
+    { bin: "/opt/lc/lets-code", caps: { memoryMax: "700M", cpuQuota: "200%" }, maxLive: 2, sandbox: false },
+  );
+  assert.deepEqual(durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1" }).lc, {
+    bin: "lets-code",
+    caps: { memoryMax: "500M", cpuQuota: "200%" },
+    maxLive: 1,
+    sandbox: true,
+  });
+  assert.equal(
+    durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1", EVEN_BRIDGE_PI_BIN: "/home/ay/.local/bin/lets-code" }).lc.bin,
+    "/home/ay/.local/bin/lets-code",
+  );
+  assert.equal(durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1", EVEN_BRIDGE_LC_MAX_LIVE: "x" }).lc.maxLive, 1, "a bad number keeps the default");
+});
+
 test("cwdAllowed: strictly below a root, never ~ or /, ~ roots expand", (t) => {
   const home = mkdtempSync(join(tmpdir(), "durable-home-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -177,9 +207,33 @@ test("server, flag on: durable=on after ready, the default cwd is <root>/glasses
   assert.deepEqual(await r.json(), { agents: [] });
   const { code, out } = await s.stop();
   assert.equal(code, 0);
-  assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none)/);
+  assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=off/);
+  assert.doesNotMatch(out, /LOADED-DURABLE .*\/lc\//, "flag off loads no lc module");
   assert.doesNotMatch(out, /default cwd .* is not under EVEN_BRIDGE_DURABLE_CWDS/);
   assert.match(out, /\[bridge\] durable store closed/);
+});
+
+test("server, lets-code engine on: the banner says lc=on(...) and GET /api/agents still answers", async (t) => {
+  const s = await startChild(t, (home) => {
+    mkdirSync(join(home, "x", "y"), { recursive: true });
+    writeFileSync(join(home, "models.json"), JSON.stringify(fakeModelsJson("http://127.0.0.1:9/v1")));
+    return {
+      EVEN_BRIDGE_DURABLE_ENABLE: "1",
+      EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1",
+      EVEN_BRIDGE_LC_SANDBOX: "0",
+      EVEN_BRIDGE_LC_BIN: join(home, "no-such-lets-code"),
+      EVEN_BRIDGE_DURABLE_STORE: join(home, "durable.sqlite"),
+      EVEN_BRIDGE_DURABLE_MODELS: join(home, "models.json"),
+      EVEN_BRIDGE_DURABLE_CWDS: "~/x",
+    };
+  });
+  const r = await fetch(`${s.base}/api/agents`, authed);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { agents: [] });
+  const { code, out } = await s.stop();
+  assert.equal(code, 0);
+  assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=on\(nosandbox,(?:mem|nomem)\)/);
+  assert.match(out, /LOADED-DURABLE .*\/lc\/engine\.mjs/);
 });
 
 test("server, flag on: warns when the default cwd is outside the roots", async (t) => {

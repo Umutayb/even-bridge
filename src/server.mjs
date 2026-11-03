@@ -74,7 +74,26 @@ export function durableOptions(env = process.env) {
   };
   if (env.EVEN_BRIDGE_DURABLE_STORE) opts.storePath = env.EVEN_BRIDGE_DURABLE_STORE;
   if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
+  const lc = lcOptions(env);
+  if (lc) opts.lc = lc;
   return opts;
+}
+
+/**
+ * The lets-code engine of durable sessions (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1), or null.
+ * The bin defaults to the pi provider's (the live bridge runs lets-code directly); MemoryMax
+ * applies only where the kernel has a memory controller; at most EVEN_BRIDGE_LC_MAX_LIVE
+ * children at once (default 1); EVEN_BRIDGE_LC_SANDBOX=0 drops lets-code's sandbox (tests only).
+ */
+export function lcOptions(env = process.env) {
+  if (String(env.EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE ?? "").trim() !== "1") return null;
+  const n = Number(env.EVEN_BRIDGE_LC_MAX_LIVE || 1);
+  return {
+    bin: env.EVEN_BRIDGE_LC_BIN || env.EVEN_BRIDGE_PI_BIN || "lets-code",
+    caps: { memoryMax: env.EVEN_BRIDGE_LC_MEMORY_MAX || "500M", cpuQuota: "200%" },
+    maxLive: Number.isInteger(n) && n >= 1 ? n : 1,
+    sandbox: env.EVEN_BRIDGE_LC_SANDBOX !== "0",
+  };
 }
 
 /** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
@@ -163,7 +182,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
       p = createDurableProvider(emit, { hub, ...durableOpts });
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
-      durableState = `on wrapper=${p.wrapper ?? "none"}`;
+      durableState = `on wrapper=${p.wrapper ?? "none"} lc=${p.lcBanner ?? "off"}`;
     } catch (err) {
       durableState = `failed: ${err.message}`;
       p?.stopAll().catch(() => {});
