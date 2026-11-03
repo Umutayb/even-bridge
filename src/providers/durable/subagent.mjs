@@ -9,14 +9,17 @@
 //     ownership index and resubmits with the same `requestId`, which Durable
 //     dedupes, so the task is never sent twice;
 //   - the child starts as a copy of the parent's agent (model, cwd, maxTurns,
-//     extensions); it gets the agent file's body as instructions, its tool
-//     list, its thinking level, and loses this extension (no grandchildren).
+//     extensions); it gets lets-code's header plus the agent's prompt as
+//     instructions (always set, never the parent's), its tool list (an empty
+//     match falls back to `read`), its thinking level, and loses this
+//     extension (no grandchildren).
 //     The guard extension is NOT removed: children are vetted like parents.
 //     The guard finds a child's cwd through `onChild` (the caller records the
 //     child → parent edge; see provider.mjs).
 //   - the wait is bounded by the agent file's `timeout` (seconds, default
 //     `defaultTimeoutS`); on timeout the child is aborted and the model gets a
-//     timeout note as an error result.
+//     timeout note as an error result;
+//   - the answer returned is the LAST 4000 characters of the child's answer.
 
 import { configure, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { withAbortSignal } from "@earendil-works/chord/context";
@@ -55,7 +58,11 @@ const textOf = (content) => {
   return content.filter((b) => b?.type === "text").map((b) => b.text ?? "").join("\n");
 };
 
-const cap = (s) => (s.length > OUTPUT_CAP ? `${s.slice(0, OUTPUT_CAP)}\n[… output truncated at ${OUTPUT_CAP} characters]` : s);
+/** The LAST `OUTPUT_CAP` characters (agents end with their summary), with a leading note when cut. */
+export const cap = (s) => (s.length > OUTPUT_CAP ? `[… first ${s.length - OUTPUT_CAP} characters truncated]\n${s.slice(-OUTPUT_CAP)}` : s);
+
+/** lets-code's child prompt header (runAgent's prompt.md), then the agent's own prompt. */
+export const instructionsFor = (def) => `You are the "${def.name}" agent. ${def.description ?? ""}\n\n${def.prompt ?? def.body ?? ""}`.trim();
 
 function describe(agents) {
   const lines = [...agents.values()].map((a) => `- ${a.name}${a.description ? ` — ${a.description}` : ""}`);
@@ -73,13 +80,18 @@ function describe(agents) {
  * is offered (the agent file's tool names are matched against them; names the
  * harness does not have, such as lets-code's grep/find/ls, are dropped).
  */
-export function childChange(def, offered, self) {
-  const change = { extensions: { remove: [self] } };
-  if (def.body) change.instructions = def.body;
+export function childChange(def, offered, self, log) {
+  // Always set: an unset field would inherit the parent's (Even AI) instructions.
+  const change = { extensions: { remove: [self] }, instructions: instructionsFor(def) };
   if (def.tools || def.disallowed) {
-    let tools = offered.filter((t) => t.name !== SUBAGENT_TOOL);
+    const usable = offered.filter((t) => t.name !== SUBAGENT_TOOL);
+    let tools = usable;
     if (def.tools) tools = tools.filter((t) => def.tools.includes(t.name));
     if (def.disallowed) tools = tools.filter((t) => !def.disallowed.includes(t.name));
+    if (tools.length === 0) {
+      tools = usable.filter((t) => t.name === "read");
+      log?.warn?.(`[durable] agent ${def.name}: its tool list matches no available tool; falling back to read`);
+    }
     change.tools = tools;
   }
   let level = def.thinking;
@@ -93,11 +105,12 @@ export function childChange(def, offered, self) {
  * @param {Map<string, object>} o.agents from loadAgentFiles()
  * @param {string[]|null} [o.allowed] agent names offered (null = every loaded agent); others are unknown
  * @param {number} [o.defaultTimeoutS] wait bound when the agent file names none
+ * @param {{ warn?: Function }} [o.log]
  * @param {(edge: {childId: unknown, parentId: unknown, agent: string, role?: string}) => void} [o.onChild]
  *   called before the child runs (also on a rerun that reuses it), so the guard can map the child to
  *   its parent's cwd and apply the agent file's `role` (e.g. `readonly`).
  */
-export function createSubagentExtension({ agents: loaded = new Map(), allowed = null, defaultTimeoutS = 900, onChild } = {}) {
+export function createSubagentExtension({ agents: loaded = new Map(), allowed = null, defaultTimeoutS = 900, onChild, log } = {}) {
   const agents = allowed ? new Map([...loaded].filter(([name]) => allowed.includes(name))) : loaded;
   let self;
   const subagent = defineTool({
@@ -112,7 +125,7 @@ export function createSubagentExtension({ agents: loaded = new Map(), allowed = 
         return { isError: true, output: text(`Unknown agent ${JSON.stringify(args.agent)}. Available agents: ${names}.`) };
       }
       const offered = def.tools || def.disallowed ? (await api.agent(context)).tools : [];
-      const change = childChange(def, offered, self);
+      const change = childChange(def, offered, self, log);
       const childId = await api.commit(async (tx) => {
         // The ownership index remembers the child, so a rerun reuses it.
         const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];

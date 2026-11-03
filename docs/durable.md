@@ -45,6 +45,7 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_DURABLE_STORE` | `~/.even-terminal/durable.sqlite` | Durable store; the session map is `<store>.sessions.sqlite` |
 | `EVEN_BRIDGE_DURABLE_MODELS` | `~/.pi/agent/models.json` | models file |
 | `EVEN_BRIDGE_DURABLE_CWDS` | `~/sandbox/agents` | colon-separated roots; a new agent's cwd must lie strictly below one |
+| `EVEN_BRIDGE_DURABLE_AGENTS` | `scout,general,worker,reviewer,researcher,tester` | comma-separated lets-code agents (`~/.pi/agent/agents/*.md`) the `subagent` tool offers. Agent files and this list are read **once at bridge start**; edits apply after a restart |
 | `BWRAP` | off | `1` runs agent bash under `bwrap` when installed (it is not on borealis) |
 | `LETS_CODE_TOKEN` | — | vLLM key (`$LETS_CODE_TOKEN` in models.json); the live unit sets it in `even-bridge.service.d/pi-lets-code.conf` |
 
@@ -91,6 +92,19 @@ interpreter is refused). `/tmp` is writable by every agent, including anything
 else that lives there. Real isolation needs `bwrap` (not installed on
 borealis); `systemd-run` only caps memory and CPU. Child conversations
 (subagents) must map to their parent's cwd.
+
+## Subagents
+
+Every durable conversation has a `subagent` tool that runs one of the allowed
+lets-code agents (`EVEN_BRIDGE_DURABLE_AGENTS`) as an owned child conversation
+in the same cwd, behind the same guard (`role: readonly` agents may not
+write). The child gets lets-code's header (`You are the "<name>" agent.
+<description>`) plus the file's body and its `append_prompt` file (resolved
+inside `~/.pi/agent`) as instructions; an agent with neither is not offered.
+The wait is bounded by the file's `timeout` (`N`, `Ns`, `Nm`, `Nh`; default
+900 s); the parent gets the last 4000 characters of the child's answer.
+Agent files are read **once at bridge start**: restart the bridge to pick
+up edits.
 
 ## Restart and resume
 

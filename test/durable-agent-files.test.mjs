@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadAgentFiles, parseAgentFile } from "../src/providers/durable/agent-files.mjs";
+import { loadAgentFiles, parseAgentFile, parseTimeout } from "../src/providers/durable/agent-files.mjs";
 
 let dir;
 before(() => {
@@ -58,6 +58,7 @@ test("loader parses the scout fixture: name, description, tools, role, body", ()
   assert.deepEqual(scout.tools, ["read", "grep", "find", "ls", "bash"]);
   assert.equal(scout.role, "readonly");
   assert.equal(scout.body, "Investigate quickly and report for an agent that has not seen the files.\n\nOutput:\n## Files");
+  assert.equal(scout.prompt, scout.body);
   assert.equal(scout.thinking, undefined);
   assert.equal(scout.timeout, undefined);
   assert.equal(scout.disallowed, undefined);
@@ -81,7 +82,43 @@ test("name defaults to the file name; quotes, brackets, CRLF, thinking, timeout 
   assert.equal(w.timeout, 1800);
   assert.equal(w.body, "Complete the assigned task.");
   assert.deepEqual(w.extra, { use_for: "changes", brief: "" });
-  assert.equal(parseAgentFile("---\ntimeout: soon\n---\nb", "/a/t.md").timeout, undefined);
+  const warned = [];
+  assert.equal(parseAgentFile("---\ntimeout: soon\n---\nb", "/a/t.md", { log: { warn: (l) => warned.push(l) } }).timeout, undefined);
+  assert.match(warned.join("\n"), /agent t: timeout "soon" is not seconds/);
+  assert.equal(parseAgentFile("---\ntimeout: 30m\n---\nb", "/a/t.md").timeout, 1800);
+  assert.deepEqual(["900", "45s", "30m", "2h", "0", "-5", "1d", ""].map(parseTimeout), [900, 45, 1800, 7200, NaN, NaN, NaN, undefined]);
+});
+
+test("append_prompt (live lets-code style) is read from the agent home and appended; unusable agents are left out", () => {
+  const home = mkdtempSync(join(tmpdir(), "dur-agent-home-"));
+  try {
+    const agents = join(home, "agents");
+    mkdirSync(join(home, "ah-app"), { recursive: true });
+    mkdirSync(agents);
+    writeFileSync(join(home, "ah-app", "prompt.md"), "Drive the AH app through the device farm.\n");
+    writeFileSync(join(home, "outside.md"), "x");
+    const fm = (name, extra) => `---\n# Written by lets-code (${name}); regenerated on launch, edits are overwritten.\nname: ${name}\ndescription: ${name} agent\n${extra}\ntimeout: 3600\n---\n`;
+    writeFileSync(join(agents, "ah-app.md"), fm("ah-app", "append_prompt: ah-app/prompt.md"));
+    writeFileSync(join(agents, "both.md"), fm("both", "append_prompt: ah-app/prompt.md") + "Own body first.\n");
+    writeFileSync(join(agents, "missing.md"), fm("missing", "append_prompt: missing/prompt.md"));
+    writeFileSync(join(agents, "escape.md"), fm("escape", "append_prompt: ../../etc/passwd"));
+    writeFileSync(join(agents, "empty.md"), fm("empty", "role: readonly"));
+    const warned = [];
+    const map = loadAgentFiles(agents, { log: { warn: (l) => warned.push(l) } });
+    assert.deepEqual([...map.keys()].sort(), ["ah-app", "both"]);
+    const ah = map.get("ah-app");
+    assert.equal(ah.body, "");
+    assert.equal(ah.prompt, "Drive the AH app through the device farm.");
+    assert.equal(ah.extra.append_prompt, "ah-app/prompt.md");
+    assert.equal(ah.timeout, 3600);
+    assert.equal(map.get("both").prompt, "Own body first.\n\nDrive the AH app through the device farm.");
+    const log = warned.join("\n");
+    assert.match(log, /agent missing: append_prompt missing\/prompt.md unreadable/);
+    assert.match(log, /agent escape: append_prompt \.\.\/\.\.\/etc\/passwd leaves/);
+    for (const n of ["missing", "escape", "empty"]) assert.match(log, new RegExp(`agent ${n}: no instructions .*not offered`));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("a missing directory gives an empty map", () => {

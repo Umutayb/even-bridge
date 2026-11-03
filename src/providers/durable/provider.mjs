@@ -51,6 +51,7 @@ const REATTACH = { baseMs: 1000, maxMs: 30_000, maxTries: 8 };
 export const DEFAULT_AGENT_ROOT = "~/sandbox/agents";
 const HISTORY_WINDOW = 200; // entries a history read / seed looks at
 const RESUME_WINDOW_S = 7 * 86400; // rows seen longer ago are not re-attached on open
+const MAX_CHILD_EDGES = 2000; // in-memory child → parent edges kept (oldest dropped first)
 
 export const AGENT_INSTRUCTIONS =
   "You are an autonomous coding agent started from smart glasses. Work in the given directory only. " +
@@ -157,9 +158,11 @@ function parseMaxTurns(v) {
  * @param {object} [o.guard] extra options for createGuardExtension (tests: `{ wrapper: "none" }`).
  * @param {object} [o.settings] extra HarnessSettings.
  * @param {number} [o.historyWindow] entries history/seed reads look at.
- * @param {string} [o.agentsDir] lets-code agent files the `subagent` tool offers.
+ * @param {string} [o.agentsDir] lets-code agent files the `subagent` tool offers. Read ONCE here, at
+ *   provider start: edits to agent files (and EVEN_BRIDGE_DURABLE_AGENTS) apply at the next bridge start.
  * @param {Map<string, object>} [o.agents] ready agent definitions instead of `agentsDir` (tests).
  * @param {object} [o.subagent] extra options for createSubagentExtension (e.g. `defaultTimeoutS`).
+ * @param {number} [o.maxChildEdges] subagent child edges kept in memory (oldest dropped first).
  * @param {string[]|null} [o.allowedAgents] agents the subagent tool offers (default: EVEN_BRIDGE_DURABLE_AGENTS or the
  *   built-in list; null = every loaded agent).
  * @param {{baseMs?: number, maxMs?: number, maxTries?: number}} [o.reattach] backoff for re-attaching a watch that died mid-run.
@@ -183,6 +186,7 @@ export function createDurableProvider(
     agentsDir = "~/.pi/agent/agents",
     agents,
     subagent = {},
+    maxChildEdges = MAX_CHILD_EDGES,
     allowedAgents = allowedAgentsFrom(env),
     reattach = {},
     pruneEveryMs = PRUNE_EVERY_MS,
@@ -210,6 +214,18 @@ export function createDurableProvider(
     }
     return undefined;
   };
+  /** Remember a child edge in memory, oldest edges dropped beyond MAX_CHILD_EDGES. */
+  const noteEdge = (childId, parentId, role) => {
+    childParents.delete(childId); // re-insert: newest last
+    childParents.set(childId, parentId);
+    if (role) childRoles.set(childId, role);
+    else childRoles.delete(childId);
+    while (childParents.size > maxChildEdges) {
+      const oldest = childParents.keys().next().value;
+      childParents.delete(oldest);
+      childRoles.delete(oldest);
+    }
+  };
   const readonlyOf = (conversationId) => childRoles.get(conversationId) === "readonly";
   /** The session row whose conversation (directly or through children) owns `conversationId`. */
   const rootRowOf = (conversationId) => {
@@ -226,11 +242,10 @@ export function createDurableProvider(
   const subagentExt = createSubagentExtension({
     agents: agents ?? loadAgentFiles(agentsDir, { log }),
     allowed: allowedAgents,
+    log,
     ...subagent,
     onChild: ({ childId, parentId, role }) => {
-      childParents.set(childId, parentId);
-      if (role) childRoles.set(childId, role);
-      else childRoles.delete(childId);
+      noteEdge(childId, parentId, role);
       const parentRow = rootRowOf(parentId);
       if (parentRow) map.noteChild(childId, parentRow.sid, role ?? null);
       else log.warn?.(`[durable] subagent child ${childId}: parent conversation ${parentId} has no session; not persisted`);
@@ -242,13 +257,18 @@ export function createDurableProvider(
   registry.install(subagentExt); // children keep the guard and drop this one
   const EXTENSIONS = [CodingTools, guardExt, subagentExt];
 
-  /** Rebuild the child → parent / role maps from the session map (on open, before resume). */
+  /**
+   * Rebuild the child → parent / role maps from the session map (on open, before
+   * resume). Only children of live rows seen within the resume window: older
+   * parents are not resumed (their busy runs are aborted), so a stray tool call
+   * of such a child finds no cwd and is blocked.
+   */
   function loadChildren() {
+    const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
     for (const c of map.children()) {
       const parent = map.get(c.parent_sid);
-      if (parent?.conversation_id == null) continue;
-      childParents.set(c.child_id, parent.conversation_id);
-      if (c.role) childRoles.set(c.child_id, c.role);
+      if (parent?.conversation_id == null || parent.archived || parent.last_seen < since) continue;
+      noteEdge(c.child_id, parent.conversation_id, c.role);
     }
   }
   // Defense in depth: the guard's `prepare` already rebuilds the bash env from
@@ -829,6 +849,8 @@ export function createDurableProvider(
     },
     _live: live,
     _childParents: childParents,
+    _childRoles: childRoles,
+    _noteEdge: noteEdge,
     _childRoles: childRoles,
     _clientCounts: clientCounts,
     _lastLines: lastLines,

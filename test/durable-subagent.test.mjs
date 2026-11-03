@@ -4,9 +4,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSy
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
-import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, defineTool, LiveDoc } from "@earendil-works/pi-durable";
+import { SessionMap } from "../src/providers/durable/sessions.mjs";
 import { createDurableProvider } from "../src/providers/durable/provider.mjs";
-import { createSubagentExtension, childChange, OUTPUT_CAP, allowedAgentsFrom } from "../src/providers/durable/subagent.mjs";
+import { createSubagentExtension, childChange, OUTPUT_CAP, allowedAgentsFrom, cap, instructionsFor } from "../src/providers/durable/subagent.mjs";
 import { openDurable } from "../src/providers/durable/harness.mjs";
 import { loadPiModels } from "../src/providers/durable/models.mjs";
 import { startFakeOpenAI, fakeModelsJson } from "./helpers/fake-openai.mjs";
@@ -105,7 +106,7 @@ test("subagent runs a child in the parent's cwd, behind the guard, and returns i
   assert.equal(agent.cwd, work);
   assert.ok(agent.extensions.some((e) => e.name === "even-guard"));
   assert.ok(!agent.extensions.some((e) => e.name === "even-subagent"));
-  assert.equal(agent.instructions, SCOUT_BODY);
+  assert.equal(agent.instructions, `You are the "scout" agent. Fast read-only recon\n\n${SCOUT_BODY}`);
   await provider.stopAll();
 });
 
@@ -151,8 +152,20 @@ test("a child that exceeds its timeout is aborted and returns a timeout note", a
   await child.waitForIdle(ctx);
   const page = await child.entries({}, 50, undefined, ctx);
   assert.ok(!page.items.some((e) => e.kind === "pi.assistant" && contentText(e.model?.[0]?.content).includes("ok:")), "the child never answered");
+  // Actually aborted: the child's run failed with "aborted" and its input is unanswered.
+  await assertAborted(provider, childId);
   await provider.stopAll();
 });
+
+/** The child's last run failed as aborted and its input submission ended unanswered. */
+async function assertAborted(provider, childId) {
+  const { ctx } = await provider.ready;
+  const lv = await provider._harness.snapshot(LiveDoc, childId, ctx);
+  assert.equal(lv?.run, undefined, "no run left");
+  assert.equal(lv?.runFailure?.reason, "aborted", JSON.stringify(lv));
+  const sub = await provider._harness.submission(lv.runFailure.inputs.at(-1), ctx);
+  assert.equal((await sub.status(ctx)).status, "unanswered");
+}
 
 test("a second call in the same task reuses the child and its submission", async () => {
   // A wrapper tool runs the subagent tool's execute twice with ITS api (same task id),
@@ -204,17 +217,25 @@ test("a second call in the same task reuses the child and its submission", async
 test("childChange maps the agent file onto the child's agent", () => {
   const self = { name: "even-subagent" };
   const offered = [{ name: "read" }, { name: "write" }, { name: "edit" }, { name: "bash" }, { name: "subagent" }];
-  assert.deepEqual(childChange({ body: "B", tools: ["read", "grep", "bash"], thinking: "max" }, offered, self), {
+  const H = (name, desc, prompt) => `You are the "${name}" agent. ${desc}\n\n${prompt}`;
+  assert.deepEqual(childChange({ name: "a", description: "D", body: "B", prompt: "B", tools: ["read", "grep", "bash"], thinking: "max" }, offered, self), {
     extensions: { remove: [self] },
-    instructions: "B",
+    instructions: H("a", "D", "B"),
     tools: [{ name: "read" }, { name: "bash" }],
     thinkingLevel: "xhigh",
   });
-  assert.deepEqual(childChange({ body: "", disallowed: ["write"], thinking: "bogus" }, offered, self), {
+  // `prompt` (body + append_prompt) wins over the bare body; instructions are always set.
+  assert.deepEqual(childChange({ name: "b", description: "D", body: "", prompt: "from file", disallowed: ["write"], thinking: "bogus" }, offered, self), {
     extensions: { remove: [self] },
+    instructions: H("b", "D", "from file"),
     tools: [{ name: "read" }, { name: "edit" }, { name: "bash" }],
   });
-  assert.deepEqual(childChange({ body: "x" }, [], self), { extensions: { remove: [self] }, instructions: "x" });
+  assert.deepEqual(childChange({ name: "c", description: "D", body: "x" }, [], self), { extensions: { remove: [self] }, instructions: H("c", "D", "x") });
+  // A tool list that matches nothing falls back to read, with a warning.
+  const warned = [];
+  assert.deepEqual(childChange({ name: "d", description: "D", body: "x", tools: ["grep", "ls"] }, offered, self, { warn: (l) => warned.push(l) }).tools, [{ name: "read" }]);
+  assert.match(warned.join("\n"), /agent d: .*falling back to read/);
+  assert.equal(instructionsFor({ name: "e", description: "", prompt: "p" }), 'You are the "e" agent. \n\np'.trim());
   assert.equal(OUTPUT_CAP, 4000);
 });
 
@@ -233,6 +254,78 @@ test("after a reopen the child -> parent edges come back from the session map", 
   await again.ready;
   assert.deepEqual([...again._childParents], edges);
   await again.stopAll();
+  // A parent last seen outside the resume window: its children are not loaded.
+  const m = new SessionMap(opts.storePath);
+  m.db.prepare("UPDATE sessions SET last_seen = 0").run();
+  m.close();
+  const stale = setup(opts).provider;
+  await stale.ready;
+  assert.equal(stale._childParents.size, 0);
+  await stale.stopAll();
+});
+
+test("the in-memory child edges are bounded, oldest dropped first", async () => {
+  const { provider } = setup({ maxChildEdges: 2 });
+  provider._noteEdge(1, 10);
+  provider._noteEdge(2, 10);
+  provider._noteEdge(3, 10, "readonly");
+  assert.deepEqual([...provider._childParents.keys()], [2, 3]);
+  provider._noteEdge(2, 10); // touched: now the newest
+  provider._noteEdge(4, 10);
+  assert.deepEqual([...provider._childParents.keys()], [2, 4]);
+  assert.equal(provider._childRoles.has(3), false);
+  await provider.stopAll();
+});
+
+test("a long child answer keeps its LAST 4000 characters", async () => {
+  const { provider, frames } = setup();
+  const from = fake.requests.length;
+  const task = `HEAD-${"x".repeat(5000)}-TAIL-END`;
+  const { sessionId } = await provider.prompt(undefined, subagentCall("general", task), undefined, {});
+  await until(() => idle(frames, sessionId));
+  const answer = `ok: ${task}`;
+  const result = toolResults(from).find((t) => t.includes("TAIL-END"));
+  assert.ok(result, JSON.stringify(toolResults(from)).slice(0, 300));
+  assert.equal(result, `[… first ${answer.length - OUTPUT_CAP} characters truncated]\n${answer.slice(-OUTPUT_CAP)}`);
+  assert.ok(!result.includes("HEAD-"));
+  assert.equal(cap("short"), "short");
+  await provider.stopAll();
+});
+
+test("aborting the parent while the child runs aborts the child (no tool answer is made up)", async () => {
+  const { provider, frames } = setup();
+  const base = fake.calls;
+  const { sessionId } = await provider.prompt(undefined, subagentCall("general", "work slowly"), undefined, {});
+  await fake.waitForCalls(base + 1);
+  fake.hold();
+  await fake.waitForCalls(base + 2); // the child's request is held
+  const parentConv = provider._map.get(sessionId).conversation_id;
+  const childId = [...provider._childParents].find(([, p]) => p === parentConv)?.[0];
+  assert.notEqual(childId, undefined);
+  provider.interrupt(sessionId);
+  await until(() => idle(frames, sessionId));
+  fake.release();
+  await assertAborted(provider, childId);
+  const { ctx } = await provider.ready;
+  const lv = await provider._harness.snapshot(LiveDoc, parentConv, ctx);
+  assert.equal(lv?.runFailure?.reason, "aborted");
+  const parent = await provider._harness.conversation(parentConv, ctx);
+  const entries = JSON.stringify((await parent.entries({}, 50, undefined, ctx)).items);
+  assert.doesNotMatch(entries, /did not finish within|ended without an answer|ok: work slowly/);
+  assert.equal(fake.calls, base + 2, "nothing asked the model after the abort");
+  await provider.stopAll();
+});
+
+test("a child whose run fails returns an 'ended without an answer' error result", async () => {
+  // maxTurns 1 (inherited by the child): the child's tool round reaches the limit, its run ends unanswered.
+  const { provider, frames } = setup();
+  const { sessionId } = await provider.prompt(undefined, subagentCall("general", 'TOOL bash {"command":"echo hi"}'), undefined, { maxTurns: 1 });
+  await until(() => idle(frames, sessionId));
+  const { ctx } = await provider.ready;
+  const parent = await provider._harness.conversation(provider._map.get(sessionId).conversation_id, ctx);
+  const entries = JSON.stringify((await parent.entries({}, 50, undefined, ctx)).items);
+  assert.match(entries, /The general agent ended without an answer \(turn_limit\)/);
+  await provider.stopAll();
 });
 
 // ───────────────────────────── fix round 2
