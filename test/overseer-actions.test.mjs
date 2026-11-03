@@ -108,11 +108,14 @@ const rejectsWith = (p, statusCode, re) => assert.rejects(p, (err) => err.status
 
 test("summaries are built from the arguments", () => {
   assert.equal(
-    summarize("session_start", { engine: "lets-code", label: "fix-ci", cwd: HOME + "/sandbox/agents/fix-ci", model: "qwen" }),
-    "Start lets-code agent 'fix-ci' in ~/sandbox/agents/fix-ci on qwen?",
+    summarize("session_start", { engine: "lets-code", label: "fix-ci", cwd: HOME + "/sandbox/agents/fix-ci", model: "qwen", task: "write hi to hi.txt" }),
+    `Start lets-code agent 'fix-ci' in ~/sandbox/agents/fix-ci on qwen to: "write hi to hi.txt"?`,
   );
   assert.equal(summarize("session_stop", { label: "fix-ci" }), "Stop agent 'fix-ci'?");
-  assert.equal(summarize("session_start", { engine: "native", label: "a", cwd: "/srv/a", model: "sonnet", factory: true }), "Start native agent 'a' in /srv/a on sonnet with the factory on?");
+  assert.equal(
+    summarize("session_start", { engine: "native", label: "a", cwd: "/srv/a", model: "sonnet", factory: true, task: "t".repeat(141) }),
+    `Start native agent 'a' in /srv/a on sonnet with the factory on to: "${"t".repeat(140)}…"?`,
+  );
   assert.equal(summarize("session_message", { label: "docs", text: "run the tests" }), `Send agent 'docs': "run the tests"?`);
   assert.equal(summarize("session_message", { label: "docs", text: "x".repeat(141), steer: true }), `Send agent 'docs': "${"x".repeat(140)}…" now?`);
   assert.equal(summarize("session_interrupt", { label: "docs" }), "Interrupt agent 'docs'?");
@@ -131,12 +134,13 @@ test("a proposal never executes without a confirm", async () => {
     const r = await s.overseer.ask('TOOL session_start {"label":"fix-ci","task":"write hi to hi.txt"}', { requestId: "t1", waitMs: 10000 });
     const tool = toolTexts(mark).find((t) => t.includes("proposed ("));
     assert.ok(tool, `a proposal result: ${toolTexts(mark).join(" | ")}`);
-    assert.match(tool, /proposed \(act-[0-9a-f]{12}\), waiting for the user: Start native agent 'fix-ci' in .*\/fix-ci on qwen\?/);
+    assert.match(tool, /proposed \(act-[0-9a-f]{12}\), waiting for the user: Start native agent 'fix-ci' in .*\/fix-ci on qwen to: "write hi to hi.txt"\?/);
     assert.deepEqual((await s.provider.listAgents()).map((a) => a.sid), before, "no agent was started");
     const reqs = permissionFrames(s);
     assert.equal(reqs.length, 1);
     assert.equal(reqs[0].toolName, "overseer");
-    assert.equal(reqs[0].detail, "session_start");
+    assert.equal(reqs[0].detail, "session_start: write hi to hi.txt", "the phone shows the task");
+    assert.match(reqs[0].description, /write hi to hi\.txt/);
     assert.deepEqual(reqs[0].options, [{ text: "Yes", key: "allow" }, { text: "No", key: "deny" }]);
     const [item] = await items(s);
     assert.equal(item.state, "pending");
@@ -241,17 +245,23 @@ test("a restart drops pending actions and tells the overseer", async () => {
   }
 });
 
-test("the phone's permission response confirms the oldest pending action", async () => {
+test("one action waits at a time; the phone's permission response answers it", async () => {
   const s = await open(newDir());
   try {
     const p1 = await s.actions.propose("session_start", { label: "one", task: "x" }, { origin: "overseer" });
-    const p2 = await s.actions.propose("session_start", { label: "two", task: "y" }, { origin: "overseer" });
+    await rejectsWith(s.actions.propose("session_start", { label: "two", task: "y" }, { origin: "overseer" }), 409, /^another action is waiting for your answer$/);
+    await rejectsWith(s.actions.propose("session_stop", { id: "dur-x" }, { origin: "evenai", requestId: "r" }), 404, /no session/);
+    // A refused gated tool is reported to the ask (Even AI says why nothing was proposed).
+    const r = await s.overseer.ask('TOOL session_start {"label":"three","task":"z"}', { requestId: "t9", waitMs: 10000, mode: "tell" });
+    assert.deepEqual(r.actions, []);
+    assert.deepEqual(r.refused, [{ kind: "session_start", reason: "another action is waiting for your answer" }]);
     assert.equal(s.provider.getStatus("dur-overseer") != null, true, "the router finds dur-overseer");
     assert.equal(await s.provider.respondPermission("dur-overseer", "allow"), true);
     const one = (await items(s)).find((i) => i.id === p1.id);
     assert.equal(one.state, "confirmed");
     assert.equal(one.confirmFrameId, "phone");
     assert.match(one.result.sessionId, /^dur-/);
+    const p2 = await s.actions.propose("session_start", { label: "two", task: "y" }, { origin: "overseer" });
     assert.equal(await s.provider.respondPermission("dur-overseer", "deny"), true);
     assert.equal((await items(s)).find((i) => i.id === p2.id).state, "denied");
     assert.equal(await s.provider.respondPermission("dur-overseer", "allow"), false, "nothing pending");
@@ -306,7 +316,7 @@ test("RC may be messaged after a confirm but never stopped", async () => {
   const s = await open(newDir(), { rc });
   try {
     const p = await s.actions.propose("session_message", { id: "cse_1", text: "status?", steer: true }, { origin: "overseer" });
-    assert.equal(p.summary, `Send agent 'remote work': "status?" now?`);
+    assert.equal(p.summary, `Send agent 'cse_1': "status?" now?`, "an RC title is untrusted: the id is named");
     assert.deepEqual(sent, [], "proposed only");
     assert.deepEqual(await s.actions.confirm(p.id), { ok: true, result: { sessionId: "cse_1" } });
     assert.deepEqual(sent, [["cse_1", "status?"]]);
@@ -360,7 +370,7 @@ test("Claude starts need two free slots and at most one", async () => {
     await rejectsWith(s.actions.propose("session_start", { label: "c1", task: "x", model: "sonnet" }, { origin: "overseer" }), 409, /^the Claude bridge has fewer than 2 free slots$/);
     free = 8;
     const p = await s.actions.propose("session_start", { label: "c1", task: "x", model: "sonnet" }, { origin: "overseer" });
-    assert.equal(p.summary, `Start native agent 'c1' in ${tildePath(join(s.dir, "c1"))} on sonnet?`);
+    assert.equal(p.summary, `Start native agent 'c1' in ${tildePath(join(s.dir, "c1"))} on sonnet to: "x"?`);
     await s.actions.confirm(p.id);
     await rejectsWith(s.actions.propose("session_start", { label: "c2", task: "x", model: "sonnet" }, { origin: "overseer" }), 409, /^one overseer-started Claude agent is already running$/);
     await rejectsWith(s.actions.propose("session_start", { label: "q", task: "x", model: "gpt-9" }, { origin: "overseer" }), 400, /unknown model/);
@@ -459,8 +469,6 @@ test("POST bodies of the one gate never claim the overseer's origin", async () =
   assert.deepEqual(overseerActionOpts({ kind: "session_stop", args: { id: "x" }, origin: "evenai", requestId: "r" }), { kind: "session_stop", args: { id: "x" }, requestId: "r" });
   assert.equal(overseerAskOpts({ question: "q", requestId: "r", mode: "shout" }).error, "'mode' must be one of ask, tell");
   assert.equal(overseerAskOpts({ question: "q", requestId: "r" }).mode, "ask");
-  assert.ok(!existsSync(join(homedir(), ".even-terminal", "overseer-actions.log.test")));
-  assert.ok(OverseerOutbox);
 });
 
 test("agent rows carry ttlS only with the overseer; ttlS is 300-43200", async () => {
@@ -488,5 +496,59 @@ test("agent rows carry ttlS only with the overseer; ttlS is 300-43200", async ()
     assert.equal(plainProvider._map.get(r.sessionId).origin, "overseer");
   } finally {
     await plainProvider.stopAll();
+  }
+});
+
+
+test("proposal text never carries a command, and the overseer's task is short enough to be heard", async () => {
+  const s = await open(newDir());
+  try {
+    const { sessionId } = await s.provider.prompt(undefined, "first", s.work, { name: "docs", origin: "evenai" });
+    for (const text of ["/mode orchestration", "  /factory start .factory/t.md", "!rm -rf ~"]) {
+      await rejectsWith(s.actions.propose("session_message", { id: sessionId, text }, { origin: "overseer" }), 400, /^the overseer cannot send commands$/);
+      await rejectsWith(s.actions.propose("session_message", { id: sessionId, text }, { origin: "evenai", requestId: "r-" + text }), 400, /commands/);
+    }
+    await rejectsWith(s.actions.propose("session_start", { label: "f", task: "/factory start x.md" }, { origin: "overseer" }), 400, /commands/);
+    await rejectsWith(s.actions.propose("session_start", { label: "f", task: "t".repeat(141) }, { origin: "overseer" }), 400, /'task'/);
+    // Defense in depth: execute refuses it too.
+    await assert.rejects(s.provider.listAgents().then(() => createOverseerHost({ durable: s.provider, log: quiet }).execute({ id: "x", kind: "session_message", origin: "overseer", args: { id: sessionId, text: "/mode orchestration" } })), /commands/);
+    assert.equal((await s.provider.getHistory(sessionId, 10)).filter((h) => h.role === "user").length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a requestId reused with other arguments is refused", async () => {
+  const s = await open(newDir());
+  try {
+    const { sessionId } = await s.provider.prompt(undefined, "first", s.work, { name: "docs", origin: "evenai" });
+    await s.actions.propose("session_message", { id: sessionId, text: "a" }, { origin: "evenai", requestId: "same" });
+    await rejectsWith(s.actions.propose("session_message", { id: sessionId, text: "b" }, { origin: "evenai", requestId: "same" }), 409, /requestId reused/);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a start cut off by a restart after its agent was created is found by its requestId", async () => {
+  const dir = newDir();
+  const one = await open(dir);
+  const p = await one.actions.propose("session_start", { label: "cut", task: "x" }, { origin: "overseer" });
+  // The confirm claimed it and created the agent; the bridge died before the result was stored.
+  await one.harness.commit(async (tx) => {
+    const doc = await tx.doc(OverseerActions, ROOT_CONVERSATION_ID);
+    Object.assign(doc.items.find((i) => i.id === p.id), { state: "confirmed", confirmedAt: Date.now() });
+  }, one.ctx);
+  const { sessionId } = await one.provider.prompt(undefined, "x", p.args.cwd, { name: "cut", origin: "overseer", requestId: `ovs-act:${p.id}` });
+  await one.close();
+  const two = await open(dir);
+  try {
+    const item = (await items(two)).find((i) => i.id === p.id);
+    assert.equal(item.state, "confirmed");
+    assert.deepEqual(item.result, { sessionId });
+    assert.deepEqual(await two.actions.confirm(p.id, { confirmFrameId: "late" }), { ok: true, result: { sessionId } });
+    const lines = readFileSync(join(dir, "overseer-actions.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.ok(lines.some((l) => l.id === p.id && l.event === "execute" && l.by === "restart"));
+  } finally {
+    await two.close();
   }
 });

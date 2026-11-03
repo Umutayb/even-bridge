@@ -143,6 +143,7 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
           const p = await actions.propose(name, args, { origin: "overseer", submissions: run?.inputs ?? [] });
           return ok(`proposed (${p.id}), waiting for the user: ${p.summary}`);
         } catch (err) {
+          actions.noteRefusal?.(run?.inputs ?? [], name, err.message ?? err);
           return fail(String(err.message ?? err));
         }
       },
@@ -153,7 +154,7 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
     "Propose starting a new coding agent (a durable session) in its own folder under ~/sandbox/agents." + PROPOSE,
     {
       label: { type: "string", maxLength: 24, description: "short name: letters, digits, '-', '_', '.' or space" },
-      task: { type: "string", maxLength: 2000, description: "what the agent should do, in the user's words" },
+      task: { type: "string", maxLength: 140, description: "what the agent should do, in the user's words (at most 140 characters, no commands)" },
       cwd: { type: "string", description: "leave it out: the agent gets ~/sandbox/agents/<label>" },
       engine: { type: "string", enum: ["native", "lets-code"], description: "leave it out (lets-code when this computer has it)" },
       model: { type: "string", description: "only when the user names one (default qwen)" },

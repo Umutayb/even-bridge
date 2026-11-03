@@ -304,7 +304,7 @@ test("server, overseer on: dur-overseer is listed, /api/overseer answers, the ag
   assert.deepEqual(await r.json(), { status: "pending", requestId: "ovs-1", actions: [] }, "the actions it proposed (none)");
   r = await fetch(`${s.base}/api/overseer/actions?state=pending`, authed);
   assert.deepEqual(await r.json(), { actions: [] });
-  r = await fetch(`${s.base}/api/overseer/actions/act-nope/confirm`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: "{}" });
+  r = await fetch(`${s.base}/api/overseer/actions/act-nope/confirm`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ confirmFrameId: "f" }) });
   assert.equal(r.status, 404);
   r = await fetch(`${s.base}/api/agents`, authed);
   assert.deepEqual(await r.json(), { agents: [], overseer: true }, "advertised; the overseer is not an agent (the reaper never sees it)");

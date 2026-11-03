@@ -1218,6 +1218,13 @@ export function createDurableProvider(
       return checkAgentCwd(cwd, { allowedCwds: roots, forbidden });
     },
 
+    /** The live session a new-session requestId created, or null (a restart-cut overseer start is found by it). */
+    sidForRequest(requestId) {
+      const sid = map.sidForRequest(requestId);
+      const row = sid ? map.get(sid) : null;
+      return row && !row.archived ? sid : null;
+    },
+
     /** Is `name` a model alias or provider/model this bridge can run? */
     hasModel(name) {
       try {

@@ -227,7 +227,10 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
       const r = await askOnce(question, opts);
       if (!actions || r.submissionId == null) return r.out;
       // The actions the overseer proposed while working on it (Even AI speaks their summaries).
-      return { ...r.out, actions: (await actions.forSubmission(r.submissionId)).map(({ id, kind, summary, expiresAt, args }) => ({ id, kind, summary, expiresAt, args })) };
+      const out = { ...r.out, actions: (await actions.forSubmission(r.submissionId)).map(({ id, kind, summary, expiresAt, args }) => ({ id, kind, summary, expiresAt, args })) };
+      const refused = actions.refusedFor?.(r.submissionId) ?? [];
+      if (refused.length) out.refused = refused; // why the overseer proposed nothing (Even AI says it)
+      return out;
     },
 
     /** Resolves when the ask with `requestId` has settled (answered or not). */

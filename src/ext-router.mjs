@@ -127,6 +127,7 @@ export function factoryOpts({ on, ticket, howToRun } = {}) {
 export const OVERSEER_LIMITS = Object.freeze({ questionMax: 2000, requestIdMax: 128, waitMsMax: 15000 });
 
 export const OVERSEER_ASK_MODES = Object.freeze(["ask", "tell"]);
+export const ACTION_BY = Object.freeze(["evenai", "http"]);
 
 /** Validate an overseer ask body: `{ question, requestId, waitMs, mode }` or `{ error }`. */
 export function overseerAskOpts({ question, requestId, waitMs, mode } = {}) {
@@ -581,6 +582,11 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
   // Gated actions (src/overseer/actions.mjs). Only a confirm executes; the phone answers through
   // /api/permission-response on dur-overseer instead.
   const actionsOf = () => overseer?.actions ?? null;
+  /** Who answered over HTTP, for the audit: the shim says evenai; any other bearer holder is "http". */
+  const actionBy = (body) => {
+    const by = body?.by ?? "http";
+    return ACTION_BY.includes(by) ? by : null;
+  };
 
   router.get("/overseer/actions", async (req, res, next) => {
     const a = actionsOf();
@@ -609,11 +615,14 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     const a = actionsOf();
     if (!a) return next();
     const confirmFrameId = req.body?.confirmFrameId;
-    if (confirmFrameId != null && (typeof confirmFrameId !== "string" || confirmFrameId.length > 128)) {
-      return res.status(400).json({ error: "'confirmFrameId' must be a string of at most 128 characters" });
+    // The confirm names the frame the user's yes answered (spec): required.
+    if (typeof confirmFrameId !== "string" || confirmFrameId.length < 1 || confirmFrameId.length > 128) {
+      return res.status(400).json({ error: "'confirmFrameId' must be a string of 1-128 characters" });
     }
+    const by = actionBy(req.body);
+    if (!by) return res.status(400).json({ error: `'by' must be one of ${ACTION_BY.join(", ")}` });
     try {
-      res.json(await a.confirm(req.params.id, { confirmFrameId, by: "evenai" }));
+      res.json(await a.confirm(req.params.id, { confirmFrameId, by }));
     } catch (err) {
       fail(res, err);
     }
@@ -622,8 +631,10 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
   router.post("/overseer/actions/:id/deny", async (req, res, next) => {
     const a = actionsOf();
     if (!a) return next();
+    const by = actionBy(req.body);
+    if (!by) return res.status(400).json({ error: `'by' must be one of ${ACTION_BY.join(", ")}` });
     try {
-      res.json(await a.deny(req.params.id, { by: "evenai" }));
+      res.json(await a.deny(req.params.id, { by }));
     } catch (err) {
       fail(res, err);
     }

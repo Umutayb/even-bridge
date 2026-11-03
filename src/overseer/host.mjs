@@ -142,7 +142,9 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       const kind = await kindOf(id);
       if (!kind) return null;
       const driver = await driverOf(id);
-      const label = await safe(`${kind} title ${id}`, () => titleOf(kind, id), "");
+      // The label a summary names: a bridge agent's own name; pi, cc-local and RC titles come from the
+      // sessions' text (untrusted), so those are named by their id.
+      const label = kind === "durable" ? await safe(`${kind} title ${id}`, () => titleOf(kind, id), "") : "";
       return { kind, driver, label: label || id };
     },
 
@@ -154,6 +156,10 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     async execute(action) {
       const { id, kind, args, origin } = action;
       const requestId = "ovs-act:" + id;
+      // Defense in depth (actions.mjs refuses it at propose): proposal text never starts a command.
+      for (const t of [args?.task, args?.text]) {
+        if (typeof t === "string" && /^\s*[\/!]/.test(t)) throw Object.assign(new Error("the overseer cannot send commands"), { statusCode: 400 });
+      }
       if (kind === "session_start") {
         const opts = { engine: args.engine, name: args.label, model: args.model, origin: origin === "evenai" ? "evenai" : "overseer", requestId, ttlS: args.ttlS };
         if (args.maxTurns != null) opts.maxTurns = args.maxTurns;

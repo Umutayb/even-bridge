@@ -309,7 +309,7 @@ async function actionsSmoke() {
   const p3 = await api("POST", "/overseer/actions", { kind: "session_stop", args: { id: sid }, origin: "evenai", requestId: randomUUID() });
   const deny = await api("POST", "/permission-response", { sessionId: "dur-overseer", decision: "deny" });
   if (deny.status !== 200) fail(`permission-response ${deny.status}: ${JSON.stringify(deny.json)}`);
-  const after = await api("POST", `/overseer/actions/${p3.json.id}/confirm`, {});
+  const after = await api("POST", `/overseer/actions/${p3.json.id}/confirm`, { confirmFrameId: "smoke-after-no" });
   if (after.status !== 409) fail(`confirm after the phone's no answered ${after.status}`);
   say(`phone deny: ${p3.json.id} denied (confirm then 409 ${after.json.error})`);
   if ((await api("GET", "/agents")).json.agents.length !== 1) fail("the denied stop ran");

@@ -37,7 +37,15 @@ export const CLAUDE_ALIASES = Object.freeze(["haiku", "sonnet", "opus", "fable"]
 /** Text of a message the overseer proposes: the summary shows 140 characters, so nothing is hidden past them. */
 export const OVERSEER_TEXT_MAX = 140;
 export const EVENAI_TEXT_MAX = 2000;
-export const TASK_MAX = 2000;
+/** A task the overseer proposes: shown in full in the summary the user confirms. */
+export const OVERSEER_TASK_MAX = 140;
+export const TASK_MAX = 400;
+/** What the summary shows of a task (Even AI's one gate may send up to TASK_MAX). */
+export const SUMMARY_TASK_MAX = 140;
+/** Proposal text never starts a command (lets-code reads "/mode", "/factory", "!cmd" from the prompt RPC). */
+export const COMMAND_RE = /^\s*[\/!]/;
+export const NO_COMMANDS = "the overseer cannot send commands";
+export const ONE_PENDING = "another action is waiting for your answer";
 export const QUESTION_MAX = 2000;
 export const LABEL_MAX = 24;
 const LABEL_RE = /^[\w .-]+$/;
@@ -79,7 +87,9 @@ export function summarize(kind, args = {}) {
   switch (kind) {
     case "session_start": {
       const engineWord = args.engine === "lets-code" ? "lets-code" : "native";
-      return `Start ${engineWord} agent '${args.label}' in ${tildePath(args.cwd)} on ${args.model}${args.factory ? " with the factory on" : ""}?`;
+      const task = String(args.task ?? "");
+      const what = `${task.slice(0, SUMMARY_TASK_MAX)}${task.length > SUMMARY_TASK_MAX ? "…" : ""}`;
+      return `Start ${engineWord} agent '${args.label}' in ${tildePath(args.cwd)} on ${args.model}${args.factory ? " with the factory on" : ""} to: "${what}"?`;
     }
     case "session_message": {
       const text = String(args.text ?? "");
@@ -172,6 +182,8 @@ export function createOverseerActions({
   let closed = false;
   const startedAt = now();
   const audit = createAuditLog(auditPath, { log });
+  /** submissionId → refusals of gated tools in that submission's run ({kind, reason}); newest 50 kept. */
+  const refusals = new Map();
   /** id → in-flight confirm (concurrent confirms share it). */
   const inflight = new Map();
 
@@ -222,7 +234,8 @@ export function createOverseerActions({
     if (kind === "session_start") {
       const label = strArg(args.label, "label", { max: LABEL_MAX });
       if (!LABEL_RE.test(label)) throw httpError(400, "'label' may hold letters, digits, space, '_', '.' or '-'");
-      const task = strArg(args.task, "task", { max: TASK_MAX });
+      const task = strArg(args.task, "task", { max: origin === "overseer" ? OVERSEER_TASK_MAX : TASK_MAX });
+      if (COMMAND_RE.test(task)) throw httpError(400, NO_COMMANDS);
       const engines = Array.isArray(durable.engines) ? durable.engines : ["native"];
       const engine = args.engine ?? (engines.includes("lets-code") ? "lets-code" : "native");
       if (!engines.includes(engine)) throw httpError(400, `the ${oneLine(engine, 20)} engine is not available`);
@@ -259,6 +272,7 @@ export function createOverseerActions({
     const label = oneLine(d.label || id, 40).replace(/'/g, "’");
     if (kind === "session_message") {
       const text = strArg(args.text, "text", { max: origin === "overseer" ? OVERSEER_TEXT_MAX : EVENAI_TEXT_MAX });
+      if (COMMAND_RE.test(text)) throw httpError(400, NO_COMMANDS);
       const steer = args.steer == null ? false : args.steer;
       if (typeof steer !== "boolean") throw httpError(400, "'steer' must be true or false");
       return { id, label, text, steer };
@@ -294,11 +308,19 @@ export function createOverseerActions({
     await ready;
     if (!ACTION_KINDS.includes(kind)) throw httpError(400, `'kind' must be one of ${ACTION_KINDS.join(", ")}`);
     if (!ACTION_ORIGINS.includes(origin)) throw httpError(400, `invalid origin ${JSON.stringify(origin)}`);
-    if (requestId != null) {
-      const same = (await snapshot()).items.find((i) => i.requestId === requestId && i.origin === origin);
-      if (same && (same.state === "pending" || same.state === "confirmed")) return view(same);
-    }
     const args = await checkArgs(kind, rawArgs, origin);
+    const items = (await snapshot()).items;
+    if (requestId != null) {
+      const same = items.find((i) => i.requestId === requestId && i.origin === origin);
+      if (same && (same.state === "pending" || same.state === "confirmed")) {
+        // A retry is the same action only with the same arguments.
+        if (same.kind !== kind || JSON.stringify(same.args) !== JSON.stringify(args)) throw httpError(409, "requestId reused for another action");
+        return view(same);
+      }
+    }
+    // One question at a time: the phone's answer (it carries no id) and the spoken yes always mean this one.
+    const t0 = now();
+    if (items.some((i) => i.state === "pending" && i.expiresAt >= t0)) throw httpError(409, ONE_PENDING);
     await checkLimits(kind, args);
     const t = now();
     const item = {
@@ -324,7 +346,7 @@ export function createOverseerActions({
       type: "permission_request",
       toolName: "overseer",
       description: item.summary,
-      detail: kind,
+      detail: kind === "session_start" ? `${kind}: ${args.task}` : kind === "session_message" ? `${kind}: ${args.text}` : kind,
       toolUseId: item.id,
       options: [
         { text: "Yes", key: "allow" },
@@ -467,6 +489,16 @@ export function createOverseerActions({
     return true;
   }
 
+  /** A gated tool's proposal was refused: remembered for the submissions of its run (the ask reply's `refused`). */
+  function noteRefusal(submissions, kind, reason) {
+    for (const s of submissions ?? []) {
+      const k = String(s);
+      refusals.set(k, [...(refusals.get(k) ?? []), { kind, reason: String(reason).slice(0, 200) }].slice(-5));
+      while (refusals.size > 50) refusals.delete(refusals.keys().next().value);
+    }
+  }
+  const refusedFor = (submissionId) => (submissionId == null ? [] : (refusals.get(String(submissionId)) ?? []));
+
   /** Actions proposed while the given submissions were running (POST /api/overseer/ask's `actions`). */
   async function forSubmission(submissionId) {
     if (submissionId == null) return [];
@@ -475,6 +507,8 @@ export function createOverseerActions({
   }
 
   // ── model switch: one question with another model, reverted when it settles ──
+  // Known limit (v1): an input that joins the switched run (whenBusy followUp) also runs on that model;
+  // the switch is refused while the root is busy, so only inputs arriving during the switched run do.
   async function modelSwitch(item) {
     if (!overseer) throw httpError(503, "the overseer is not running");
     if (await durable.overseerBusy()) throw httpError(409, "the overseer is busy; ask again when it is idle");
@@ -506,21 +540,29 @@ export function createOverseerActions({
     harness = d.harness;
     ctx = d.ctx;
     // A restart drops what was pending, and an execution it cut off is reported as failed.
-    const { dropped, cut } = await commit((doc) => {
-      const out = { dropped: [], cut: [] };
+    const { dropped, cut, found } = await commit((doc) => {
+      const out = { dropped: [], cut: [], found: [] };
       for (const i of doc.items) {
         if (i.createdAt >= startedAt) continue; // proposed by this process (a resumed run)
         if (i.state === "pending") {
           i.state = "expired";
           out.dropped.push(plain(i));
         } else if (i.state === "confirmed" && !("result" in i)) {
-          Object.assign(i, { state: "failed", error: { statusCode: 500, message: "the bridge restarted while it ran" } });
-          out.cut.push(plain(i));
+          // A start the restart cut off may have created its agent: found by its requestId, it is done.
+          const sid = i.kind === "session_start" ? durable.sidForRequest?.(`ovs-act:${i.id}`) : null;
+          if (sid) {
+            i.result = { sessionId: sid };
+            out.found.push(plain(i));
+          } else {
+            Object.assign(i, { state: "failed", error: { statusCode: 500, message: "the bridge restarted while it ran" } });
+            out.cut.push(plain(i));
+          }
         }
       }
       return out;
     });
     for (const i of dropped) note("expire", i, "restart");
+    for (const i of found) note("execute", i, "restart");
     for (const i of cut) audit.write({ event: "fail", id: i.id, kind: i.kind, origin: i.origin, summary: i.summary, by: "restart" });
     const n = dropped.length;
     if (n) {
@@ -556,6 +598,8 @@ export function createOverseerActions({
     pending,
     respond,
     forSubmission,
+    noteRefusal,
+    refusedFor,
     sweep,
     auditPath: audit.path,
     bindOverseer(o) {
