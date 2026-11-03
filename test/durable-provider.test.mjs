@@ -5,7 +5,7 @@ import { SessionMap } from "../src/providers/durable/sessions.mjs";
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
-import { createDurableProvider, resolveAgentCwd, AGENT_INSTRUCTIONS, DEFAULT_MAX_TURNS } from "../src/providers/durable/provider.mjs";
+import { createDurableProvider, resolveAgentCwd, forbiddenDirs, usableRoots, BRIDGE_ROOT, AGENT_INSTRUCTIONS, DEFAULT_MAX_TURNS } from "../src/providers/durable/provider.mjs";
 import { getOwner } from "../src/ownership.mjs";
 import { startFakeOpenAI, fakeModelsJson } from "./helpers/fake-openai.mjs";
 
@@ -718,10 +718,105 @@ test("a restart only re-attaches rows seen within the last 7 days", async () => 
   assert.equal(two.provider.getStatus(a.sessionId).state, "busy");
   await two.provider.ready;
   assert.equal(two.provider._live.has(a.sessionId), false);
-  // The stale run was aborted rather than left running unwatched.
+  // The stale run was abort-marked BEFORE resume: it never asked the model again.
   const rec = await settled(two.provider, a.submissionId);
   assert.equal(rec.status, "unanswered");
   assert.equal(rec.reason, "aborted");
+  assert.equal(fake.calls - base, 1, "only the first provider's (held) request; none after the restart");
   assert.equal(two.provider.getStatus(a.sessionId).state, "idle");
   await two.provider.stopAll();
+});
+
+// ───────────────────────────── final review
+
+test("scopes: named per session, stale ones stopped before resume and at shutdown", async () => {
+  const calls = [];
+  const { provider } = setup({ guard: { wrapper: "systemd-run", log: () => {} }, scopeRunner: (argv) => (calls.push(argv.join(" ")), { status: 0 }) });
+  await provider.ready;
+  assert.equal(provider.wrapper, "systemd-run");
+  assert.deepEqual(calls, ["systemctl --user stop even-durable-*.scope"], "stopped before resume");
+  const sid = provider._map.create({ name: "u", cwd: "/w", modelRef: { provider: "fake", modelId: "fake-model" }, origin: "phone" });
+  provider._map.setConversation(sid, 4242);
+  assert.equal(provider._unitOf(4242), `even-durable-${sid}-1`);
+  assert.equal(provider._unitOf(4242), `even-durable-${sid}-2`);
+  assert.equal(provider._unitOf(9999), "even-durable-unknown-3");
+  await provider.stopAll();
+  assert.deepEqual(calls, ["systemctl --user stop even-durable-*.scope", "systemctl --user stop even-durable-*.scope"]);
+});
+
+test("the wrapper is probed once with the tools' env and falls back to none", async () => {
+  const seen = [];
+  const warns = [];
+  const { provider } = setup({
+    guard: { log: () => {} }, // no wrapper given: detect + probe
+    env: { ...process.env, PATH: "/usr/bin:/bin", XDG_RUNTIME_DIR: "" },
+    log: { warn: (l) => warns.push(l), error() {}, log() {} },
+    scopeRunner: (argv, o) => (seen.push({ argv: argv.join(" "), xdg: o.env.XDG_RUNTIME_DIR }), { status: 1 }),
+  });
+  await provider.ready;
+  if (seen.length) {
+    // systemd-run exists here: probed once, failed, fell back.
+    assert.equal(seen.filter((c) => c.argv === "systemd-run --user --scope -q true").length, 1);
+    assert.equal(provider.wrapper, "none");
+    assert.ok(warns.some((l) => /WITHOUT memory\/CPU caps/.test(l)));
+  } else assert.equal(provider.wrapper, "none");
+  await provider.stopAll();
+});
+
+test("cwds inside or containing the bridge, tool trees or PATH dirs are refused; such roots are dropped", async () => {
+  const r = realpathSync(mkdtempSync(join(tmpdir(), "dur-forbid-")));
+  const home = join(r, "home");
+  const bin = join(home, "agents", "tools", "bin");
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(join(home, "agents", "ok"), { recursive: true });
+  const forbidden = forbiddenDirs({ home, env: { PATH: `${bin}:/usr/bin:relative/bin` }, bridgeRoot: join(home, "agents", "bridge") });
+  assert.ok(forbidden.includes(join(home, ".nvm")) && forbidden.includes(join(home, ".local")) && forbidden.includes(join(home, ".pi")) && forbidden.includes(join(home, ".even-terminal")));
+  assert.ok(forbidden.includes(bin) && forbidden.includes("/usr/bin") && !forbidden.some((f) => f.includes("relative")));
+  const roots = [join(home, "agents")];
+  assert.equal(resolveAgentCwd(join(home, "agents", "ok"), { allowedCwds: roots, home, forbidden }), join(home, "agents", "ok"));
+  assert.throws(() => resolveAgentCwd(join(home, "agents", "tools"), { allowedCwds: roots, home, forbidden }), (e) => e.statusCode === 400 && /contains/.test(e.message));
+  assert.throws(() => resolveAgentCwd(join(bin, "x"), { allowedCwds: roots, home, forbidden }), (e) => e.statusCode === 400 && /is inside/.test(e.message));
+  assert.throws(() => resolveAgentCwd(join(home, "agents", "bridge", "src"), { allowedCwds: roots, home, forbidden }), (e) => e.statusCode === 400);
+  // Roots: one covering a forbidden dir is dropped with a warning; none usable → every agent refused.
+  const warns = [];
+  assert.deepEqual(usableRoots([join(home, "agents"), join(home, "agents", "ok")], { home, forbidden, warn: (l) => warns.push(l) }), [join(home, "agents", "ok")]);
+  assert.match(warns[0], /agent root .* is refused: it contains/);
+  assert.equal(usableRoots([join(home, ".nvm", "x")], { home, forbidden, warn: () => {} }), null);
+  assert.throws(() => resolveAgentCwd(join(home, "agents", "ok"), { allowedCwds: null, home, forbidden }), (e) => e.statusCode === 400 && /No usable agent root/.test(e.message));
+  // The real defaults cover the bridge checkout and PATH.
+  const real = forbiddenDirs();
+  assert.ok(real.includes(realpathSync(BRIDGE_ROOT)));
+  rmSync(r, { recursive: true, force: true });
+});
+
+test("a prompt without a cwd works in <first root>/glasses, created on demand", async () => {
+  const { provider, frames, dir } = setup({ defaultCwd: undefined });
+  assert.equal(provider.defaultCwd, join(dir, "glasses"));
+  const { sessionId } = await provider.prompt(undefined, "where am I", undefined, {});
+  await until(() => idleCount(frames, sessionId) === 1);
+  assert.equal(provider._map.get(sessionId).cwd, join(dir, "glasses"));
+  assert.ok(existsSync(join(dir, "glasses")));
+  await provider.stopAll();
+});
+
+test("startup prunes child rows of archived or out-of-window parents", async () => {
+  const { dir, work } = setup();
+  const storePath = join(dir, "kids.sqlite");
+  const m = new SessionMap(storePath);
+  const ref = { provider: "fake", modelId: "fake-model" };
+  const live = m.create({ name: "live", cwd: work, modelRef: ref, origin: "phone", conversationId: 1 });
+  const old = m.create({ name: "old", cwd: work, modelRef: ref, origin: "phone", conversationId: 2 });
+  const gone = m.create({ name: "gone", cwd: work, modelRef: ref, origin: "phone", conversationId: 3 });
+  m.db.prepare("UPDATE sessions SET last_seen = last_seen - ? WHERE sid = ?").run(8 * 86400, old);
+  m.archive(gone);
+  m.noteChild(11, live, null);
+  m.noteChild(12, old, null);
+  m.noteChild(13, gone, "readonly");
+  m.noteChild(14, "dur-missing", null);
+  m.close();
+  const { provider } = setup({ storage: undefined, storePath, allowedCwds: [dir], defaultCwd: work });
+  await provider.ready;
+  assert.deepEqual(provider._map.children().map((c) => c.child_id), [11]);
+  assert.deepEqual([...provider._childParents], [[11, 1]]);
+  await provider.stopAll();
 });

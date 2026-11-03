@@ -142,8 +142,9 @@ test("a child that exceeds its timeout is aborted and returns a timeout note", a
   const parentConv = provider._map.get(sessionId).conversation_id;
   const childId = [...provider._childParents].find(([, p]) => p === parentConv)?.[0];
   assert.notEqual(childId, undefined);
-  // The child is aborted at 0.3 s; let the parent's follow-up request through afterwards.
-  await new Promise((r) => setTimeout(r, 800));
+  // The child is aborted at 0.3 s (its held request is cancelled); the signal that it happened is the
+  // parent's follow-up request with the timeout note, which then needs to be let through.
+  await fake.waitForCalls(base + 3);
   fake.release();
   await until(() => idle(frames, sessionId));
   assert.ok(toolResults(from).some((t) => /did not finish within 0\.3 s and was stopped/.test(t)), JSON.stringify(toolResults(from)));

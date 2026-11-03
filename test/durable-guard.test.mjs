@@ -12,6 +12,10 @@ import {
   guardPrepare,
   createGuardExtension,
   shellQuote,
+  wrapperEnv,
+  probeWrapper,
+  scopeUnit,
+  stopScopes,
 } from "../src/providers/durable/guard.mjs";
 
 // A fake home and a workspace inside it, so nothing depends on the real ~.
@@ -605,4 +609,70 @@ test("readonly: writes, removals, git mutation and inline interpreter code are r
   assert.match(guardBeforeTool({ name: "edit", arguments: { path: "x" } }, o).block, /read-only agent: edit is refused/);
   assert.equal(guardBeforeTool({ name: "read", arguments: { path: "a/b" } }, o), undefined);
   s.done();
+});
+
+// ───────────────────────────── final review
+
+test("secrets: /proc/self/environ and cmdline, unit drop-ins, the env file and the user runtime dir are refused (read and write)", () => {
+  const s = sandbox();
+  for (const cmd of [
+    "cat /proc/self/environ", "cat /proc/self/cmdline", "tr '\\0' '\\n' < /proc/self/environ",
+    "cat /etc/systemd/system/even-bridge.service.d/pi-lets-code.conf", "grep -r TOKEN /etc/systemd",
+    "cat /etc/even-terminal.env", "ls /run/user/1000", "echo x > /run/user/1000/x",
+  ]) {
+    assert.ok(blocked(cmd, s), cmd);
+  }
+  for (const [tool, path] of [["read", "/etc/systemd/system/x.conf"], ["read", "/etc/even-terminal.env"], ["read", "/proc/self/environ"], ["write", "/run/user/1000/bus"]]) {
+    assert.ok(guardBeforeTool({ name: tool, arguments: { path } }, { cwd: s.cwd, home: s.home, tmp: s.tmp, log: () => {} })?.block, `${tool} ${path}`);
+  }
+  assert.equal(blocked("cat /proc/self/status", s), undefined);
+  assert.equal(blocked("cat /etc/hostname", s), undefined);
+  s.done();
+});
+
+test("host control: tmux, screen, ps with environments, bus tools and systemd-run are refused", () => {
+  const s = sandbox();
+  for (const cmd of ["tmux ls", "tmux send-keys -t 0 x", "screen -ls", "ps eww", "ps auxe", "ps aux e", "ps -E", "busctl --user list", "dbus-send --session x", "gdbus call --session", "loginctl list-sessions", "systemd-run --user true"]) {
+    assert.ok(blocked(cmd, s), cmd);
+  }
+  for (const cmd of ["ps aux", "ps -ef", "ps -C node", "ps -o pid,user"]) assert.equal(blocked(cmd, s), undefined, cmd);
+  s.done();
+});
+
+test("wrapperEnv defaults XDG_RUNTIME_DIR and the user bus only when unset and present", () => {
+  const exists = (p) => p === "/run/user/1000" || p === "/run/user/1000/bus";
+  assert.deepEqual(wrapperEnv({ PATH: "/usr/bin" }, { uid: 1000, exists }), {
+    PATH: "/usr/bin", XDG_RUNTIME_DIR: "/run/user/1000", DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+  });
+  assert.deepEqual(wrapperEnv({ XDG_RUNTIME_DIR: "/x", DBUS_SESSION_BUS_ADDRESS: "y" }, { uid: 1000, exists }), { XDG_RUNTIME_DIR: "/x", DBUS_SESSION_BUS_ADDRESS: "y" });
+  assert.deepEqual(wrapperEnv({}, { uid: 1001, exists }), {});
+});
+
+test("probeWrapper runs systemd-run --user --scope -q true once and falls back to none, loudly", () => {
+  const calls = [];
+  const warns = [];
+  const ok = (argv, o) => (calls.push({ argv, env: o.env }), { status: 0 });
+  assert.equal(probeWrapper("systemd-run", { env: { XDG_RUNTIME_DIR: "/run/user/1000" }, run: ok, warn: (l) => warns.push(l) }), "systemd-run");
+  assert.deepEqual(calls[0].argv, ["systemd-run", "--user", "--scope", "-q", "true"]);
+  assert.equal(calls[0].env.XDG_RUNTIME_DIR, "/run/user/1000");
+  assert.equal(warns.length, 0);
+  assert.equal(probeWrapper("systemd-run", { env: {}, run: () => ({ status: 1 }), warn: (l) => warns.push(l) }), "none");
+  assert.equal(probeWrapper("systemd-run", { env: {}, run: () => ({ status: null }), warn: (l) => warns.push(l) }), "none");
+  assert.equal(warns.length, 2);
+  assert.match(warns[0], /WARNING: 'systemd-run --user --scope' does not work here .*WITHOUT memory\/CPU caps/);
+  assert.equal(probeWrapper("none", { run: () => assert.fail("not probed") }), "none");
+  assert.equal(probeWrapper("bwrap", { run: () => assert.fail("not probed") }), "bwrap");
+});
+
+test("scopes: each bash call gets --unit=even-durable-<sid>-<n>; stopScopes stops the pattern and tolerates absence", () => {
+  assert.equal(scopeUnit("dur-1234-abcd", 3), "even-durable-dur-1234-abcd-3");
+  assert.equal(scopeUnit(undefined, 1), "even-durable-unknown-1");
+  assert.equal(scopeUnit("a b/c", 2), "even-durable-a_b_c-2");
+  const ex = { command: "echo hi", cwd: "/w", env: {}, inheritEnv: true };
+  guardPrepare(ex, { wrapper: "systemd-run", caps: { memoryMax: "600M", cpuQuota: "200%" }, unit: "even-durable-dur-1-1", baseEnv: {} });
+  assert.equal(ex.command, `systemd-run --user --scope -q --unit=even-durable-dur-1-1 -p MemoryMax=600M -p CPUQuota=200% -- bash -lc ${shellQuote("echo hi")}`);
+  const calls = [];
+  assert.equal(stopScopes({ env: { A: "1" }, run: (argv) => (calls.push(argv), { status: 5 }) }), false); // no units: not an error
+  assert.deepEqual(calls[0], ["systemctl", "--user", "stop", "even-durable-*.scope"]);
+  assert.equal(stopScopes({ run: () => ({ status: 0 }) }), true);
 });

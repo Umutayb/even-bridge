@@ -79,6 +79,9 @@ export class SessionMap {
       pruneRequests: this.db.prepare("DELETE FROM requests WHERE created_at < ?"),
       noteChild: this.db.prepare("INSERT INTO children (child_id, parent_sid, role) VALUES (?, ?, ?) ON CONFLICT(child_id) DO UPDATE SET parent_sid = excluded.parent_sid, role = excluded.role"),
       children: this.db.prepare("SELECT child_id, parent_sid, role FROM children"),
+      pruneChildren: this.db.prepare(
+        "DELETE FROM children WHERE parent_sid NOT IN (SELECT sid FROM sessions WHERE archived = 0 AND last_seen >= ?)",
+      ),
     };
     this.pruneRequests();
   }
@@ -147,6 +150,11 @@ export class SessionMap {
   /** Remember a subagent child conversation of `parentSid`, with its agent file's role. */
   noteChild(childId, parentSid, role = null) {
     this.stmt.noteChild.run(childId, parentSid, role ?? null);
+  }
+
+  /** Drop child rows whose parent is archived, gone, or not seen since `seenSince` (epoch s). @returns {number} */
+  pruneChildren(seenSince) {
+    return Number(this.stmt.pruneChildren.run(seenSince).changes);
   }
 
   /** Every recorded child: `{ child_id, parent_sid, role }`. */

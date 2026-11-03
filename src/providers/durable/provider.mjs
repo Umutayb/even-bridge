@@ -34,7 +34,8 @@ import { loadPiModels, thinkingLevelFor } from "./models.mjs";
 import { openDurable } from "./harness.mjs";
 import { SessionMap } from "./sessions.mjs";
 import { ViewTranslator } from "./wire.mjs";
-import { createGuardExtension, shellEnv as guardShellEnv } from "./guard.mjs";
+import { createGuardExtension, detectWrapper, probeWrapper, runSync, scopeUnit, shellEnv as guardShellEnv, stopScopes, wrapperEnv } from "./guard.mjs";
+import { fileURLToPath } from "node:url";
 import { loadAgentFiles } from "./agent-files.mjs";
 import { allowedAgentsFrom, createSubagentExtension } from "./subagent.mjs";
 
@@ -49,6 +50,10 @@ const PRUNE_EVERY_MS = 6 * 3600 * 1000;
 const REATTACH = { baseMs: 1000, maxMs: 30_000, maxTries: 8 };
 /** Where agents may work when no roots are configured: never "anywhere". */
 export const DEFAULT_AGENT_ROOT = "~/sandbox/agents";
+/** Where a prompt without a cwd works, below the first root (created on demand). */
+export const DEFAULT_CWD_NAME = "glasses";
+/** The bridge's own checkout: never an agent workspace (an agent could rewrite the bridge). */
+export const BRIDGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const HISTORY_WINDOW = 200; // entries a history read / seed looks at
 const RESUME_WINDOW_S = 7 * 86400; // rows seen longer ago are not re-attached on open
 const MAX_CHILD_EDGES = 2000; // in-memory child → parent edges kept (oldest dropped first)
@@ -109,23 +114,63 @@ function realish(abs) {
   return join(existsSync(base) ? realpathSync(base) : base, ...tail);
 }
 
+const within = (p, root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
+
+/**
+ * Directories an agent may neither work in nor contain: the bridge checkout,
+ * the tool and config trees agents must not rewrite, and every absolute PATH
+ * entry (a workspace there could plant a binary the bridge or the user runs).
+ */
+export function forbiddenDirs({ home = homedir(), env = process.env, bridgeRoot = BRIDGE_ROOT } = {}) {
+  const dirs = [bridgeRoot, ...[".local", ".nvm", ".even-terminal", ".pi"].map((d) => join(home, d))];
+  for (const d of String(env.PATH ?? "").split(":")) if (d.startsWith("/")) dirs.push(d);
+  return [...new Set(dirs.map((d) => realish(resolve(d))))];
+}
+
+/** The forbidden dir that `dir` sits inside or contains, if any. */
+function clash(dir, forbidden) {
+  return forbidden.find((f) => within(dir, f) || within(f, dir));
+}
+
+/**
+ * The roots agents may use: each configured root (or `[~/sandbox/agents]`) unless it sits inside or
+ * covers a forbidden dir; those are dropped with a warning. `null` = roots were configured but none
+ * is usable (every new agent is then refused).
+ */
+export function usableRoots(allowedCwds = [], { home = homedir(), forbidden = [], warn = (l) => console.warn(l) } = {}) {
+  const configured = allowedCwds.filter(Boolean);
+  const out = [];
+  for (const r of configured.length ? configured : [DEFAULT_AGENT_ROOT]) {
+    const real = realish(resolve(expandWith(r, home)));
+    const f = clash(real, forbidden);
+    if (f) warn(`[durable] agent root ${r} is refused: it ${within(real, f) ? "sits inside" : "contains"} ${f}`);
+    else out.push(r);
+  }
+  return out.length ? out : null;
+}
+
 /**
  * Where a new conversation may work. The cwd must lie strictly below one of
- * the roots (a bare root is refused); no roots configured = `[~/sandbox/agents]`.
- * `~` and `/` are always refused. Symlinks are resolved on the deepest existing
- * ancestor and checked BEFORE anything is created; a missing cwd below a root
- * is then created (e.g. `~/sandbox/agents/<label>`).
+ * the roots (a bare root is refused); no roots configured = `[~/sandbox/agents]`;
+ * `null` = no usable root (always 400). `~` and `/` are always refused, and so
+ * is any cwd inside or containing a `forbidden` dir. Symlinks are resolved on
+ * the deepest existing ancestor and checked BEFORE anything is created; a
+ * missing cwd below a root is then created (e.g. `~/sandbox/agents/<label>`).
  * @returns {string} the real path
  */
-export function resolveAgentCwd(want, { allowedCwds = [], home = homedir() } = {}) {
+export function resolveAgentCwd(want, { allowedCwds = [], home = homedir(), forbidden = [] } = {}) {
   if (!want) throw httpError(400, "No working directory given for the new agent");
+  if (allowedCwds === null) throw httpError(400, "No usable agent root is configured (see the bridge's startup warnings)");
   const configured = allowedCwds.filter(Boolean);
   const roots = (configured.length ? configured : [DEFAULT_AGENT_ROOT]).map((r) => realish(resolve(expandWith(r, home))));
   const realHome = realish(resolve(home));
+  const banned = forbidden.map((f) => realish(resolve(f)));
   const under = (p) => roots.some((r) => p.startsWith(r + sep));
   const check = (real) => {
     if (real === realHome || real === "/") throw httpError(400, `Refusing to run an agent in ${real}`);
     if (!under(real)) throw httpError(400, `Working directory ${real} is not under an allowed root (${roots.join(", ")})`);
+    const f = clash(real, banned);
+    if (f) throw httpError(400, `Working directory ${real} ${within(real, f) ? "is inside" : "contains"} ${f}, which agents may not use`);
   };
   const target = realish(resolve(expandWith(String(want), home)));
   check(target);
@@ -167,6 +212,8 @@ function parseMaxTurns(v) {
  *   built-in list; null = every loaded agent).
  * @param {{baseMs?: number, maxMs?: number, maxTries?: number}} [o.reattach] backoff for re-attaching a watch that died mid-run.
  * @param {number} [o.pruneEveryMs] how often stale requestId rows are pruned (default 6 h).
+ * @param {Function} [o.scopeRunner] runs systemd-run/systemctl argv synchronously (tests inject a fake).
+ * @param {string[]} [o.forbidden] dirs agents may not use (default forbiddenDirs()).
  */
 export function createDurableProvider(
   emitRaw,
@@ -190,9 +237,27 @@ export function createDurableProvider(
     allowedAgents = allowedAgentsFrom(env),
     reattach = {},
     pruneEveryMs = PRUNE_EVERY_MS,
+    scopeRunner = runSync,
+    forbidden = forbiddenDirs({ env }),
   } = {},
 ) {
   const backoff = { ...REATTACH, ...reattach };
+  // Roots covering the bridge, tool trees or PATH dirs are dropped (startup warning).
+  const roots = usableRoots(allowedCwds, { forbidden, warn: (l) => log.warn?.(l) });
+  defaultCwd ??= roots ? join(roots[0], DEFAULT_CWD_NAME) : undefined;
+  // Tools' environment: what systemd-run --user needs (XDG_RUNTIME_DIR, the user bus) even
+  // under a system unit, then the wrapper probed once with it.
+  const toolEnv = wrapperEnv(env);
+  const shellEnv = guardShellEnv({ PI_TELEMETRY: "0" }, toolEnv);
+  const wrapper = guard.wrapper ?? probeWrapper(detectWrapper({ env: toolEnv }), { env: shellEnv, run: scopeRunner, warn: (l) => (log.warn ?? console.warn)(l) });
+  const clearScopes = () => {
+    if (wrapper === "systemd-run") stopScopes({ env: shellEnv, run: scopeRunner });
+  };
+  let unitSeq = 0;
+  /** The scope of the next bash call: even-durable-<session id>-<n> (a child uses its root session's id). */
+  const unitOf = (conversationId) => scopeUnit(rootRowOf(conversationId)?.sid, ++unitSeq);
+  /** Conversations of runs being aborted at startup: no cwd, so the guard blocks their tools. */
+  const stale = new Set();
   const map = new SessionMap(storePath);
   const { models, refs, default: defaultRef } = loadPiModels(modelsPath, env);
   // Subagent children are owned conversations the sessions table does not know:
@@ -207,6 +272,7 @@ export function createDurableProvider(
   const cwdOf = (conversationId) => {
     let id = conversationId;
     for (let hops = 0; hops < 8; hops++) {
+      if (stale.has(id)) return undefined;
       const row = map.byConversation(id);
       if (row) return row.cwd;
       if (!childParents.has(id)) return undefined;
@@ -238,7 +304,14 @@ export function createDurableProvider(
     }
     return undefined;
   };
-  const guardExt = createGuardExtension({ cwdOf, readonlyOf, ...guard });
+  const guardExt = createGuardExtension({
+    cwdOf,
+    readonlyOf,
+    unitOf,
+    baseEnv: toolEnv,
+    ...guard,
+    wrapper,
+  });
   const subagentExt = createSubagentExtension({
     agents: agents ?? loadAgentFiles(agentsDir, { log }),
     allowed: allowedAgents,
@@ -272,8 +345,7 @@ export function createDurableProvider(
     }
   }
   // Defense in depth: the guard's `prepare` already rebuilds the bash env from
-  // its allowlist; the environment itself starts from that allowlist too.
-  const shellEnv = guardShellEnv({ PI_TELEMETRY: "0" }, env);
+  // its allowlist; the environment itself starts from that allowlist too (shellEnv above).
   const envFor = ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? defaultCwd ?? process.cwd(), shellEnv });
 
   /** sid → watcher { conv, watch, translator, view, pending, stopped, starting } */
@@ -306,42 +378,63 @@ export function createDurableProvider(
   const ready = (async () => {
     try {
       await opened;
-      // After a restart, before anything runs (openDurable did not resume):
-      // 1. the guard's child maps, so a resumed child's tool call resolves;
-      // 2. every live row's state from its stored `pi.live`, so getStatus never
-      //    says idle for a run the harness is about to continue.
-      loadChildren();
+      // After a restart, BEFORE anything runs (openDurable did not resume):
+      // 1. scopes left by the last process are stopped (they outlive the unit);
+      // 2. child edges of rows seen in the 7-day window (older ones pruned);
+      // 3. the live tasks (harness.inspect, no per-row reads): a task of a
+      //    recent row is a run to resume (busy + watcher); any other live task
+      //    (row older than 7 days, unknown conversation) is stale and is
+      //    abort-marked before resume, so its run phase never executes; until
+      //    the abort lands its conversation has no cwd, so the guard blocks it;
+      // 4. resume. Rows outside the window are not read and report idle.
+      clearScopes();
       const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
-      const recentBusy = [];
-      const staleBusy = [];
-      for (const row of map.rows()) {
+      map.pruneChildren(since);
+      loadChildren();
+      const recent = new Map(); // sid → row
+      for (const row of map.rows({ seenSince: since })) {
         if (row.conversation_id == null) continue;
-        try {
-          const lv = await durable.harness.snapshot(LiveDoc, row.conversation_id, durable.ctx);
-          if (lv?.run) {
-            states.set(row.sid, "busy");
-            (row.last_seen >= since ? recentBusy : staleBusy).push(row);
-          } else states.set(row.sid, "idle");
-        } catch (err) {
-          log.warn?.(`[durable] resume check for ${row.sid} failed: ${err.message}`);
+        states.set(row.sid, "idle");
+      }
+      const staleTasks = [];
+      const staleConvs = new Set();
+      const inspection = await durable.harness.inspect(durable.ctx);
+      for (const t of inspection.tasks) {
+        const convId = t.record.conversationId;
+        const row = rootRowOf(convId);
+        if (row && !row.archived && row.last_seen >= since) {
+          states.set(row.sid, "busy");
+          recent.set(row.sid, row);
+        } else {
+          staleTasks.push(t.record.id);
+          staleConvs.add(row?.conversation_id ?? convId);
+          stale.add(convId);
+          if (row) stale.add(row.conversation_id);
         }
       }
-      // 3. resume; re-attach a watcher to each recent busy run so its frames
-      //    reach the ring again, and abort runs nobody has looked at in 7 days.
+      for (const id of staleTasks) {
+        try {
+          await durable.harness.abortTask(id, durable.ctx);
+        } catch (err) {
+          log.warn?.(`[durable] abort of stale task ${id} failed: ${err.message}`);
+        }
+      }
+      if (staleConvs.size) log.warn?.(`[durable] aborting ${staleConvs.size} unfinished run(s) not seen for over 7 days`);
       durable.harness.resume();
-      for (const row of recentBusy) await ensureWatcher(row.sid).catch(() => {});
+      for (const sid of recent.keys()) await ensureWatcher(sid).catch(() => {});
       await Promise.all(
-        staleBusy.map(async (row) => {
+        [...staleConvs].map(async (id) => {
           try {
-            const conv = await durable.harness.conversation(row.conversation_id, durable.ctx);
-            log.warn?.(`[durable] aborting ${row.sid}: unfinished run last seen over 7 days ago`);
-            await conv?.abort(durable.ctx);
-            states.set(row.sid, "idle");
+            const conv = await durable.harness.conversation(id, durable.ctx);
+            await conv?.waitForIdle(durable.ctx);
           } catch (err) {
-            log.warn?.(`[durable] aborting stale ${row.sid} failed: ${err.message}`);
+            log.warn?.(`[durable] waiting for stale conversation ${id} failed: ${err.message}`);
+          } finally {
+            stale.delete(id);
           }
         }),
       );
+      for (const id of [...stale]) stale.delete(id);
       return durable;
     } finally {
       resumed = true;
@@ -529,7 +622,7 @@ export function createDurableProvider(
     if (origin !== "evenai" && origin !== "phone") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
-    const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds });
+    const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
     const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
@@ -581,6 +674,10 @@ export function createDurableProvider(
     name: NAME,
     wireProvider: WIRE_PROVIDER,
     ready,
+    /** "systemd-run" | "bwrap" | "none": what agent bash actually runs under (after the probe). */
+    wrapper,
+    /** cwd of a prompt that names none. */
+    defaultCwd,
 
     /** Sync ownership probe: a "dur-" id the session map knows. */
     probe(sessionId) {
@@ -840,6 +937,7 @@ export function createDurableProvider(
       }
       for (const sid of [...live.keys()]) stopWatcher(sid);
       await durable.close();
+      clearScopes(); // bash still running in a scope would outlive the bridge
       map.close();
     },
 
@@ -851,7 +949,7 @@ export function createDurableProvider(
     _childParents: childParents,
     _childRoles: childRoles,
     _noteEdge: noteEdge,
-    _childRoles: childRoles,
+    _unitOf: unitOf,
     _clientCounts: clientCounts,
     _lastLines: lastLines,
     _idleWaiters: idleWaiters,

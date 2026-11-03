@@ -43,7 +43,8 @@
 // - Child conversations (subagents) must map to their parent's cwd; `cwdOf`
 //   is the caller's responsibility.
 
-import { lstatSync, readlinkSync, accessSync, constants as FS } from "node:fs";
+import { lstatSync, readlinkSync, accessSync, existsSync, constants as FS } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
@@ -51,11 +52,13 @@ import { createBashTool } from "@earendil-works/pi-durable/tools";
 
 const TMP = "/tmp";
 const DENIED_IN_HOME = [".ssh", ".aws", ".config", ".even-terminal", ".pi", ".gnupg"];
-const DENIED_ABS = ["/etc/ssh", "/etc/ssl/private", "/etc/netplan", "/etc/wpa_supplicant", "/etc/NetworkManager"];
+// Read AND write: unit drop-ins hold tokens (`Environment=LETS_CODE_TOKEN=...`), the user bus is host control.
+const DENIED_ABS = ["/etc/ssh", "/etc/ssl/private", "/etc/netplan", "/etc/wpa_supplicant", "/etc/NetworkManager", "/etc/systemd", "/etc/even-terminal.env", "/run/user"];
 const DENIED_PREFIX = ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 const READ_SYSTEM = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/snap", "/etc"];
-// /proc: only named, harmless entries; never root, cwd, fd, exe, map_files (they lead anywhere).
-const PROC_SELF_OK = new Set(["status", "stat", "statm", "maps", "smaps", "smaps_rollup", "environ", "cmdline", "comm", "limits", "mountinfo", "mounts", "cgroup", "io", "sched", "oom_score", "loginuid", "sessionid", "uid_map", "gid_map", "wchan"]);
+// /proc: only named, harmless entries; never root, cwd, fd, exe, map_files (they lead anywhere),
+// nor environ/cmdline (a shell's own environ is filtered, but the names invite reading other pids').
+const PROC_SELF_OK = new Set(["status", "stat", "statm", "maps", "smaps", "smaps_rollup", "comm", "limits", "mountinfo", "mounts", "cgroup", "io", "sched", "oom_score", "loginuid", "sessionid", "uid_map", "gid_map", "wchan"]);
 const PROC_GLOBAL_OK = new Set(["cpuinfo", "meminfo", "loadavg", "uptime", "version", "stat"]);
 // The shell sees only these variables from the bridge's environment (never tokens or keys).
 const ENV_ALLOW = /^(?:PATH|HOME|LANG|LC_\w+|TERM|USER|LOGNAME|SHELL|TMPDIR|NVM_DIR|NODE_\w+|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)$/;
@@ -102,7 +105,10 @@ export const RULES = [
   { re: /(?<![\w.-])(?:sudo|doas|pkexec)(?![\w./-])/, why: "sudo/doas/pkexec is refused" },
   { re: /(?<![\w.-])(?:docker|podman|nerdctl|ctr|lxd|machinectl|lxc(?:-[\w-]+)?)(?![\w./-])(?!\s+(?:ps|images|logs|inspect|version|info)(?=\s|$|[;&|)]))/, why: "container tools are refused (docker group membership is root-equivalent)" },
   { re: /(?<![\w.-])(?:nsenter|unshare|chroot)(?![\w./-])/, why: "namespace and chroot tools are refused" },
-  { re: /(?<![\w.-])(?:pkill|killall5?|loginctl|crontab|systemd-run)(?![\w./-])/, why: "process, session and scheduler control is refused" },
+  { re: /(?<![\w.-])(?:pkill|killall5?|loginctl|crontab|systemd-run|busctl|dbus-send|gdbus|tmux|screen)(?![\w./-])/, why: "process, session, bus, terminal-multiplexer and scheduler control is refused" },
+  // ps with environment output: BSD `e` in a dashless cluster (`ps eww`, `ps auxe`) or `-E`.
+  { re: r(`(?<![\\w.-])ps(?:\\s+[a-zA-Z]+)*?\\s+[a-zA-Z]*e[a-zA-Z]*${E}`), why: "ps with process environments (ps e/eww) is refused" },
+  { re: r(`(?<![\\w.-])ps\\b${A}\\s-[A-Za-z]*E[A-Za-z]*${E}`), why: "ps with process environments (ps -E) is refused" },
   { re: r(`(?<![\\w.-])kill\\b${A}\\s(?:--\\s+)?-1${E}`), why: "kill -1 signals every process" },
   { re: r(`(?<![\\w.-])kill\\b${A}(?:\\$|\`)`), why: "kill with a computed target ($PPID, $$, $(..)) cannot be checked" },
   { re: r(`(?<![\\w.-])(?:ba|z|da|k|fi)?sh(?![\\w./-])${A}<<<`), why: "a here-string fed to a shell cannot be checked; use bash -c '...'" },
@@ -655,6 +661,62 @@ export function detectWrapper({ env = process.env, which = (bin) => onPath(bin, 
   return "none";
 }
 
+/**
+ * `env` plus what `systemd-run --user` needs to reach the user manager when the
+ * bridge runs as a system unit (no login session): XDG_RUNTIME_DIR defaults to
+ * `/run/user/<uid>` and DBUS_SESSION_BUS_ADDRESS to its `bus` socket, each only
+ * when unset and the path exists.
+ */
+export function wrapperEnv(env = process.env, { uid = process.getuid?.(), exists = existsSync } = {}) {
+  const out = { ...env };
+  if (!out.XDG_RUNTIME_DIR && uid !== undefined && exists(`/run/user/${uid}`)) out.XDG_RUNTIME_DIR = `/run/user/${uid}`;
+  if (!out.DBUS_SESSION_BUS_ADDRESS && out.XDG_RUNTIME_DIR && exists(`${out.XDG_RUNTIME_DIR}/bus`)) out.DBUS_SESSION_BUS_ADDRESS = `unix:path=${out.XDG_RUNTIME_DIR}/bus`;
+  return out;
+}
+
+/** Run argv synchronously: `{ status }` (null when it could not start). Injected in tests. */
+export function runSync(argv, { env, timeoutMs = 5000 } = {}) {
+  try {
+    const r = spawnSync(argv[0], argv.slice(1), { env, timeout: timeoutMs, stdio: "ignore" });
+    return { status: r.error ? null : r.status };
+  } catch {
+    return { status: null };
+  }
+}
+
+/**
+ * Probe a detected wrapper once with the tools' env: `systemd-run --user --scope -q true`
+ * must exit 0, else the caps cannot apply and we fall back to "none" with a loud warning.
+ * @returns {"systemd-run"|"bwrap"|"none"}
+ */
+export function probeWrapper(wrapper, { env = process.env, run = runSync, warn = (l) => console.warn(l) } = {}) {
+  if (wrapper !== "systemd-run") return wrapper;
+  const { status } = run(["systemd-run", "--user", "--scope", "-q", "true"], { env });
+  if (status === 0) return wrapper;
+  warn(
+    `[durable:guard] WARNING: 'systemd-run --user --scope' does not work here (exit ${status ?? "spawn failed"}; ` +
+      `XDG_RUNTIME_DIR=${env.XDG_RUNTIME_DIR ?? "unset"}); agent bash runs WITHOUT memory/CPU caps (wrapper=none)`,
+  );
+  return "none";
+}
+
+export const SCOPE_PREFIX = "even-durable-";
+
+/** The transient scope unit of one bash call: `even-durable-<sid>-<n>.scope` (systemd-safe characters only). */
+export function scopeUnit(sid, n) {
+  return `${SCOPE_PREFIX}${String(sid ?? "unknown").replace(/[^A-Za-z0-9:_.-]/g, "_")}-${n}`;
+}
+
+/**
+ * Stop every `even-durable-*.scope` left by an earlier process (on resume) or this one (shutdown):
+ * a scope outlives the bridge unit it was started from. Absence of units, of systemctl or of a user
+ * manager is not an error. @returns {boolean} whether systemctl exited 0
+ */
+export function stopScopes({ env = process.env, run = runSync } = {}) {
+  const { status } = run(["systemctl", "--user", "stop", `${SCOPE_PREFIX}*.scope`], { env });
+  return status === 0;
+}
+
 const DEFAULT_CAPS = { memoryMax: "600M", cpuQuota: "200%" };
 
 /**
@@ -670,13 +732,14 @@ export function shellEnv(own = {}, baseEnv = process.env) {
 }
 
 /** Rewrite a bash execution (`{command, cwd, env, inheritEnv}`) to run under the wrapper. */
-export function guardPrepare(execution, { wrapper = "none", caps = DEFAULT_CAPS, baseEnv = process.env } = {}) {
+export function guardPrepare(execution, { wrapper = "none", caps = DEFAULT_CAPS, baseEnv = process.env, unit } = {}) {
   const cmd = execution.command;
   execution.env = shellEnv(execution.env, baseEnv);
   execution.inheritEnv = false;
   if (wrapper === "systemd-run") {
     const { memoryMax, cpuQuota } = { ...DEFAULT_CAPS, ...caps };
-    execution.command = `systemd-run --user --scope -q -p MemoryMax=${memoryMax} -p CPUQuota=${cpuQuota} -- bash -lc ${SHQ(cmd)}`;
+    const named = unit ? ` --unit=${unit}` : "";
+    execution.command = `systemd-run --user --scope -q${named} -p MemoryMax=${memoryMax} -p CPUQuota=${cpuQuota} -- bash -lc ${SHQ(cmd)}`;
   } else if (wrapper === "bwrap") {
     const cwd = execution.cwd;
     execution.command = `bwrap --ro-bind / / --bind ${SHQ(cwd)} ${SHQ(cwd)} --bind /tmp /tmp --dev /dev --proc /proc --unshare-all --share-net --die-with-parent -- bash -lc ${SHQ(cmd)}`;
@@ -719,11 +782,13 @@ export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = 
  *   must map to its parent's cwd, and an unknown conversation must return undefined (blocks).
  * @param {(conversationId: unknown) => boolean} [o.readonlyOf] true for a read-only agent
  *   (agent file `role: readonly`): write/edit and writing, removing or git-mutating bash are blocked.
+ * @param {(conversationId: unknown) => string|undefined} [o.unitOf] systemd scope name of the next bash call.
+ * @param {object} [o.baseEnv] where the shell's allowlisted variables come from (default process.env).
  */
-export function createGuardExtension({ cwdOf, readonlyOf = () => false, caps = DEFAULT_CAPS, wrapper = detectWrapper(), home = homedir(), tmp = TMP, log } = {}) {
+export function createGuardExtension({ cwdOf, readonlyOf = () => false, unitOf, baseEnv = process.env, caps = DEFAULT_CAPS, wrapper = detectWrapper(), home = homedir(), tmp = TMP, log } = {}) {
   return defineExtension({
     name: "even-guard",
     hooks: [hook(ToolTask, { beforeTool: (call, api) => guardBeforeTool(call, { cwd: cwdOf(api.conversationId), readonly: Boolean(readonlyOf(api.conversationId)), home, tmp, log }) })],
-    tools: [createBashTool({ prepare: (execution) => { guardPrepare(execution, { wrapper, caps }); } })],
+    tools: [createBashTool({ prepare: (execution, api) => { guardPrepare(execution, { wrapper, caps, baseEnv, unit: unitOf?.(api?.conversationId) }); } })],
   });
 }
