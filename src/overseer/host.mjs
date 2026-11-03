@@ -75,6 +75,8 @@ export const WHY_NOT = Object.freeze({
   "phone-claude": "the phone's Claude bridge runs it; message it from the phone",
   "driver-unknown": "who drives it could not be checked",
   "waiting-in-terminal": "it is showing a prompt or menu in its terminal; answer it there",
+  "draft-in-terminal": "it has unsent text in its terminal; send or clear it there",
+  "no-pane": "no tmux pane could be matched to it",
   unknown: "its kind is unknown",
 });
 const LINE_MAX = 160; // characters of a last line / title in a list row
@@ -233,8 +235,13 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     }));
   }
 
-  /** "input" | "menu" | null: what the terminal of a tmux-driven pi / Claude Code session shows (the allowlist). */
-  const screenOf = (p, kind, id) => (typeof p?.terminalScreen === "function" ? safe(`${kind} screen ${id}`, () => p.terminalScreen(id), "menu") : null);
+  /**
+   * "input" | "draft" | "menu" | null: what the terminal of a tmux-driven pi / Claude Code session shows (the
+   * allowlist); null is no bound pane. undefined when the provider cannot tell (no terminalScreen).
+   */
+  const screenOf = (p, kind, id) => (typeof p?.terminalScreen === "function" ? safe(`${kind} screen ${id}`, () => p.terminalScreen(id), "menu") : undefined);
+  /** Why a tmux session takes no message besides a prompt (its state "waiting"): unsent text, or no bound pane. */
+  const holdOf = (screen) => (screen === "draft" ? "draft-in-terminal" : screen === null ? "no-pane" : null);
 
   async function fileRows(p, kind, sessions) {
     const rows = [];
@@ -245,10 +252,12 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       let state = s.status ?? (await safe(`${kind} status ${s.id}`, () => p.getSessionStatus?.(s.id), null)) ?? "idle";
       // A terminal in tmux: its screen is the truth (a terminal pi reports idle, cc-local only busy/idle). Anything
       // but its idle input box is "waiting" (a prompt or menu typing would answer).
-      if (driver === "terminal-tmux" && (await screenOf(p, kind, s.id)) === "menu") state = "waiting";
+      const screen = driver === "terminal-tmux" ? await screenOf(p, kind, s.id) : undefined;
+      if (screen === "menu") state = "waiting";
+      const hold = holdOf(screen); // unsent text (I7) or no bound pane (n9): canMessage false (finish)
       const hist = await safe(`${kind} history ${s.id}`, () => p.getHistory?.(s.id, 2), []);
       const t = msOf(s.timestamp);
-      rows.push({ id: s.id, kind, title: s.title ?? "", cwd: s.cwd ?? "", state, driver, ageS: ageS(t), lastActivity: t, lastLine: lastLineOf(hist) });
+      rows.push({ id: s.id, kind, title: s.title ?? "", cwd: s.cwd ?? "", state, driver, ageS: ageS(t), lastActivity: t, lastLine: lastLineOf(hist), ...(hold ? { hold } : {}) });
     }
     return rows;
   }
@@ -265,10 +274,12 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
   }
 
   /** label, normalized state, message route: added to every row in one place. */
-  const finish = (r) => {
+  const finish = ({ hold, ...r }) => {
     const state = normalizeState(r.state);
-    // A terminal at a permission / select prompt: typing would answer it, so it takes no message now.
-    const route = waitingInTerminal(messageRoute(r.kind, r.driver), state);
+    // A terminal at a permission / select prompt: typing would answer it, so it takes no message now. Unsent text
+    // in its input box (it would be submitted with ours) or no bound pane: no message either.
+    let route = waitingInTerminal(messageRoute(r.kind, r.driver), state);
+    if (hold && route.via === "tmux") route = { canMessage: false, why: hold };
     return { ...r, label: safeLabel(r.kind, r.id, r.cwd, r.title), state, ...route };
   };
   // Driven by a terminal or a bridge child counts as active; an RC row's driver is always "rc", so RC counts by its
@@ -336,6 +347,12 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     if ((kind === "pi" || kind === "cc-local") && (await driverOf(id)) === "terminal-tmux" && (await screenOf(p, kind, id)) === "menu") return "waiting";
     return normalizeState(st ?? "idle");
   };
+  /** "draft-in-terminal" | "no-pane" | null for a session of a known kind, now (a tmux terminal's screen). */
+  const holdNow = async (kind, id) => {
+    if (kind !== "pi" && kind !== "cc-local") return null;
+    if ((await driverOf(id)) !== "terminal-tmux") return null;
+    return holdOf(await screenOf(providerOf(kind), kind, id));
+  };
 
   return {
     /**
@@ -361,6 +378,16 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       const kind = await kindOf(id);
       if (!kind) return null;
       return stateNow(kind, id);
+    },
+
+    /**
+     * Why a tmux-driven session takes no message now besides a prompt: "draft-in-terminal" (unsent text in its
+     * input box, I7), "no-pane" (no bound pane, n9), or null (anything else, an unknown id too).
+     */
+    async terminalHold(id) {
+      const kind = await kindOf(id);
+      if (!kind) return null;
+      return holdNow(kind, id);
     },
 
     /**
@@ -415,11 +442,15 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
           // right before typing; never a resume, a spawn or the official router. A session waiting at a permission /
           // select prompt is refused (its state now, and the pane's screen right before typing).
           const waiting = () => Object.assign(new Error(waitingText(k, args.label || args.id)), { statusCode: 409 });
+          // Unsent text in its input box (I7) is refused the same way: ours would be submitted with it.
+          const draft = () => Object.assign(new Error(draftText(k, args.label || args.id)), { statusCode: 409 });
           if ((await stateNow(k, args.id)) === "waiting") throw waiting();
+          if ((await holdNow(k, args.id)) === "draft-in-terminal") throw draft();
           const p = providerOf(k);
           if (typeof p.deliverToTerminal !== "function") throw notDelivered();
           r = await p.deliverToTerminal(args.id, args.text);
           if (r?.waiting) throw waiting();
+          if (r?.draft) throw draft();
         } else {
           // pi RPC: refused (blocked) if a terminal took the session over since the probe.
           r = await pi.prompt(args.id, args.text, undefined, { noTerminal: true });
@@ -479,6 +510,11 @@ export function waitingInTerminal(route, state) {
 /** The refusal for a message to a terminal session that waits at a permission / select prompt. */
 export function waitingText(kind, label) {
   return `${KIND_WORD[kind] ?? "session"} '${defuse(label, { oneLine: true, max: 60 })}' is showing a prompt or menu in its terminal; answer it there`;
+}
+
+/** The refusal for a message to a terminal session whose input box holds unsent text (a draft, I7). */
+export function draftText(kind, label) {
+  return `${KIND_WORD[kind] ?? "session"} '${defuse(label, { oneLine: true, max: 60 })}' has unsent text in its terminal; send or clear it there`;
 }
 
 /** The refusal text for a session that cannot receive a message (host text; "driven from a terminal" kept for the shim). */

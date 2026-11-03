@@ -397,6 +397,35 @@ test("I5: a message to a terminal session waiting at a prompt is refused at prop
   }
 });
 
+test("I7 / n9: a message to a terminal session with unsent text, or with no bound pane, is refused at propose", async () => {
+  let screen = "draft";
+  const cc = {
+    recentSessions: () => [{ id: "c1", title: "", cwd: "/home/u/proj" }],
+    probe: (id) => id === "c1",
+    driverOf: async () => "terminal-tmux",
+    getSessionStatus: async () => "idle",
+    terminalScreen: async () => screen,
+    deliverToTerminal: async () => {
+      throw new Error("must not be typed");
+    },
+  };
+  const s = await open(newDir(), { cc });
+  try {
+    for (const origin of ["overseer", "evenai"]) {
+      await rejectsWith(s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin, requestId: `d-${origin}` }), 409, /^Claude session 'proj-c1' has unsent text in its terminal; send or clear it there$/);
+    }
+    screen = null;
+    await rejectsWith(s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin: "evenai", requestId: "np" }), 409, /can't receive messages: no tmux pane could be matched to it/);
+    // input at propose, a draft at the yes: refused at confirm, nothing typed
+    screen = "input";
+    const p = await s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin: "evenai", requestId: "d-late" });
+    screen = "draft";
+    await rejectsWith(s.actions.confirm(p.id, { confirmFrameId: "f" }), 409, /has unsent text in its terminal/);
+  } finally {
+    await s.close();
+  }
+});
+
 test("I3: a pi message blocked at the last moment fails with 409 and starts no reply watch", async () => {
   let delivered = 0;
   const pi = {

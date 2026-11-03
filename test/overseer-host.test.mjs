@@ -436,3 +436,40 @@ test("n5: a tmux row's state comes from its screen (a terminal pi reports idle; 
   };
   assert.equal(await host.stateOf("bbbb2222-pi"), "waiting", "an unreadable screen is never 'input'");
 });
+
+test("I7 / n9: a tmux row with unsent text, or with no bound pane, takes no message", async () => {
+  const k = everyKind();
+  let screen = "draft";
+  k.pi.terminalScreen = async (id) => (id === "bbbb2222-pi" ? screen : null);
+  k.pi.getSessionStatus = async () => "idle";
+  const typed = [];
+  let deliverSays = null;
+  k.pi.deliverToTerminal = async (id, text) => deliverSays ?? (typed.push([id, text]), { sessionId: id });
+  const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
+  let row = (await host.sessionsList()).find((r) => r.id === "bbbb2222-pi");
+  assert.deepEqual([row.state, row.canMessage, row.why, row.via], ["idle", false, "draft-in-terminal", undefined]);
+  assert.ok(!("hold" in row), "the internal hold field is not listed");
+  assert.equal(publicRow(row).why, "draft-in-terminal");
+  assert.equal(await host.terminalHold("bbbb2222-pi"), "draft-in-terminal");
+  assert.equal(await host.stateOf("bbbb2222-pi"), "idle", "a draft is not a prompt");
+  const msg = () => host.execute({ id: "act-1", kind: "session_message", args: { id: "bbbb2222-pi", label: "notes-2222pi", text: "status?", steer: false }, origin: "overseer" });
+  await assert.rejects(msg(), (e) => e.statusCode === 409 && e.message === "pi session 'notes-2222pi' has unsent text in its terminal; send or clear it there");
+  assert.deepEqual(typed, []);
+  // The screen read "input" but the provider found a draft right before typing: refused the same way.
+  screen = "input";
+  deliverSays = { sessionId: "bbbb2222-pi", blocked: true, draft: true };
+  await assert.rejects(msg(), (e) => e.statusCode === 409 && /has unsent text in its terminal/.test(e.message));
+  assert.deepEqual(typed, []);
+  deliverSays = null;
+  assert.deepEqual(await msg(), { sessionId: "bbbb2222-pi" });
+  // n9: no bound pane (terminalScreen null): canMessage false, why "no-pane".
+  screen = null;
+  row = (await host.sessionsList()).find((r) => r.id === "bbbb2222-pi");
+  assert.deepEqual([row.state, row.canMessage, row.why], ["idle", false, "no-pane"]);
+  assert.equal(await host.terminalHold("bbbb2222-pi"), "no-pane");
+  // A provider that cannot read screens (no terminalScreen) keeps the plain tmux route.
+  delete k.pi.terminalScreen;
+  row = (await host.sessionsList()).find((r) => r.id === "bbbb2222-pi");
+  assert.deepEqual([row.canMessage, row.via], [true, "tmux"]);
+  assert.equal(await host.terminalHold("bbbb2222-pi"), null);
+});

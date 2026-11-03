@@ -333,6 +333,26 @@ Typing into a terminal is code execution if done carelessly, so the tmux route i
   is the state of a tmux row (`terminalScreen`: anything but the input box is `waiting`, and the
   row says `canMessage: false, why: "waiting-in-terminal"`), so propose refuses it too. A terminal
   pi always reports idle and cc-local only busy/idle, so for tmux rows the screen IS the gate.
+- A half-typed draft in the input box blocks too (our text would be appended to it and submitted
+  with it): for pi any non-whitespace text in the editor region (pi has no placeholder; its cursor
+  is an inverse-video cell); for Claude Code, captured styled (`capture-pane -p -e`), any non-space
+  character after "❯ " / "> " outside a dim run (SGR 2: the placeholder), or any continuation line
+  in the box. The refusal is its own: 409 "<kind> '<label>' has unsent text in its terminal; send
+  or clear it there", and the row says `canMessage: false, why: "draft-in-terminal"` (its state
+  stays as it is: a draft is not a prompt). A tmux row with no bound pane (`terminalScreen` null)
+  says `canMessage: false, why: "no-pane"`, and propose refuses it.
+- Capture real screens at deploy (Task 7). The shapes above are rebuilt from the installed sources,
+  not captured: no pi or claude ran in tmux on borealis. At the deploy, capture each screen below
+  with both `tmux capture-pane -p -t <pane>` and `tmux capture-pane -p -e -t <pane>`, and add them as
+  fixtures in test/overseer-delivery.test.mjs (replacing the rebuilt ones):
+  - pi: idle (empty editor), a draft in the editor, a menu (a selector or submenu, e.g. the
+    thinking level), a confirm (`ui.confirm`, "→ Yes / No");
+  - Claude Code: idle (with its dim placeholder, and with an empty box after a turn), a draft, a
+    permission menu ("Do you want to proceed?"), the trust prompt ("Yes, I trust this folder"),
+    bash mode ("! …").
+  Check in particular that Claude Code's placeholder really is SGR 2 (if it is a grey colour or has
+  an inverse-video first character, an idle box reads as a draft and every message is refused) and
+  that pi draws no visible cursor glyph.
 - The pane is bound to the terminal's own process: pi's external pid (with two pi terminals in one
   folder, the pane whose screen shows this conversation, else none), Claude Code's owner pid. Right
   before typing (after the per-pane gap) the pane must still run `pi` / `claude` with `pane_pid` an

@@ -29,7 +29,7 @@ import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { transcriptEntriesToWire } from "./wire.mjs";
 import { TranscriptWatcher, defaultFindFile } from "./watcher.mjs";
-import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid, inputReady } from "./detect.mjs";
+import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid, inputReady, screenWord, notReady } from "./detect.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -574,8 +574,10 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       if (wait > 0) await sleep(wait);
       if (!(await paneCheck(target.pane, target.pid).catch(() => false))) return blocked;
       // Allowlist (I6): only pi's own idle editor + footer at the bottom of the pane takes typing; a selector,
-      // confirm, input or submenu (they replace the editor) would be answered by the text and the Enter.
-      if (!inputReady(await paneScreen(target.pane).catch(() => null), "pi").ready) return { ...blocked, waiting: true };
+      // confirm, input or submenu (they replace the editor) would be answered by the text and the Enter; a draft in
+      // the editor (I7) would be submitted together with the text: `{ draft: true }`.
+      const ready = inputReady(await paneScreen(target.pane).catch(() => null), "pi");
+      if (!ready.ready) return { ...blocked, ...notReady(ready) };
       await deliverTmux(target.pane, text, { singleLine: true });
       paneLastDelivery.set(target.pane, Date.now());
       noteDelivered(sessionId, text);
@@ -586,14 +588,15 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
 
     /**
      * What the terminal pi of this session shows (the inventory's state, Task 6b n5): "input" (its idle editor:
-     * typing is allowed), "menu" (anything else: a selector, confirm, dialog), or null (no bound tmux pane).
+     * typing is allowed), "draft" (unsent text in the editor, I7), "menu" (anything else: a selector, confirm,
+     * dialog), or null (no bound tmux pane).
      */
     async terminalScreen(sessionId) {
       const file = findSessionFile(sessionId, cfg.agentDir);
       if (!file) return null;
       const target = await terminalTarget(sessionId, file);
       if (!target) return null;
-      return inputReady(await paneScreen(target.pane).catch(() => null), "pi").ready ? "input" : "menu";
+      return screenWord(inputReady(await paneScreen(target.pane).catch(() => null), "pi"));
     },
 
     respondPermission(sessionId, decision) {

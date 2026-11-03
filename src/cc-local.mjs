@@ -40,6 +40,8 @@ import {
   findExternalClaude,
   paneRunsPid,
   inputReady,
+  notReady,
+  screenWord,
   screenShowsFragments,
   tmuxDeliver,
 } from "./providers/pi/detect.mjs";
@@ -328,21 +330,27 @@ export function createCcLocalProvider(
       if (!target) return blocked;
       if (!(await paneRunsPid(target.pane, target.pid, { commands: ["claude"], tmuxBin, procRoot }))) return blocked;
       // Allowlist (I6): only Claude Code's own idle input box ("❯ " between two rules) at the bottom of the pane
-      // takes typing; a permission menu, the trust prompt or any dialog would be answered by the text and Enter.
-      if (!inputReady(await capturePane(target.pane, { tmuxBin }).catch(() => null), "claude").ready) return { ...blocked, waiting: true };
+      // takes typing; a permission menu, the trust prompt or any dialog would be answered by the text and Enter. A
+      // draft (I7: text outside the dim placeholder, or a continuation line; a styled `-e` capture) would be
+      // submitted with it: `{ draft: true }`.
+      const ready = inputReady(await capturePane(target.pane, { tmuxBin, styled: true }).catch(() => null), "claude");
+      if (!ready.ready) return { ...blocked, ...notReady(ready) };
       await tmuxDeliver(target.pane, text, { tmuxBin, singleLine: true });
       claim(sessionId, CC_LOCAL_NAME);
       log?.(`[bridge] cc-local overseer message -> tmux pane ${target.pane} (claude ${target.pid})`);
       return { sessionId, provider: "claude" };
     },
 
-    /** What the terminal claude of this session shows: "input" (its idle input box), "menu" (anything else), or null. */
+    /**
+     * What the terminal claude of this session shows: "input" (its idle input box), "draft" (unsent text in it),
+     * "menu" (anything else), or null (no bound tmux pane).
+     */
     async terminalScreen(sessionId) {
       const file = fileOf(sessionId);
       if (!file) return null;
       const target = await terminalTarget(sessionId, file);
       if (!target) return null;
-      return inputReady(await capturePane(target.pane, { tmuxBin }).catch(() => null), "claude").ready ? "input" : "menu";
+      return screenWord(inputReady(await capturePane(target.pane, { tmuxBin, styled: true }).catch(() => null), "claude"));
     },
 
     /**

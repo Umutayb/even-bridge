@@ -31,7 +31,16 @@ const PI_SUBMENU = [" > alpha task number one", RULE, " Thinking level", "   low
 const PI_CONTINUE = [" > alpha task number one", RULE, " Session compacted.", " Press Enter to continue", RULE, ...PI_FOOTER].join("\n");
 const PI_NUMBERED = [" > alpha task number one", RULE, " Which file?", " 1. notes.md", " 2. todo.md", RULE, ...PI_FOOTER].join("\n");
 const CC_IDLE = ["⏺ Done. The tests pass. Do you want to keep the old build too?", "", RULE, "❯ ", RULE, "  ? for shortcuts", ""].join("\n");
-const CC_OLD_BOX = ["⏺ Done.", "╭" + "─".repeat(70) + "╮", "│ > fix the parser please" + " ".repeat(45) + "│", "╰" + "─".repeat(70) + "╯", "  ? for shortcuts"].join("\n");
+const CC_OLD_BOX = ["⏺ Done.", "╭" + "─".repeat(70) + "╮", "│ > \x1b[2mTry \"fix the parser\"\x1b[0m" + " ".repeat(45) + "│", "╰" + "─".repeat(70) + "╯", "  ? for shortcuts"].join("\n");
+const CC_OLD_BOX_DRAFT = ["⏺ Done.", "╭" + "─".repeat(70) + "╮", "│ > fix the parser please" + " ".repeat(45) + "│", "╰" + "─".repeat(70) + "╯", "  ? for shortcuts"].join("\n");
+// Styled captures (`capture-pane -p -e`, I7): Claude Code's placeholder is dim (SGR 2); a draft is plain text.
+const ccBox = (...input) => ["⏺ Done.", "", RULE, ...input, RULE, "  ? for shortcuts", ""].join("\n");
+const CC_PLACEHOLDER_E = ccBox('\x1b[39m❯ \x1b[2mTry "refactor the parser"\x1b[0m');
+const CC_PLACEHOLDER_256_E = ccBox("❯ \x1b[38;2;2;2;2m\x1b[2mTry it\x1b[22m\x1b[39m"); // a 2 inside 38;2;… is no dim
+const CC_DRAFT_E = ccBox("\x1b[39m❯ \x1b[0mfix the parser\x1b[0m");
+const CC_DRAFT_AFTER_DIM_E = ccBox("❯ \x1b[2m\x1b[0mx"); // dim switched off before the text
+const CC_DRAFT_COLOURED_E = ccBox("❯ \x1b[38;2;2;2;2mhello\x1b[0m"); // 38;2;r;g;b with r=2 is a colour, not dim
+const CC_CONTINUATION_E = ccBox("❯ \x1b[2m\x1b[0m", "  second line of a draft");
 const CC_PERMISSION = ["⏺ Bash(rm -rf build)", RULE, " Bash command", "", "   rm -rf build", "   Remove the build folder", "", " Do you want to proceed?", " ❯ 1. Yes", "   2. Yes, and don't ask again for rm commands in /home/u/proj", "   3. No, and tell Claude what to do differently (esc)", ""].join("\n");
 const CC_TRUST = [RULE, " Do you trust the files in this folder?", "", " /home/u/proj", "", " ❯ 1. Yes, I trust this folder", "   2. No, exit", "", " Enter to confirm · Esc to exit"].join("\n");
 const CC_BASH_MODE = ["⏺ Done.", RULE, "! ls", RULE, "  ! for bash mode"].join("\n");
@@ -269,14 +278,37 @@ test("n1: a trailing ';' (tmux's command separator) is typed, not eaten", async 
 });
 
 test("I6 allowlist: only the program's own idle input box takes typing", () => {
-  for (const [name, screen] of [["pi idle", PI_IDLE()], ["pi draft (a y/n in the transcript above does not count)", PI_DRAFT]]) {
+  for (const [name, screen] of [["pi idle (a y/n in the transcript above does not count)", piScreen([" > alpha task", " Overwrite it? (y/n) was asked earlier"], [" "])], ["pi idle, empty editor line", piScreen([], [""])]]) {
     assert.deepEqual(inputReady(screen, "pi"), { ready: true }, name);
   }
+  // I7: a draft in the editor blocks (our text would be appended to it and submitted together).
+  assert.deepEqual(inputReady(PI_DRAFT, "pi"), { ready: false, why: "draft" });
+  assert.deepEqual(inputReady(piScreen([], ["first line", "second line"]), "pi"), { ready: false, why: "draft" });
+  // n7: pi-tui's scrolled editor border is centred ("──── ↑ 3 more ────"); the narrow form still matches.
+  const scrolled = (b) => [" > alpha", RULE, " ", b, ...PI_FOOTER].join("\n");
+  assert.deepEqual(inputReady(scrolled("─".repeat(30) + " ↑ 3 more " + "─".repeat(30)), "pi"), { ready: true });
+  assert.deepEqual(inputReady(scrolled("─── ↓ 12 more " + "─".repeat(20)), "pi"), { ready: true });
+  assert.equal(inputReady(scrolled("── ↑ x more ──"), "pi").ready, false);
   for (const [name, screen] of [["pi confirm selector", PI_CONFIRM], ["pi submenu", PI_SUBMENU], ["Press Enter to continue", PI_CONTINUE], ["numbered list", PI_NUMBERED], ["no footer", "> hello\n"], ["claude screen", CC_IDLE]]) {
     assert.equal(inputReady(screen, "pi").ready, false, name);
   }
-  for (const [name, screen] of [["claude idle (assistant text 'Do you want to' above, n6)", CC_IDLE], ["claude old box", CC_OLD_BOX]]) {
+  for (const [name, screen] of [
+    ["claude idle (assistant text 'Do you want to' above, n6)", CC_IDLE],
+    ["claude old box, dim placeholder", CC_OLD_BOX],
+    ["-e: dim placeholder", CC_PLACEHOLDER_E],
+    ["-e: dim placeholder after a truecolour", CC_PLACEHOLDER_256_E],
+  ]) {
     assert.deepEqual(inputReady(screen, "claude"), { ready: true }, name);
+  }
+  for (const [name, screen] of [
+    ["-e: plain text after ❯", CC_DRAFT_E],
+    ["-e: text after the dim run ended", CC_DRAFT_AFTER_DIM_E],
+    ["-e: coloured text (38;2;2;…)", CC_DRAFT_COLOURED_E],
+    ["-e: a continuation line", CC_CONTINUATION_E],
+    ["old box with text", CC_OLD_BOX_DRAFT],
+    ["unstyled capture with text (no dim run to prove a placeholder)", ccBox('❯ Try "refactor the parser"')],
+  ]) {
+    assert.deepEqual(inputReady(screen, "claude"), { ready: false, why: "draft" }, name);
   }
   for (const [name, screen] of [["claude permission menu", CC_PERMISSION], ["trust prompt", CC_TRUST], ["bash mode", CC_BASH_MODE], ["pi screen", PI_IDLE()], ["empty", ""]]) {
     assert.equal(inputReady(screen, "claude").ready, false, name);
@@ -397,4 +429,63 @@ test("I6: pi confirm, submenu, Press Enter, numbered list and Claude permission 
   assert.equal(await cc.terminalScreen(id), "input");
   assert.deepEqual(await cc.deliverToTerminal(id, "status?"), { sessionId: id, provider: "claude" });
   assert.deepEqual(tm.calls().filter((c) => c[0] === "send-keys"), [["send-keys", "-t", "%5", "-l", "--", "status?"], ["send-keys", "-t", "%5", "Enter"]]);
+});
+
+test("I7: a draft in the input box gets zero send-keys (pi editor text; Claude Code text outside the dim placeholder, -e)", async (t) => {
+  const dir = scratch(t);
+  const cwd = join(dir, "work");
+  mkdirSync(cwd);
+  const agentDir = join(dir, "agent");
+  piSession(agentDir, cwd, "sess-alpha", "alpha task number one");
+  const typed = [];
+  let screen = PI_DRAFT;
+  const pi = createPiProvider(() => {}, {
+    hub: { clientCount: () => 0 },
+    cwd,
+    defaultCwd: cwd,
+    pi: {
+      agentDir,
+      bin: join(dir, "no-such-pi"),
+      externalProbe: async () => [{ pid: 201, cwd }],
+      tmuxPaneProbe: async () => "%1",
+      paneScreenProbe: async () => screen,
+      recentInCwd: () => [],
+      newestForCwd: () => ({ id: "sess-alpha", file: null }),
+      paneCheckProbe: async () => true,
+      tmuxDeliver: async (pane, text) => typed.push([pane, text]),
+    },
+  });
+  t.after(() => pi.stopAll());
+  assert.deepEqual(await pi.deliverToTerminal("sess-alpha", "status?"), { sessionId: "sess-alpha", provider: "claude", blocked: true, draft: true });
+  assert.equal(await pi.terminalScreen("sess-alpha"), "draft");
+  assert.deepEqual(typed, [], "pi draft: nothing typed");
+
+  const cdir = join(dir, "cc");
+  mkdirSync(cdir);
+  const proj = join(cdir, "proj");
+  mkdirSync(proj);
+  const base = join(cdir, "projects");
+  const id = "41111111-2222-3333-4444-555555555555";
+  ccSession(base, proj, id, "fix the parser please");
+  const procRoot = join(cdir, "proc");
+  const sessionsDir = join(cdir, "cc-sessions");
+  mkdirSync(sessionsDir);
+  proc(procRoot, 300, "bash", 1, proj);
+  proc(procRoot, 301, "claude", 300, proj, "claude");
+  writeFileSync(join(sessionsDir, "301.json"), JSON.stringify({ pid: 301, cwd: proj, sessionId: id, status: "idle" }));
+  const tm = fakeTmux(cdir, { panes: `s 0 %5 300 claude ${proj}\n`, display: "claude 300\n" });
+  const cc = createCcLocalProvider(() => {}, { base, tmuxBin: tm.bin, procRoot, sessionsDir, watcher: { start() {}, stop() {}, stopAll() {} } });
+  const sends = () => tm.calls().filter((c) => c[0] === "send-keys");
+  for (const sc of [CC_DRAFT_E, CC_CONTINUATION_E]) {
+    tm.setScreen(sc);
+    assert.deepEqual(await cc.deliverToTerminal(id, "status?"), { sessionId: id, provider: "claude", blocked: true, draft: true });
+    assert.equal(await cc.terminalScreen(id), "draft");
+  }
+  assert.deepEqual(sends(), [], "Claude Code draft: zero send-keys");
+  // The screen is captured styled (-e) for the Claude Code check.
+  assert.ok(tm.calls().some((c) => c[0] === "capture-pane" && c.includes("-e")));
+  tm.setScreen(CC_PLACEHOLDER_E);
+  assert.equal(await cc.terminalScreen(id), "input");
+  assert.deepEqual(await cc.deliverToTerminal(id, "status?"), { sessionId: id, provider: "claude" });
+  assert.deepEqual(sends(), [["send-keys", "-t", "%5", "-l", "--", "status?"], ["send-keys", "-t", "%5", "Enter"]]);
 });

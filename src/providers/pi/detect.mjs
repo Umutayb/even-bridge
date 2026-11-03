@@ -149,7 +149,47 @@ export const MENU_HINT_RE = new RegExp(
 );
 const NUMBERED_RE = /^\s*(?:[❯>]\s*)?\d+[.)]\s/;
 const RULE_RE = /^─{8,}$/; // a full-width rule: pi-tui's editor borders, Claude Code's input box (round, no sides)
-const PI_SCROLL_RULE_RE = /^─── [↑↓] \d+ more ─*$/; // pi-tui editor border with hidden lines
+const PI_SCROLL_RULE_RE = /^─+ [↑↓] \d+ more ─*$/; // pi-tui editor border with hidden lines (centred, or "─── ↓ N more ──" when narrow)
+/** Any escape sequence a styled capture (`capture-pane -e`) can hold: CSI (SGR and others), OSC, other ESC X. */
+const ANSI_RE = /\x1b(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+export const stripAnsi = (s) => String(s).replace(ANSI_RE, "");
+
+/**
+ * The typed text of a styled (`capture-pane -e`) Claude Code input line, without the prompt: every character that
+ * is not a space and lies outside a dim run (SGR 2, until SGR 0, an empty SGR or SGR 22). Claude Code draws its
+ * idle placeholder dim; a draft is plain text. 256-colour / truecolour arguments (38;5;n, 38;2;r;g;b and the 48
+ * forms) are skipped, so their numbers never read as SGR 2. An unstyled capture has no dim run: any text is a draft.
+ */
+export function undimmedText(line) {
+  let dim = false;
+  let out = "";
+  const s = String(line);
+  for (let i = 0; i < s.length; ) {
+    if (s[i] === "\x1b") {
+      const m = /^\x1b\[([0-9;:]*)m/.exec(s.slice(i));
+      if (m) {
+        const ps = m[1] === "" ? ["0"] : m[1].split(/[;:]/);
+        for (let k = 0; k < ps.length; k++) {
+          const v = ps[k] === "" ? 0 : Number(ps[k]);
+          if (v === 0 || v === 22) dim = false;
+          else if (v === 2) dim = true;
+          else if (v === 38 || v === 48 || v === 58) k += ps[k + 1] === "5" ? 2 : ps[k + 1] === "2" ? 4 : 0;
+        }
+        i += m[0].length;
+        continue;
+      }
+      const o = new RegExp(ANSI_RE.source, "y");
+      o.lastIndex = i;
+      const e = o.exec(s);
+      i += e ? e[0].length : 1;
+      continue;
+    }
+    const ch = String.fromCodePoint(s.codePointAt(i));
+    if (!dim && ch.trim()) out += ch;
+    i += ch.length;
+  }
+  return out;
+}
 /** pi's footer stats line: the context indicator "12.3%/128k" or "?/128k" (footer.js contextPercentDisplay). */
 const PI_STATS_RE = /(?:^|\s)(?:\d+(?:\.\d+)?%|\?)\/\d+(?:\.\d+)?[kM]?(?:\s|\(|$)/;
 const CLAUDE_TOP_RE = /^(?:─{8,}|╭─{6,}╮)$/;
@@ -169,12 +209,20 @@ const CLAUDE_INPUT_RE = /^(?:│\s*)?[❯>](?:\s|$)/;
  *     menu or the trust prompt replaces the box: there is no rule-"❯ "-rule at the bottom then.
  * Inside the region found, a menu hint (MENU_HINT_RE), two numbered lines in a row, or (pi) a blank line in a
  * multi-line region also block. Anything unrecognised blocks: `{ ready: false, why }`.
- * @param {string|null} screen capture-pane output
+ * A DRAFT blocks too (I7: our text would be appended to the user's half-typed text and submitted with it), with
+ * `why: "draft"`:
+ *   - pi: any non-whitespace text in the editor region (pi has no placeholder; its cursor is an inverse-video
+ *     cell, a space in a plain capture);
+ *   - Claude Code: any non-space character after the "❯ " / "> " prompt outside a dim run (`undimmedText`: the
+ *     dim placeholder alone is idle; needs a `capture-pane -e` screen, an unstyled one blocks any text), or any
+ *     continuation line in the box.
+ * @param {string|null} screen capture-pane output (`-p`; for Claude Code `-p -e`)
  * @param {"pi"|"claude"} program
  */
 export function inputReady(screen, program) {
   if (screen == null) return { ready: false, why: "unreadable" };
-  const lines = String(screen).split("\n").map((l) => l.replace(/\s+$/, ""));
+  const raw = String(screen).split("\n");
+  const lines = raw.map((l) => stripAnsi(l).replace(/\s+$/, ""));
   while (lines.length && !lines.at(-1).trim()) lines.pop();
   const t = (i) => (lines[i] ?? "").trim();
   const menuIn = (region) => {
@@ -197,6 +245,7 @@ export function inputReady(screen, program) {
     if (!content.length) return { ready: false, why: "empty region" };
     if (content.length > 1 && content.some((l) => !l.trim())) return { ready: false, why: "a menu or dialog" };
     if (menuIn(lines.slice(top))) return { ready: false, why: "a menu or dialog" };
+    if (content.some((l) => l.trim())) return { ready: false, why: "draft" };
     return { ready: true };
   }
   if (program === "claude") {
@@ -208,10 +257,20 @@ export function inputReady(screen, program) {
     if (top < 0 || top + 1 >= b) return { ready: false, why: "no input box" };
     if (!CLAUDE_INPUT_RE.test(t(top + 1))) return { ready: false, why: "not the input line" };
     if (menuIn(lines.slice(top))) return { ready: false, why: "a menu or dialog" };
+    if (b - top > 2) return { ready: false, why: "draft" }; // a continuation line is always typed text
+    // The input line, styles kept: drop the old box's side borders, then the prompt character and its space.
+    const input = raw[top + 1].replace(/^((?:\x1b\[[0-9;:]*m)*)\s*│/, "$1").replace(/│((?:\x1b\[[0-9;:]*m|\s)*)$/, "$1");
+    const after = input.replace(/^((?:\x1b\[[0-9;:]*m|\s)*)[❯>]/, "$1");
+    if (undimmedText(after)) return { ready: false, why: "draft" };
     return { ready: true };
   }
   return { ready: false, why: "unknown program" };
 }
+
+/** An inputReady verdict as a terminal screen word: "input" (typing allowed), "draft" (unsent text), "menu" (anything else). */
+export const screenWord = (r) => (r?.ready ? "input" : r?.why === "draft" ? "draft" : "menu");
+/** The extra field of a blocked deliverToTerminal: `{ draft: true }` for unsent text, `{ waiting: true }` otherwise. */
+export const notReady = (r) => (r?.why === "draft" ? { draft: true } : { waiting: true });
 
 /**
  * Deliver `text` to a tmux pane's foreground program (the pi TUI) as if typed,
@@ -260,12 +319,13 @@ function runTmux(tmuxBin, args) {
 
 /**
  * Capture a pane's visible screen as text (for deciding which conversation
- * the terminal TUI is actually showing).
+ * the terminal TUI is actually showing). `styled`: keep the SGR attributes
+ * (`capture-pane -e`), so inputReady can tell Claude Code's dim placeholder from a draft.
  * @returns {Promise<string|null>}
  */
-export async function capturePane(paneId, { tmuxBin = "tmux" } = {}) {
+export async function capturePane(paneId, { tmuxBin = "tmux", styled = false } = {}) {
   const { stdout } = await new Promise((resolve, reject) =>
-    execFile(tmuxBin, ["capture-pane", "-p", "-t", paneId], { timeout: 5000 }, (err, stdout) =>
+    execFile(tmuxBin, ["capture-pane", "-p", ...(styled ? ["-e"] : []), "-t", paneId], { timeout: 5000 }, (err, stdout) =>
       err ? reject(err) : resolve({ stdout: String(stdout ?? "") })
     )
   );
