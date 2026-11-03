@@ -432,12 +432,67 @@ test("/prompt passes the agent fields to the provider's prompt as its 4th argume
   assert.deepEqual(durable.calls.prompt[1], { sid: "dur-1", text: "and the docs", cwd: undefined, opts: {} });
 });
 
-test("/prompt response for other providers carries no submissionId", async (t) => {
+test("/prompt to other providers keeps the 3-argument call and no submissionId", async (t) => {
   const pi = stubPi();
+  const argc = [];
+  const inner = pi.prompt;
+  pi.prompt = function (...args) {
+    argc.push(args.length);
+    return inner(...args);
+  };
   const { app } = await buildApp(t, { rc: stubRc(), pi, durable: stubDurable() });
   const base = await listen(t, app);
-  const r = await postJson(`${base}/api/prompt`, { provider: "pi", text: "hi", name: "x" });
+  // Agent fields (even invalid ones) are neither validated nor passed for pi.
+  const r = await postJson(`${base}/api/prompt`, { provider: "pi", text: "hi", name: "x".repeat(99), maxTurns: "lots" });
+  assert.equal(r.status, 202);
   assert.deepEqual(await r.json(), { ok: true, sessionId: "pi-new", provider: "claude" });
+  assert.deepEqual(argc, [3]);
+});
+
+test("/prompt validates the durable agent fields (400 with a clear error)", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = [
+    [{ name: "x".repeat(25) }, /'name'/],
+    [{ name: "rm -rf /;" }, /'name'/],
+    [{ name: "" }, /'name'/],
+    [{ name: 7 }, /'name'/],
+    [{ maxTurns: 0 }, /'maxTurns'/],
+    [{ maxTurns: 61 }, /'maxTurns'/],
+    [{ maxTurns: 2.5 }, /'maxTurns'/],
+    [{ maxTurns: "12a" }, /'maxTurns'/],
+    [{ maxTurns: "-3" }, /'maxTurns'/],
+    [{ requestId: "r".repeat(129) }, /'requestId'/],
+    [{ requestId: 42 }, /'requestId'/],
+    [{ origin: "shell" }, /'origin'/],
+    [{ model: "m".repeat(33) }, /'model'/],
+    [{ model: ["qwen"] }, /'model'/],
+  ];
+  for (const [fields, re] of bad) {
+    const r = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", ...fields });
+    assert.equal(r.status, 400, JSON.stringify(fields));
+    assert.match((await r.json()).error, re, JSON.stringify(fields));
+  }
+  assert.equal(durable.calls.prompt.length, 0, "no rejected prompt reached the provider");
+
+  // Boundaries accepted; a digit-only maxTurns string becomes a number.
+  const r = await postJson(`${base}/api/prompt`, {
+    provider: "durable", text: "go", cwd: "/w",
+    name: "fix-the_tests v2.0 abcdef", model: "m".repeat(32), maxTurns: "60",
+    requestId: "r".repeat(128), origin: "phone",
+  });
+  assert.equal(r.status, 400, "a 25-char name is still too long");
+  const ok = await postJson(`${base}/api/prompt`, {
+    provider: "durable", text: "go", cwd: "/w",
+    name: "fix-the_tests v2.0 abcde", model: "m".repeat(32), maxTurns: "60",
+    requestId: "r".repeat(128), origin: "phone",
+  });
+  assert.equal(ok.status, 202);
+  assert.deepEqual(durable.calls.prompt[0].opts, {
+    name: "fix-the_tests v2.0 abcde", model: "m".repeat(32), maxTurns: 60,
+    requestId: "r".repeat(128), origin: "phone",
+  });
 });
 
 test("GET /agents returns the durable provider's listAgents()", async (t) => {

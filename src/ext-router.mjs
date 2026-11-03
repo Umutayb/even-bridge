@@ -25,6 +25,54 @@ import { listCcSessions, ccProjectsBase } from "./cc-transcripts.mjs";
 
 const STATUS_CHECK_COUNT = 10; // mirrors core.js
 
+// Durable prompt fields (POST /api/prompt): limits per the plan's rulings.
+export const AGENT_LIMITS = Object.freeze({ nameMax: 24, maxTurns: 60, requestIdMax: 128, modelMax: 32 });
+export const AGENT_ORIGINS = Object.freeze(["evenai", "phone"]);
+const NAME_RE = /^[\w .-]+$/;
+
+/**
+ * Validate the durable prompt fields. Absent (undefined/null) fields are left
+ * out; `maxTurns` may be a number or a digit-only string and comes back a number.
+ * @returns {{ opts: object } | { error: string }}
+ */
+export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
+  const opts = {};
+  const L = AGENT_LIMITS;
+  if (name != null) {
+    if (typeof name !== "string" || name.length < 1 || name.length > L.nameMax || !NAME_RE.test(name)) {
+      return { error: `'name' must be 1-${L.nameMax} characters of letters, digits, space, '_', '.' or '-'` };
+    }
+    opts.name = name;
+  }
+  if (model != null) {
+    if (typeof model !== "string" || model.length < 1 || model.length > L.modelMax) {
+      return { error: `'model' must be a string of 1-${L.modelMax} characters` };
+    }
+    opts.model = model;
+  }
+  if (maxTurns != null) {
+    const n =
+      typeof maxTurns === "number" ? maxTurns : typeof maxTurns === "string" && /^\d+$/.test(maxTurns) ? Number(maxTurns) : NaN;
+    if (!Number.isInteger(n) || n < 1 || n > L.maxTurns) {
+      return { error: `'maxTurns' must be an integer from 1 to ${L.maxTurns}` };
+    }
+    opts.maxTurns = n;
+  }
+  if (requestId != null) {
+    if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > L.requestIdMax) {
+      return { error: `'requestId' must be a string of 1-${L.requestIdMax} characters` };
+    }
+    opts.requestId = requestId;
+  }
+  if (origin != null) {
+    if (!AGENT_ORIGINS.includes(origin)) {
+      return { error: `'origin' must be one of ${AGENT_ORIGINS.join(", ")}` };
+    }
+    opts.origin = origin;
+  }
+  return { opts };
+}
+
 /**
  * @param {{
  *   hub: import("./hub.mjs").Hub,
@@ -219,13 +267,15 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     console.log(`[bridge] prompt -> ${p.name} session=${sessionId ?? "(new)"}`);
     try {
       const effectiveCwd = sessionId ? undefined : cwd ?? process.env.PROJECT_DIR;
-      // Agent fields (durable): only the ones the caller sent. pi/rc/cc-local
-      // take three arguments and ignore the fourth.
-      const opts = {};
-      for (const [k, v] of Object.entries({ name, model, maxTurns, requestId, origin })) {
-        if (v !== undefined && v !== null) opts[k] = v;
+      let result;
+      if (p.name === "durable") {
+        // Agent fields: validated, and only the ones the caller sent.
+        const checked = agentOpts({ name, model, maxTurns, requestId, origin });
+        if (checked.error) return res.status(400).json({ error: checked.error });
+        result = await p.prompt(sessionId, text, effectiveCwd, checked.opts);
+      } else {
+        result = await p.prompt(sessionId, text, effectiveCwd);
       }
-      const result = await p.prompt(sessionId, text, effectiveCwd, opts);
       // cc-local: session not externally driven -> the official router is
       // the single writer (spawn/resume) for this session.
       if (result?.passThrough) return next();

@@ -176,8 +176,14 @@ bridge never loads pi-durable and every route behaves as before.
 | `EVEN_BRIDGE_DURABLE_CWDS` | empty = any existing dir except `~` and `/` | colon-separated roots, e.g. `~/github:~/sandbox/agents`; a new agent's cwd must lie **strictly below** a root (a bare root is refused; a missing dir below a root is created). A prompt without `cwd` uses the project dir (`PROJECT_DIR`/`--cwd`), so that dir must itself sit below a root or such prompts get a 400 |
 | `BWRAP` | off | `1` runs agent bash commands under `bwrap` when installed, instead of `systemd-run --user --scope` resource caps |
 
+The startup line reads `durable=on` once the store is open and resumed,
+`durable=failed: <reason>` if it could not start (the bridge then runs
+without it), and the bridge warns at startup when the project dir is not
+below an `EVEN_BRIDGE_DURABLE_CWDS` root.
+
 A bridge shutdown does not abort running agents: their runs stay pending in
-the store and resume on the next start. Rollback = unset the flag and restart.
+the store and resume on the next start. On SIGTERM/SIGINT the bridge waits
+up to 3 s for the store to close. Rollback = unset the flag and restart.
 
 ## Live settings (`~/.even-terminal/bridge.env`)
 
@@ -454,14 +460,27 @@ flow through the same endpoints; the phone needs no changes.
 
 Bridge-only additions (durable; 404 unless `EVEN_BRIDGE_DURABLE_ENABLE=1`):
 
-- `POST /api/prompt` also accepts `name`, `model`, `maxTurns`, `requestId`
-  and `origin`; they are passed to the provider (pi, RC and cc-local ignore
-  them). A durable reply also carries `submissionId`; a repeated `requestId`
-  returns the same session and submission instead of starting a second run.
+- `POST /api/prompt` to a durable session also accepts these optional
+  fields, validated by the router (400 with an `error` message otherwise):
+
+  | field | rule |
+  | --- | --- |
+  | `name` | string, 1–24 chars of letters, digits, space, `_`, `.`, `-` |
+  | `model` | string, 1–32 chars (a models.json id or alias such as `haiku`/`sonnet`; the provider resolves it; default = the private vLLM) |
+  | `maxTurns` | integer 1–60, as a number or a digit-only string; default 60 |
+  | `requestId` | string, 1–128 chars; a repeated id returns the same session and submission instead of starting a second run |
+  | `origin` | `evenai` or `phone` |
+
+  Other providers get exactly the old call (these fields are neither
+  validated nor passed). A durable reply also carries `submissionId`.
 - `GET /api/agents` → `{ agents: [{ sid, name, cwd, model, state, origin,
   createdAt, lastSeen, lastLine }] }`.
 - `POST /api/agents/:sid/stop` → aborts the run and archives the session
   (`{ ok: true, sessionId }`; 404 for an unknown or archived sid).
+- Both `/api/agents` routes need the bridge token like every `/api/*` route.
+  With the flag off they answer a JSON 404
+  `{ "error": "Durable agents are not enabled" }` (before this they fell
+  through to the official router's HTML 404).
 
 ## Development
 
