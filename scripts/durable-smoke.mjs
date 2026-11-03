@@ -7,6 +7,11 @@
 //   node scripts/durable-smoke.mjs --kill-mid-turn  # stop the bridge 2 s into a turn, restart, resume
 //   node scripts/durable-smoke.mjs --engine lets-code                 # (a) a file, (a2) a mandate ask denied, (c) scope, (d) banner
 //   node scripts/durable-smoke.mjs --engine lets-code --kill-mid-turn --kill-signal SIGKILL   # (b) restart mid-turn
+//   node scripts/durable-smoke.mjs --engine lets-code --factory   # factory:true at start, the toggle, a ticket with an unquoted how-to-run (stopped at its first checkpoint)
+//        [--enable-experts-temporarily]   answer lets-code's "Enable the factory's experts?" yes and restore its state file afterwards
+//        WARNING (2026-11-03): two --factory runs on borealis coincided with a hard reboot of the host (one
+//        waiting at the experts question, one ~40 s after answering it yes; MemAvailable stayed > 4.4 GB).
+//        Do not run it on borealis again until that is understood (see the Task 3 report).
 //
 // --engine lets-code: the durable lets-code engine (an owned lets-code RPC child per
 // session, plan Task 2). Store ~/tmp/ovs-smoke-store, cwd ~/sandbox/agents/ovs-smoke,
@@ -30,7 +35,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, closeSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, closeSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -499,6 +504,7 @@ async function lcStart() {
 
 async function mainLc() {
   if (KILL_MID_TURN) return killMidTurnLc();
+  if (flag("--factory")) return factoryLc();
   const { c } = await lcStart();
   const before = rssOf(c.pid);
   // (d) the banner
@@ -624,6 +630,113 @@ async function killMidTurnLc() {
   const left = sh("systemctl", ["--user", "list-units", `even-lc-${sid}.scope`, "--no-legend"]);
   if (left) fail(`scope still there after stop: ${left}`);
   say("SMOKE OK (lets-code kill-mid-turn: one cut-off prompt, done.txt, no stale registry)");
+}
+
+async function factoryLc() {
+  // Task 3 real check: a lets-code session started with the factory on (`/mode orchestration` acknowledged),
+  // then a tiny ticket started with an unquoted how-to-run. Kept short: the run is stopped at its first
+  // checkpoint (no build, little vLLM time). The factory dir is removed afterwards when this run created it.
+  const factoryRoot = join(homedir(), ".pi", "agent", "lets-code-factory");
+  const hadFactoryRoot = existsSync(factoryRoot);
+  // `/factory start` asks once to enable the five stage experts (host-global, ruling 4: the operator's job).
+  // --enable-experts-temporarily answers yes and restores ~/.pi/agent/lets-code-state.json afterwards
+  // (as the Task 1 spike did); without it the smoke answers no and stops there.
+  const statePath = join(homedir(), ".pi", "agent", "lets-code-state.json");
+  const enableExperts = flag("--enable-experts-temporarily");
+  const stateBackup = enableExperts && existsSync(statePath) ? readFileSync(statePath) : null;
+  const before = hadFactoryRoot ? new Set(readdirSync(factoryRoot)) : new Set();
+  const { c } = await lcStart();
+  const frames = [];
+  let runId = null;
+  try {
+    let t = Date.now();
+    const r1 = await prompt({ text: "Say ready.", cwd: WORK, name: "ovs-factory", engine: "lets-code", factory: true, requestId: randomUUID() });
+    const sid = r1.sessionId;
+    const push = frames.push.bind(frames);
+    frames.push = (...fs) => {
+      for (const f of fs) if (!/delta$|^status$/.test(f?.type ?? "")) say(`  frame ${short(JSON.stringify(f), 500)}`);
+      return push(...fs);
+    };
+    const stopSse = sse(sid, frames);
+    say(`(f1) new session with factory:true accepted: ${sid}`);
+    await waitIdle(sid);
+    say(`(f1) first run idle after ${((Date.now() - t) / 1000).toFixed(1)}s`);
+    const spawnWarn = readFileSync(LOG, "utf8").split("\n").filter((l) => /factory mode after spawn/.test(l));
+    if (spawnWarn.length) fail(`the spawn-time /mode orchestration was not acknowledged: ${spawnWarn.join(" | ")}`);
+    const row = ((await api("GET", "/agents")).json?.agents ?? []).find((a) => a.sid === sid);
+    say(`(f1) /api/agents row: engine=${row?.engine} factory=${row?.factory}; no 'factory mode after spawn' warning in the log`);
+    if (!row?.factory) fail("the agent row does not say factory on");
+
+    // the toggle route on the live child: /mode orchestration re-sent, resolved on lets-code's notify
+    t = Date.now();
+    const ack = await api("POST", `/agents/${encodeURIComponent(sid)}/factory`, { on: true });
+    say(`(f2) POST /agents/${sid}/factory {on:true} → ${ack.status} ${JSON.stringify(ack.json)} in ${Date.now() - t} ms`);
+    if (ack.status !== 200 || ack.json?.mode !== "orchestration") fail("lets-code did not acknowledge /mode orchestration");
+    const bad = await api("POST", `/agents/${encodeURIComponent(sid)}/factory`, { on: true, ticket: "x", howToRun: '"test -f hello.txt"' });
+    say(`(f2) quoted how-to-run → ${bad.status} ${JSON.stringify(bad.json)}`);
+    if (bad.status !== 400) fail("a quoted how-to-run was not refused");
+
+    // a tiny ticket, the how-to-run unquoted
+    const ticket = "Create a file hello.txt in the project root that contains the single word hi.\n\nAcceptance criteria:\n- hello.txt exists and contains hi\n";
+    t = Date.now();
+    const go = await api("POST", `/agents/${encodeURIComponent(sid)}/factory`, { on: true, ticket, howToRun: "test -f hello.txt" });
+    say(`(f3) POST factory with ticket + howToRun → ${go.status} ${JSON.stringify(go.json)}`);
+    if (go.status !== 200) fail("the factory start was refused");
+    const tickets = readdirSync(join(WORK, ".factory")).filter((f) => /^ticket-\d+\.md$/.test(f));
+    say(`(f3) ticket file(s): ${tickets.join(", ")}; content matches: ${tickets.length === 1 && readFileSync(join(WORK, ".factory", tickets[0]), "utf8") === ticket}`);
+    const isCheckpoint = (f) => f.type === "user_question" && /^Factory \S+: /.test(f.questions?.[0]?.question ?? "");
+    const isExperts = (f) => f.type === "permission_request" && /^Enable the factory's experts\?/.test(f.toolName ?? "");
+    await waitFor(() => frames.some((f) => isCheckpoint(f) || isExperts(f)), TURN_TIMEOUT_MS, "the experts question or the first checkpoint");
+    if (frames.some(isExperts) && !frames.some(isCheckpoint)) {
+      const ex = frames.find(isExperts);
+      say(`(f3) lets-code asks: ${ex.toolName} ${short(ex.detail ?? "", 160)}`);
+      const pr = await api("POST", "/permission-response", { sessionId: sid, decision: enableExperts ? "allow" : "deny" });
+      say(`(f3) answered ${enableExperts ? "Yes (temporarily; the state file is restored at the end)" : "No"} → ${pr.status}`);
+      if (!enableExperts) {
+        await waitIdle(sid, { sawBusy: true });
+        say("SMOKE PARTIAL: /factory start reached lets-code; it needs the factory's experts enabled (operator step), so no run started");
+        return;
+      }
+      await waitFor(() => frames.some(isCheckpoint), TURN_TIMEOUT_MS, "the first factory checkpoint");
+    }
+    const q = frames.find((f) => f.type === "user_question" && /^Factory \S+: /.test(f.questions?.[0]?.question ?? ""));
+    const qText = q.questions[0].question;
+    runId = /^Factory (\S+):/.exec(qText)[1];
+    say(`(f3) checkpoint after ${((Date.now() - t) / 1000).toFixed(1)}s: ${short(qText, 200)} options=${JSON.stringify(q.questions[0].options.map((o) => o.label))}`);
+    const ledgerFile = join(factoryRoot, runId, "ledger.json");
+    const ledger = JSON.parse(readFileSync(ledgerFile, "utf8"));
+    say(`(f3) ledger ${runId}: status=${ledger.status} stage=${ledger.stage} ticket=${ledger.ticket} howToRun=${JSON.stringify(ledger.howToRun)} repo=${ledger.repo}`);
+    if (ledger.howToRun !== "test -f hello.txt") fail(`ledger howToRun is ${JSON.stringify(ledger.howToRun)}`);
+    if (/not a shell command that parses/.test(JSON.stringify(frames))) fail("lets-code could not parse the how-to-run");
+
+    // stop the run at the checkpoint (minimal vLLM use), then the agent
+    const qr = await api("POST", "/question-response", { sessionId: sid, answer: "Stop" });
+    say(`(f4) answered Stop → ${qr.status}`);
+    await waitIdle(sid, { sawBusy: true });
+    const after = JSON.parse(readFileSync(ledgerFile, "utf8"));
+    say(`(f4) ledger after Stop: status=${after.status} note=${short(String(after.note ?? ""), 120)}`);
+    const off = await api("POST", `/agents/${encodeURIComponent(sid)}/factory`, { on: false });
+    say(`(f5) factory off → ${off.status} ${JSON.stringify(off.json)}`);
+    if (off.status !== 200 || off.json?.mode !== "ask") fail("lets-code did not acknowledge /mode ask");
+    const stop = await api("POST", `/agents/${encodeURIComponent(sid)}/stop`);
+    if (stop.status !== 200) fail(`stop ${stop.status}`);
+    stopSse();
+    await sleep(1000);
+    const left = sh("systemctl", ["--user", "list-units", `even-lc-${sid}.scope`, "--no-legend"]);
+    if (left) fail(`scope still there after stop: ${left}`);
+    say("SMOKE OK (lets-code factory: factory:true at start acknowledged, toggle acknowledged, unquoted how-to-run reached the ledger)");
+  } finally {
+    if (stateBackup) {
+      writeFileSync(statePath, stateBackup);
+      say(`restored ${statePath}`);
+    }
+    // the factory data this run created (the operator's own runs are left alone)
+    if (existsSync(factoryRoot)) {
+      for (const d of readdirSync(factoryRoot)) if (!before.has(d)) rmSync(join(factoryRoot, d), { recursive: true, force: true });
+      if (!hadFactoryRoot && readdirSync(factoryRoot).length === 0) rmSync(factoryRoot, { recursive: true, force: true });
+    }
+    void c;
+  }
 }
 
 let code = 0;
