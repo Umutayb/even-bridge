@@ -454,6 +454,8 @@ export function createOverseerActions({
     const item = await harness.commit(async (tx) => {
       const st = await tx.doc(OverseerStanding, ROOT_CONVERSATION_ID);
       st.orders = (st.orders ?? []).filter((o) => o.until >= t && o.used < o.maxTimes);
+      // The order's summary promised a message, not an interruption: a steer never matches it.
+      if (args.steer !== false) return null;
       const o = st.orders.find((x) => x.sid === args.id && x.text === args.text);
       if (!o) return null;
       o.used += 1;
@@ -477,7 +479,19 @@ export function createOverseerActions({
     }, ctx);
     if (!item) return null;
     audit.write({ event: "standing", id: item.id, kind: item.kind, origin: item.origin, summary: item.summary, by: "standing", order: item.standing, use: item.use });
-    const r = await confirm(item.id, { confirmFrameId: `standing:${item.standing}`, by: "standing" });
+    let r;
+    try {
+      r = await confirm(item.id, { confirmFrameId: `standing:${item.standing}`, by: "standing" });
+    } catch (err) {
+      // The use was taken in the commit (two concurrent messages never both get the last one); a send that
+      // did not happen (kill switch, a changed driver, a bridge error) gives it back.
+      await harness.commit(async (tx) => {
+        const st = await tx.doc(OverseerStanding, ROOT_CONVERSATION_ID);
+        const o = (st.orders ?? []).find((x) => x.actionId === item.standing);
+        if (o && o.used > 0) o.used -= 1;
+      }, ctx);
+      throw err;
+    }
     const t2 = now();
     const out = await harness.commit(
       async (tx) => ({
@@ -668,7 +682,9 @@ export function createOverseerActions({
   async function forSubmission(submissionId) {
     if (submissionId == null) return [];
     await ready;
-    return (await snapshot()).items.filter((i) => (i.submissions ?? []).includes(String(submissionId))).map(view);
+    return (await snapshot()).items
+      .filter((i) => (i.submissions ?? []).includes(String(submissionId)))
+      .map((i) => ({ ...view(i), state: i.state, done: "result" in i }));
   }
 
   // ── model switch: one question with another model, reverted when it settles ──

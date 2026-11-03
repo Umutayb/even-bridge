@@ -67,7 +67,7 @@ const httpError = (statusCode, message) => Object.assign(new Error(message), { s
  * @param {object} [o.log]
  * @param {boolean} [o.handoffs] accept hand-off requests on told asks (EVEN_BRIDGE_OVERSEER_HANDOFF=1)
  */
-export function createOverseer({ durable, host, emit, log = console, handoffs = false } = {}) {
+export function createOverseer({ durable, host, emit, log = console, handoffs = false, now = Date.now } = {}) {
   let harness;
   let ctx;
   /** requestId → asks of this process still waiting for it (reconcile leaves those alone). */
@@ -96,6 +96,8 @@ export function createOverseer({ durable, host, emit, log = console, handoffs = 
       const t = textOf(entry?.model?.[0]?.content).trim();
       return { kind: "answer", text: t || "(the overseer gave an empty answer)" };
     }
+    // The nightly reset can still meet a question that arrived at the same instant: said plainly.
+    if (rec.reason === "reset") return { kind: "system", text: "The overseer's nightly reset interrupted a question; ask it again." };
     return { kind: "system", text: `The overseer could not answer (${rec.reason ?? "unanswered"}).` };
   }
 
@@ -203,13 +205,13 @@ export function createOverseer({ durable, host, emit, log = console, handoffs = 
         const asks = await tx.doc(OverseerAsks, ROOT_CONVERSATION_ID);
         asks.done ??= [];
         if (!asks.pending.some((p) => p.requestId === requestId) && !asks.done.includes(requestId)) {
-          asks.pending.push({ requestId, submissionId: id, at: Date.now() });
+          asks.pending.push({ requestId, submissionId: id, at: now() });
         }
         if (h) {
           // In the same commit as the submission: a start proposed in its run is always held to it.
           const ho = await tx.doc(OverseerHandoffs, ROOT_CONVERSATION_ID);
           ho.items ??= [];
-          if (!ho.items.some((x) => x.requestId === requestId)) ho.items.push({ ...h, requestId, submissionId: String(id), at: Date.now() });
+          if (!ho.items.some((x) => x.requestId === requestId)) ho.items.push({ ...h, requestId, submissionId: String(id), at: now() });
           while (ho.items.length > HANDOFFS_KEEP) ho.items.shift();
         }
         return { submissionId: id, delivered: (asks.delivered ?? []).includes(requestId) };
@@ -263,7 +265,15 @@ export function createOverseer({ durable, host, emit, log = console, handoffs = 
       const r = await askOnce(question, opts);
       if (!actions || r.submissionId == null) return r.out;
       // The actions the overseer proposed while working on it (Even AI speaks their summaries).
-      const out = { ...r.out, actions: (await actions.forSubmission(r.submissionId)).map(({ id, kind, summary, expiresAt, args }) => ({ id, kind, summary, expiresAt, args })) };
+      // `actions`: only proposals still waiting for the user's answer. A message a standing order already sent
+      // is never offered as a question; it is listed in `sent` (Even AI says it happened).
+      const mine = await actions.forSubmission(r.submissionId);
+      const out = {
+        ...r.out,
+        actions: mine.filter((a) => a.state === "pending" && !a.standing).map(({ id, kind, summary, expiresAt, args }) => ({ id, kind, summary, expiresAt, args })),
+      };
+      const sent = mine.filter((a) => a.standing && a.state === "confirmed" && a.done).map(({ id, kind, summary, args }) => ({ id, kind, summary, label: args?.label, standing: true }));
+      if (sent.length) out.sent = sent;
       const refused = actions.refusedFor?.(r.submissionId) ?? [];
       if (refused.length) out.refused = refused; // why the overseer proposed nothing (Even AI says it)
       return out;
@@ -286,7 +296,7 @@ export function createOverseer({ durable, host, emit, log = console, handoffs = 
     async handoffTag(tag) {
       await ready;
       const doc = await harness.snapshot(OverseerHandoffs, ROOT_CONVERSATION_ID, ctx);
-      const t = Date.now();
+      const t = now();
       return (doc?.items ?? []).some((x) => x.tag === tag && t - x.at <= HANDOFF_TAG_MS);
     },
 

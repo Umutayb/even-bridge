@@ -17,8 +17,9 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { defineDoc, defineTask, defineTool, LiveDoc, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
-import { OverseerNotes, OverseerOutbox, pushOutbox } from "./docs.mjs";
+import { defineDoc, defineTask, defineTool, InboxDoc, LiveDoc, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
+import { NOTES_CLOSE, NOTES_OPEN, OverseerNotes, OverseerOutbox, pushOutbox } from "./docs.mjs";
+import { defuse } from "./host.mjs";
 
 export const CHECKIN_MAX_PENDING = 6;
 export const CHECKIN_MIN_GAP_MS = 900000;
@@ -72,11 +73,16 @@ export function nextResetAt(t, hour = NIGHTLY_RESET_HOUR) {
 }
 const expand = (p, home = homedir()) => (p === "~" ? home : String(p).startsWith("~/") ? home + String(p).slice(1) : String(p));
 
-/** The handoff the nightly reset starts the new context with: the notes first, then the pending check-ins. */
+/**
+ * The handoff the nightly reset starts the new context with: the notes, fenced as untrusted exactly as
+ * notes_get returns them (they may quote session output), then the pending check-ins, whose `about` texts
+ * the model wrote (defused, one line each).
+ */
+export const CHECKINS_HEAD = "Pending check-ins (your own reminders, data):";
 export function nightlyHandoff(notes, pending = []) {
-  const head = String(notes ?? "").trim() || "(no notes)";
-  const rows = pending.map((p) => `- ${hhmm(p.at)} ${p.about} (${p.id})`);
-  return `${head}\n\nPending check-ins:\n${rows.length ? rows.join("\n") : "(none)"}`;
+  const body = String(notes ?? "").trim() ? defuse(notes) : "(no notes yet)";
+  const rows = pending.map((p) => `- ${hhmm(p.at)} ${defuse(p.about, { oneLine: true, max: CHECKIN_ABOUT_MAX })} (${defuse(p.id, { oneLine: true, max: 40 })})`);
+  return `${NOTES_OPEN}\n${body}\n${NOTES_CLOSE}\n\n${CHECKINS_HEAD}\n${rows.length ? rows.join("\n") : "(none)"}`;
 }
 
 /** Totals of a `harness.usage()` value: `{ tokens, cost }`. */
@@ -92,10 +98,14 @@ export function usageTotals(state) {
   return { tokens, cost };
 }
 
-/** The outbox line of a nightly report (host text). */
+/**
+ * The outbox line of a nightly report (host text). Without a baseline (the first report after a deploy) the
+ * totals are all the store ever used, so they are not called the day's usage.
+ */
 export function usageText(now, before) {
-  const tokens = Math.max(0, now.tokens - (before?.tokens ?? 0));
-  const cost = Math.max(0, now.cost - (before?.cost ?? 0));
+  if (before == null) return `Usage of the agents and the overseer so far: ${now.tokens} tokens, $${now.cost.toFixed(2)}. Daily reports start tomorrow.`;
+  const tokens = Math.max(0, now.tokens - (before.tokens ?? 0));
+  const cost = Math.max(0, now.cost - (before.cost ?? 0));
   return `The day's usage of the agents and the overseer: ${tokens} tokens, $${cost.toFixed(2)}.`;
 }
 
@@ -199,7 +209,12 @@ export function createCheckinTasks(box) {
         }
         const notes = (await runtime.snapshot(OverseerNotes, conv, context))?.text ?? "";
         const pending = (await runtime.snapshot(OverseerCheckins, conv, context))?.pending ?? [];
-        await deps.resetRoot(nightlyHandoff(notes, pending));
+        // resetRoot checks the root again right before the reset and refuses while a run or a queued input
+        // exists (an ask that came in meanwhile is never cut off by the reset): then again in 10 minutes.
+        if ((await deps.resetRoot(nightlyHandoff(notes, pending))) === false) {
+          await runtime.sleepUntil(t + NIGHTLY_RETRY_MS, { phase: "reset" }, context);
+          return;
+        }
         let totals = null;
         try {
           totals = usageTotals(await deps.usage());
@@ -336,7 +351,14 @@ export function createOverseerCheckins({ durable, box, disableFile = DEFAULT_DIS
     if (!box?.tasks) throw new Error("the overseer extension has no check-in tasks");
     box.bind({
       disabled: () => existsSync(resolve(expand(disableFile, home))),
-      resetRoot: async (handoff) => (await harness.root(ctx)).reset(handoff, ctx),
+      resetRoot: async (handoff) => {
+        // Busy = a run, or user inputs queued for one: no reset now (the task tries again in 10 minutes).
+        if ((await harness.snapshot(LiveDoc, ROOT_CONVERSATION_ID, ctx))?.run) return false;
+        const inbox = await harness.snapshot(InboxDoc, ROOT_CONVERSATION_ID, ctx);
+        if ((inbox?.items ?? []).some((i) => i.mode !== "write")) return false;
+        await (await harness.root(ctx)).reset(handoff, ctx);
+        return true;
+      },
       usage: () => harness.usage(ctx),
       onOutbox,
     });

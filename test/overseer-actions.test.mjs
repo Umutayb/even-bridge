@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { createDurableProvider } from "../src/providers/durable/provider.mjs";
 import { createOverseerHost } from "../src/overseer/host.mjs";
 import { createOverseerExtension } from "../src/overseer/extension.mjs";
-import { createOverseer, overseerProviderOptions, OverseerAsks, OverseerOutbox, ROOT_CONVERSATION_ID } from "../src/overseer/overseer.mjs";
+import { createOverseer, overseerProviderOptions, OverseerAsks, OverseerHandoffs, OverseerOutbox, ROOT_CONVERSATION_ID } from "../src/overseer/overseer.mjs";
 import { ACTION_TTL_MS, claudeFreeSlots, createOverseerActions, OverseerActions, summarize, tildePath } from "../src/overseer/actions.mjs";
 import { startFakeOpenAI } from "./helpers/fake-openai.mjs";
 
@@ -68,7 +68,7 @@ async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup, handof
   Object.assign(host, createOverseerHost({ durable: provider, pi, cc, rc, log: quiet }));
   await provider.ready;
   if (failSetup) return { provider, frames, dir };
-  const overseer = createOverseer({ durable: provider, host, log: quiet, handoffs });
+  const overseer = createOverseer({ durable: provider, host, log: quiet, handoffs, ...(clock ? { now: () => clock.t } : {}) });
   await overseer.ready;
   host.handoffTag = (t) => overseer.handoffTag(t);
   const actions = createOverseerActions({
@@ -657,14 +657,34 @@ test("hand-offs are refused while off; notify carries only a hand-off's tag", as
     ];
     for (const [h, re] of bad) await rejectsWith(s.overseer.ask("x", { requestId: "b" + Math.random(), mode: "tell", handoff: h }), 400, re);
     await rejectsWith(s.overseer.ask("x", { requestId: "b9", mode: "ask", handoff: bad[0][0] }), 400, /mode tell/);
-    let r = await s.overseer.ask('TOOL notify {"text":"bees.md is written","tag":"ideate:bees"}', { requestId: "n1", waitMs: 10000 });
+    let mark = fake.requests.length;
+    await s.overseer.ask('TOOL notify {"text":"bees.md is written","tag":"ideate:bees"}', { requestId: "n1", waitMs: 10000 });
+    assert.ok(toolTexts(mark).some((t) => t.includes("unknown tag: only a hand-off's tag may be used")), toolTexts(mark).join(" | "));
     let box = await s.overseer.outbox({ since: 0 });
     assert.equal(box.items.filter((i) => i.kind === "notify").length, 0, "an unknown tag is refused");
     await s.overseer.ask("start nothing", { requestId: "n2", waitMs: 10000, mode: "tell", handoff: { tag: "ideate:bees", label: "ideate-bees", ttlS: 600 } });
-    r = await s.overseer.ask('TOOL notify {"text":"bees.md is written","tag":"ideate:bees"}', { requestId: "n3", waitMs: 10000 });
+    mark = fake.requests.length;
+    await s.overseer.ask('TOOL notify {"text":"bees.md is written","tag":"ideate:bees"}', { requestId: "n3", waitMs: 10000 });
+    assert.ok(toolTexts(mark).some((t) => t.includes("Noted in the outbox.")), toolTexts(mark).join(" | "));
     box = await s.overseer.outbox({ since: 0 });
     assert.deepEqual(box.items.filter((i) => i.kind === "notify").map((i) => [i.text, i.tag]), [["bees.md is written", "ideate:bees"]]);
-    assert.ok(r);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a hand-off's deadline runs on the injected clock", async () => {
+  const clock = { t: Date.now() };
+  const s = await open(newDir(), { handoffs: true, clock });
+  try {
+    await s.overseer.ask("start nothing yet", { requestId: "d1", waitMs: 10000, mode: "tell", handoff: { tag: "ideate:ants", label: "ideate-ants", ttlS: 3600 } });
+    const [h] = (await s.harness.snapshot(OverseerHandoffs, ROOT_CONVERSATION_ID, s.ctx)).items;
+    assert.equal(h.at, clock.t, "the record carries the injected time");
+    assert.equal(await s.overseer.handoffTag("ideate:ants"), true);
+    clock.t += 3600 * 1000 - 100 * 1000; // 100 s left: below the 300 s minimum agent TTL
+    await rejectsWith(s.actions.propose("session_start", { task: "late work" }, { origin: "overseer", submissions: [h.submissionId] }), 409, /deadline has passed/);
+    clock.t += 25 * 3600 * 1000;
+    assert.equal(await s.overseer.handoffTag("ideate:ants"), false, "the tag window is on the same clock");
   } finally {
     await s.close();
   }
