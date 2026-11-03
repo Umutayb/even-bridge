@@ -1,12 +1,12 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
 import { createRegistry, defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { createDurableProvider } from "../src/providers/durable/provider.mjs";
-import { createSubagentExtension, childChange, OUTPUT_CAP } from "../src/providers/durable/subagent.mjs";
+import { createSubagentExtension, childChange, OUTPUT_CAP, allowedAgentsFrom } from "../src/providers/durable/subagent.mjs";
 import { openDurable } from "../src/providers/durable/harness.mjs";
 import { loadPiModels } from "../src/providers/durable/models.mjs";
 import { startFakeOpenAI, fakeModelsJson } from "./helpers/fake-openai.mjs";
@@ -32,6 +32,7 @@ const AGENTS = new Map([
   ["scout", { name: "scout", description: "Fast read-only recon", tools: ["read", "grep", "find", "ls", "bash"], role: "readonly", body: SCOUT_BODY, extra: {} }],
   ["general", { name: "general", description: "Runs multi-step tasks", body: "Do the task.", extra: {} }],
   ["slow", { name: "slow", description: "Never finishes in time", timeout: 0.3, body: "Take your time.", extra: {} }],
+  ["auditor", { name: "auditor", description: "Read-only, every tool offered", role: "readonly", body: "Audit only.", extra: {} }],
 ]);
 
 let n = 0;
@@ -51,6 +52,7 @@ function setup(extra = {}) {
     guard: { wrapper: "none", log: () => {} },
     log: { warn() {}, error() {}, log() {} },
     agents: AGENTS,
+    allowedAgents: ["scout", "general", "slow", "auditor"],
     ...extra,
   });
   return { provider, frames, work };
@@ -75,12 +77,13 @@ const subagentCall = (agent, task) => `TOOL subagent ${JSON.stringify({ agent, t
 test("subagent runs a child in the parent's cwd, behind the guard, and returns its answer", async () => {
   const { provider, frames, work } = setup();
   const from = fake.requests.length;
-  const task = 'TOOL bash {"command":"echo hi > note.txt"}';
+  // scout is read-only (role: readonly): a read-only command in the workspace.
+  const task = 'TOOL bash {"command":"pwd"}';
   const { sessionId } = await provider.prompt(undefined, subagentCall("scout", task), undefined, {});
   await until(() => idle(frames, sessionId));
 
   // The child's bash ran in the parent's directory: the guard resolved the child's cwd.
-  assert.equal(readFileSync(join(work, "note.txt"), "utf8"), "hi\n");
+  assert.ok(toolResults(from).some((t) => t.trim() === work), JSON.stringify(toolResults(from)));
   // The parent got the child's last answer as the tool result.
   assert.ok(toolResults(from).includes(`ok: ${task}`), JSON.stringify(toolResults(from)));
 
@@ -123,7 +126,7 @@ test("an unknown agent is an error result naming the available agents", async ()
   const from = fake.requests.length;
   const { sessionId } = await provider.prompt(undefined, subagentCall("nobody", "x"), undefined, {});
   await until(() => idle(frames, sessionId));
-  assert.ok(toolResults(from).some((t) => /Unknown agent "nobody".*scout, general, slow/.test(t)));
+  assert.ok(toolResults(from).some((t) => /Unknown agent "nobody".*scout, general, slow, auditor/.test(t)));
   await provider.stopAll();
 });
 
@@ -215,7 +218,7 @@ test("childChange maps the agent file onto the child's agent", () => {
   assert.equal(OUTPUT_CAP, 4000);
 });
 
-test("after a reopen the child -> parent edges come back from the ownership index", async () => {
+test("after a reopen the child -> parent edges come back from the session map", async () => {
   // Real SQLite store, closed and reopened by a second provider.
   const dir = join(root, `case-${++n}`);
   mkdirSync(dir, { recursive: true });
@@ -230,4 +233,80 @@ test("after a reopen the child -> parent edges come back from the ownership inde
   await again.ready;
   assert.deepEqual([...again._childParents], edges);
   await again.stopAll();
+});
+
+// ───────────────────────────── fix round 2
+
+test("a read-only child may read and list but not write, edit or redirect", async () => {
+  const { provider, frames, work } = setup();
+  writeFileSync(join(work, "a.txt"), "content of a\n");
+  const results = [];
+  for (const task of [
+    'TOOL read {"path":"a.txt"}',
+    'TOOL write {"path":"b.txt","content":"x"}',
+    'TOOL bash {"command":"echo x > f"}',
+    'TOOL bash {"command":"ls"}',
+  ]) {
+    const from = fake.requests.length;
+    const { sessionId } = await provider.prompt(undefined, subagentCall("auditor", task), undefined, {});
+    await until(() => idle(frames, sessionId));
+    results.push(toolResults(from).join("\n"));
+  }
+  const [read, write, redirect, ls] = results;
+  assert.match(read, /content of a/);
+  assert.match(write, /read-only agent: write is refused/);
+  assert.match(redirect, /read-only agent: writing 'f' is refused/);
+  assert.match(ls, /a\.txt/);
+  assert.equal(existsSync(join(work, "b.txt")), false);
+  assert.equal(existsSync(join(work, "f")), false);
+  // The role is recorded per child (and persisted).
+  assert.ok([...provider._childRoles.values()].every((r) => r === "readonly"));
+  assert.ok(provider._map.children().every((c) => c.role === "readonly"));
+  await provider.stopAll();
+});
+
+test("a non-readonly child may still write", async () => {
+  const { provider, frames, work } = setup();
+  const { sessionId } = await provider.prompt(undefined, subagentCall("general", 'TOOL bash {"command":"echo hi > note.txt"}'), undefined, {});
+  await until(() => idle(frames, sessionId));
+  assert.equal(readFileSync(join(work, "note.txt"), "utf8"), "hi\n");
+  await provider.stopAll();
+});
+
+test("a restart with a child mid-run: the child's resumed tool call resolves its cwd (edges loaded before resume)", async () => {
+  const dir = join(root, `case-${++n}`);
+  mkdirSync(join(dir, "work"), { recursive: true });
+  const work = join(dir, "work");
+  const opts = { storage: undefined, storePath: join(dir, "child.sqlite"), allowedCwds: [dir], defaultCwd: work };
+  const one = setup(opts);
+  const base = fake.calls;
+  const from = fake.requests.length;
+  const { sessionId } = await one.provider.prompt(undefined, subagentCall("general", 'TOOL bash {"command":"pwd"}'), undefined, {});
+  await fake.waitForCalls(base + 1); // the parent's subagent call went through
+  fake.hold();
+  await fake.waitForCalls(base + 2); // the child's first request is held
+  await one.provider.stopAll(); // shutdown mid-child: everything stays pending
+  fake.release();
+  const two = setup(opts);
+  await two.provider.ready;
+  assert.equal(two.provider._childParents.size, 1);
+  await until(() => idle(two.frames, sessionId));
+  const results = toolResults(from);
+  assert.ok(results.some((t) => t.trim() === work), JSON.stringify(results));
+  assert.ok(!results.some((t) => /no workspace is known/.test(t)), JSON.stringify(results));
+  await two.provider.stopAll();
+});
+
+test("the subagent tool offers only EVEN_BRIDGE_DURABLE_AGENTS; others are unknown", async () => {
+  assert.deepEqual(allowedAgentsFrom({}), ["scout", "general", "worker", "reviewer", "researcher", "tester"]);
+  assert.deepEqual(allowedAgentsFrom({ EVEN_BRIDGE_DURABLE_AGENTS: " general , scout,," }), ["general", "scout"]);
+  const { provider, frames } = setup({ allowedAgents: undefined, env: { ...process.env, EVEN_BRIDGE_DURABLE_AGENTS: "general" } });
+  const from = fake.requests.length;
+  const { sessionId } = await provider.prompt(undefined, subagentCall("scout", "look around"), undefined, {});
+  await until(() => idle(frames, sessionId));
+  const desc = fake.requests.slice(from)[0].tools.find((t) => t.function.name === "subagent").function.description;
+  assert.match(desc, /- general — /);
+  assert.doesNotMatch(desc, /scout|slow|auditor/);
+  assert.ok(toolResults(from).some((t) => /Unknown agent "scout"\. Available agents: general\./.test(t)), JSON.stringify(toolResults(from)));
+  await provider.stopAll();
 });

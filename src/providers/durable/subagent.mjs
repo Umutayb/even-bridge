@@ -25,6 +25,15 @@ import { THINKING_LEVELS } from "./models.mjs";
 export const SUBAGENT_EXTENSION = "even-subagent";
 export const SUBAGENT_TOOL = "subagent";
 export const OUTPUT_CAP = 4000;
+/** The lets-code agents offered when EVEN_BRIDGE_DURABLE_AGENTS is unset. */
+export const DEFAULT_ALLOWED_AGENTS = Object.freeze(["scout", "general", "worker", "reviewer", "researcher", "tester"]);
+
+/** `EVEN_BRIDGE_DURABLE_AGENTS` (comma-separated) or the default list. */
+export function allowedAgentsFrom(env = process.env) {
+  const raw = env.EVEN_BRIDGE_DURABLE_AGENTS;
+  if (raw == null || raw.trim() === "") return [...DEFAULT_ALLOWED_AGENTS];
+  return raw.split(",").map((x) => x.trim()).filter(Boolean);
+}
 
 // The same JSON Schema `obj({ agent: str(), task: str() })` from pi-schema
 // builds, written out so the bridge needs no direct pi-schema dependency.
@@ -82,11 +91,14 @@ export function childChange(def, offered, self) {
 /**
  * @param {object} o
  * @param {Map<string, object>} o.agents from loadAgentFiles()
+ * @param {string[]|null} [o.allowed] agent names offered (null = every loaded agent); others are unknown
  * @param {number} [o.defaultTimeoutS] wait bound when the agent file names none
- * @param {(edge: {childId: unknown, parentId: unknown}) => void} [o.onChild] called before the child runs
- *   (also on a rerun that reuses it), so the guard can map the child to its parent's cwd.
+ * @param {(edge: {childId: unknown, parentId: unknown, agent: string, role?: string}) => void} [o.onChild]
+ *   called before the child runs (also on a rerun that reuses it), so the guard can map the child to
+ *   its parent's cwd and apply the agent file's `role` (e.g. `readonly`).
  */
-export function createSubagentExtension({ agents = new Map(), defaultTimeoutS = 900, onChild } = {}) {
+export function createSubagentExtension({ agents: loaded = new Map(), allowed = null, defaultTimeoutS = 900, onChild } = {}) {
+  const agents = allowed ? new Map([...loaded].filter(([name]) => allowed.includes(name))) : loaded;
   let self;
   const subagent = defineTool({
     name: SUBAGENT_TOOL,
@@ -110,7 +122,7 @@ export function createSubagentExtension({ agents = new Map(), defaultTimeoutS = 
         await configure(tx, created.id, change);
         return created.id;
       }, context);
-      onChild?.({ childId, parentId: api.conversationId });
+      onChild?.({ childId, parentId: api.conversationId, agent: def.name, role: def.role });
       await api.details({ conversationId: childId, agent: def.name }, context); // lets a UI attach to the child
       const child = await api.conversation(childId, context);
       if (!child) return { isError: true, output: text(`The ${def.name} agent's conversation is gone.`) };

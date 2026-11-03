@@ -374,17 +374,40 @@ function flagsOf(args) {
  * Vet a bash command run in `cwd`.
  * @returns {{ block?: string }}
  */
-export function judgeCommand(cmd, cwd, home = homedir(), { tmp = TMP } = {}) {
+export function judgeCommand(cmd, cwd, home = homedir(), { tmp = TMP, readonly = false } = {}) {
   if (typeof cmd !== "string") return { block: "no command" };
-  const why = judge(cmd, cwd, home, tmp, 0);
+  const why = judge(cmd, cwd, home, tmp, 0, readonly);
   return why ? { block: why } : {};
 }
 
-function judge(cmd, cwd0, home, tmp, depth) {
+// Read-only agents (agent file `role: readonly`): git verbs that only read, and
+// how a listing-only use of branch/tag/remote/config/stash looks.
+const GIT_READ_VERBS = new Set(["status", "log", "diff", "show", "blame", "grep", "ls-files", "ls-tree", "rev-parse", "describe", "shortlog", "cat-file", "rev-list", "for-each-ref", "name-rev", "show-ref", "whatchanged", "reflog", "help", "version"]);
+const GIT_LIST_VERBS = new Set(["branch", "tag", "remote"]);
+const LIST_FLAG = /^(?:-[arvl]+|-vv|--list|--all|--remotes|--verbose|--contains|--merged|--no-merged|--show-current)$/;
+const INLINE_CODE = /^(?:python\d*(?:\.\d+)?|node|nodejs|deno|bun|perl|ruby|php|lua|Rscript|osascript)$/;
+const RO = "read-only agent: ";
+
+/** Why a git invocation would change the repository, for a read-only agent. */
+function gitMutates(ga) {
+  let gi = 0;
+  while (gi < ga.length && ga[gi].startsWith("-")) gi += /^-[Cc]$|^--(?:git-dir|work-tree|namespace|config-env)$/.test(ga[gi]) ? 2 : 1;
+  const verb = ga[gi];
+  if (verb === undefined) return undefined;
+  const rest = ga.slice(gi + 1);
+  if (GIT_READ_VERBS.has(verb)) return verb === "reflog" && rest[0] && rest[0] !== "show" ? `git reflog ${rest[0]} changes the repository` : undefined;
+  if (GIT_LIST_VERBS.has(verb) && rest.every((a) => LIST_FLAG.test(a) || (verb !== "remote" && a.startsWith("-") === false && rest.some((f) => f === "--list" || f === "-l")))) return undefined;
+  if (verb === "remote" && (rest[0] === "-v" || rest[0] === "show" || rest[0] === "get-url")) return undefined;
+  if (verb === "config" && rest.some((a) => /^(?:--get\S*|-l|--list)$/.test(a))) return undefined;
+  if (verb === "stash" && (rest[0] === "list" || rest[0] === "show")) return undefined;
+  return `git ${verb} may change the repository`;
+}
+
+function judge(cmd, cwd0, home, tmp, depth, readonly = false) {
   if (depth > MAX_DEPTH) return "commands nested too deeply to check";
   const { text, shellBodies } = stripHeredocs(cmd);
   for (const rule of RULES) if (rule.re.test(text)) return rule.why;
-  for (const body of shellBodies) { const v = judge(body, cwd0, home, tmp, depth + 1); if (v) return v; }
+  for (const body of shellBodies) { const v = judge(body, cwd0, home, tmp, depth + 1, readonly); if (v) return v; }
   // A denied dir named anywhere, also inside quoted interpreter code (`python -c "open('~/.ssh/..')"`).
   for (const d of DENIED_IN_HOME) {
     const tail = d.replace(/\./g, "\\.") + "(?![\\w.-])";
@@ -440,6 +463,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
   const checkWrite = (raw) => {
     const t = expand(raw);
     if (DEVICES.test(t)) return undefined;
+    if (readonly) return `${RO}writing '${raw}' is refused`;
     if (unresolved(t)) return `cannot tell what '${raw}' refers to ($VAR or $(..)); use a literal path`;
     if (cwd === UNKNOWN) return `cannot tell where '${raw}' is after an unresolved cd`;
     if (SECRET_NAME.test(basename(t))) return `writing '${basename(t)}' (env files and keys) is refused`;
@@ -449,6 +473,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
     return viaLink(t);
   };
   const checkRemoval = (name, raw, recursive) => {
+    if (readonly) return `${RO}${name} ${raw} is refused`;
     const t = expand(raw);
     if (unresolved(t)) return recursive ? `cannot tell what '${raw}' refers to ($VAR, $(..) or {}); use a literal path` : undefined;
     if (cwd === UNKNOWN) return `cannot tell where '${raw}' is after an unresolved cd`;
@@ -509,7 +534,9 @@ function judge(cmd, cwd0, home, tmp, depth) {
       let gi = 0;
       while (gi < ga.length && ga[gi].startsWith("-")) gi += /^-[Cc]$|^--(?:git-dir|work-tree|namespace|config-env)$/.test(ga[gi]) ? 2 : 1;
       if (gi < ga.length && unresolved(expand(ga[gi]))) return `cannot tell which git command '${ga[gi]}' is; use a literal verb`;
+      if (readonly) { const v = gitMutates(ga.map(expand)); if (v) return RO + v; }
     }
+    if (readonly && INLINE_CODE.test(name) && argv.slice(1).some((a) => /^-[a-zA-Z]*[ceE]$|^--eval$|^--command$/.test(a))) return `${RO}inline ${name} code cannot be checked for writes`;
 
     for (const t of argv) {
       const v = checkToken(t) ?? (/^-{0,2}[\w-]+=(.+)$/.test(t) ? checkToken(t.slice(t.indexOf("=") + 1)) : undefined);
@@ -543,7 +570,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
       if (script !== undefined) {
         if (scriptDyn) return `${name}: a script with $-expansions outside single quotes cannot be checked; single-quote it`;
         if (cwd === UNKNOWN) return "cannot tell where a nested script runs after an unresolved cd";
-        const v = judge(script, cwd, home, tmp, depth + 1); if (v) return v;
+        const v = judge(script, cwd, home, tmp, depth + 1, readonly); if (v) return v;
       } else if (seg.piped || fromStdin) {
         return `${name} reading its script from stdin cannot be checked; use ${SHELLS.test(name) ? name : "bash"} -c '...'`;
       }
@@ -568,7 +595,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
         const end = expr.findIndex((x, j) => j > ex && (x === ";" || x === "+"));
         const sub = expr.slice(ex + 1, end < 0 ? undefined : end);
         const ci = sub.indexOf("-c");
-        if (ci > 0 && sub[ci + 1] !== undefined) { const v = judge(sub[ci + 1], cwd ?? cwd0, home, tmp, depth + 1); if (v) return v; }
+        if (ci > 0 && sub[ci + 1] !== undefined) { const v = judge(sub[ci + 1], cwd ?? cwd0, home, tmp, depth + 1, readonly); if (v) return v; }
       }
       const action = expr.findIndex((x, j) => x === "-delete" || (/^-(?:exec|ok)(?:dir)?$/.test(x) && /^(?:rm|shred|unlink)$/.test(basename(expr[j + 1] ?? ""))));
       if (action >= 0) {
@@ -664,13 +691,14 @@ const PATH_TOOLS = new Set(["read", "write", "edit"]);
  * @param {{ name: string, arguments: object }} call
  * @param {{ cwd: string|undefined, home?: string, tmp?: string, log?: (line: string) => void }} o
  */
-export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = (l) => console.warn(l) } = {}) {
+export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = (l) => console.warn(l), readonly = false } = {}) {
   const name = call?.name;
   if (name !== "bash" && !PATH_TOOLS.has(name)) return undefined;
   const args = call.arguments ?? {};
   let why;
   if (!cwd) why = "no workspace is known for this conversation";
-  else if (name === "bash") why = judgeCommand(args.command, cwd, home, { tmp }).block;
+  else if (readonly && (name === "write" || name === "edit")) why = `${RO}${name} is refused`;
+  else if (name === "bash") why = judgeCommand(args.command, cwd, home, { tmp, readonly }).block;
   else {
     const res = confinePath(args.path, cwd, home, { tmp, mode: name === "read" ? "read" : "write" });
     if (!res.ok) why = res.why;
@@ -689,11 +717,13 @@ export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = 
  * @param {(conversationId: unknown) => string|undefined} o.cwdOf the workspace of a
  *   conversation. The caller owns this mapping: a child conversation (a subagent, Task 7)
  *   must map to its parent's cwd, and an unknown conversation must return undefined (blocks).
+ * @param {(conversationId: unknown) => boolean} [o.readonlyOf] true for a read-only agent
+ *   (agent file `role: readonly`): write/edit and writing, removing or git-mutating bash are blocked.
  */
-export function createGuardExtension({ cwdOf, caps = DEFAULT_CAPS, wrapper = detectWrapper(), home = homedir(), tmp = TMP, log } = {}) {
+export function createGuardExtension({ cwdOf, readonlyOf = () => false, caps = DEFAULT_CAPS, wrapper = detectWrapper(), home = homedir(), tmp = TMP, log } = {}) {
   return defineExtension({
     name: "even-guard",
-    hooks: [hook(ToolTask, { beforeTool: (call, api) => guardBeforeTool(call, { cwd: cwdOf(api.conversationId), home, tmp, log }) })],
+    hooks: [hook(ToolTask, { beforeTool: (call, api) => guardBeforeTool(call, { cwd: cwdOf(api.conversationId), readonly: Boolean(readonlyOf(api.conversationId)), home, tmp, log }) })],
     tools: [createBashTool({ prepare: (execution) => { guardPrepare(execution, { wrapper, caps }); } })],
   });
 }

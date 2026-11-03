@@ -41,6 +41,7 @@ function setup(extra = {}) {
     guard: { wrapper: "none", log: () => {} },
     log: { warn() {}, error() {}, log() {} },
     agentsDir: join(dir, "no-agents"),
+    reattach: { baseMs: 5, maxMs: 40, maxTries: 4 },
     ...extra,
   });
   return { provider, frames, work, dir };
@@ -507,7 +508,116 @@ test("a watch that dies while busy is re-attached and the run still reaches the 
   await until(() => frames.some((f) => f.sid === sessionId && f.type === "result"));
   const result = frames.find((f) => f.sid === sessionId && f.type === "result");
   assert.equal(result.success, true);
+  // The carried translator does not report the in-flight run again.
+  const mine = frames.filter((f) => f.sid === sessionId);
+  assert.equal(mine.filter((f) => f.type === "user_prompt").length, 1);
+  assert.equal(mine.filter((f) => f.type === "status" && f.state === "busy").length, 1);
+  assert.equal(mine.filter((f) => f.type === "text_delta").map((f) => f.text).join(""), "ok: keep going");
   await until(() => provider.getStatus(sessionId).state === "idle");
+  await provider.stopAll();
+});
+
+test("re-attaching backs off between failures and gives up with a log line", async () => {
+  const logs = [];
+  const { provider, frames } = setup({
+    log: { warn() {}, error: (l) => logs.push(l), log() {} },
+    reattach: { baseMs: 20, maxMs: 60, maxTries: 3 },
+  });
+  fake.hold();
+  const base = fake.calls;
+  const { sessionId } = await provider.prompt(undefined, "flaky watch", undefined, {});
+  await fake.waitForCalls(base + 1);
+  const harness = provider._harness;
+  const real = harness.conversation.bind(harness);
+  const attempts = [];
+  harness.conversation = async (...a) => {
+    attempts.push(Date.now());
+    throw new Error("store hiccup");
+  };
+  await provider._live.get(sessionId).watch.stop();
+  await until(() => logs.some((l) => /giving up re-attaching after 3 failed attempts/.test(l)), 3000);
+  assert.equal(attempts.length, 3);
+  const gaps = attempts.slice(1).map((t, i) => t - attempts[i]);
+  assert.ok(gaps[0] >= 35 && gaps[1] >= 55, `backoff grows: ${gaps}`); // 20 → 40 → 60 (capped)
+  assert.equal(provider.getStatus(sessionId).state, "busy", "still running: never reported idle");
+  harness.conversation = real;
+  fake.release();
+  void frames;
+  await provider.stopAll({ abort: true });
+});
+
+test("a re-attached watcher keeps the SSE clients that were attached", async () => {
+  const { provider, frames } = setup();
+  fake.hold();
+  const base = fake.calls;
+  const { sessionId } = await provider.prompt(undefined, "with a client", undefined, {});
+  await fake.waitForCalls(base + 1);
+  provider.watchTranscript(sessionId);
+  const dead = provider._live.get(sessionId);
+  await dead.watch.stop();
+  await until(() => provider._live.get(sessionId)?.watch && provider._live.get(sessionId) !== dead);
+  fake.release();
+  await until(() => idleCount(frames, sessionId) === 1);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(provider._live.has(sessionId), "idle, but a client is attached: the watcher stays");
+  assert.equal(provider._clientCounts.get(sessionId), 1);
+  provider.unwatchTranscript(sessionId);
+  assert.equal(provider._live.has(sessionId), false);
+  await provider.stopAll();
+});
+
+test("maxTurns has a hard ceiling of 500 in the provider", async () => {
+  const { provider } = setup();
+  await assert.rejects(provider.prompt(undefined, "x", undefined, { maxTurns: 501 }), (e) => e.statusCode === 400 && /1 to 500/.test(e.message));
+  const ok = await provider.prompt(undefined, "x", undefined, { maxTurns: 500 });
+  assert.equal(provider._map.get(ok.sessionId).max_turns, 500);
+  await settled(provider, ok.submissionId);
+  await provider.stopAll();
+});
+
+test("listAgents: last 7 days unless {all:true}, lookups in batches of 8", async () => {
+  const { provider, work } = setup();
+  await provider.ready;
+  const ref = { provider: "fake", modelId: "fake-model" };
+  const { ctx } = await provider.ready;
+  const sids = [];
+  for (let i = 0; i < 12; i++) {
+    const sid = provider._map.create({ name: `a${i}`, cwd: work, modelRef: ref, origin: "evenai", maxTurns: 5 });
+    const conv = await provider._harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model: ref, thinkingLevel: "off", cwd: work } }, ctx);
+    provider._map.setConversation(sid, conv.id);
+    sids.push(sid);
+  }
+  provider._map.db.prepare("UPDATE sessions SET last_seen = last_seen - ? WHERE sid = ?").run(8 * 86400, sids[0]);
+  const harness = provider._harness;
+  const realSnap = harness.snapshot.bind(harness);
+  let inFlight = 0;
+  let peak = 0;
+  harness.snapshot = async (...a) => {
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    await new Promise((r) => setTimeout(r, 5));
+    try {
+      return await realSnap(...a);
+    } finally {
+      inFlight--;
+    }
+  };
+  const recent = await provider.listAgents();
+  assert.equal(recent.length, 11);
+  assert.ok(!recent.some((x) => x.sid === sids[0]));
+  assert.ok(peak <= 8 && peak > 1, `peak concurrency ${peak}`);
+  const all = await provider.listAgents({ all: true });
+  assert.equal(all.length, 12);
+  harness.snapshot = realSnap;
+  await provider.stopAll();
+});
+
+test("stale requestId rows are pruned periodically, not only on open", async () => {
+  const { provider } = setup({ pruneEveryMs: 20 });
+  await provider.ready;
+  provider._map.db.prepare("INSERT INTO requests (request_id, sid, created_at) VALUES (?, ?, ?)").run("ancient", "dur-x", 1);
+  assert.equal(provider._map.sidForRequest("ancient"), "dur-x");
+  await until(() => provider._map.sidForRequest("ancient") === undefined, 2000);
   await provider.stopAll();
 });
 
@@ -602,9 +712,16 @@ test("a restart only re-attaches rows seen within the last 7 days", async () => 
   const m = new SessionMap(storePath);
   m.db.prepare("UPDATE sessions SET last_seen = last_seen - ? WHERE sid = ?").run(8 * 86400, a.sessionId);
   m.close();
+  fake.release();
   const two = setup(opts);
+  // Before the restart check finishes the row reads busy; the harness may be about to run it.
+  assert.equal(two.provider.getStatus(a.sessionId).state, "busy");
   await two.provider.ready;
   assert.equal(two.provider._live.has(a.sessionId), false);
-  fake.release();
-  await two.provider.stopAll({ abort: true });
+  // The stale run was aborted rather than left running unwatched.
+  const rec = await settled(two.provider, a.submissionId);
+  assert.equal(rec.status, "unanswered");
+  assert.equal(rec.reason, "aborted");
+  assert.equal(two.provider.getStatus(a.sessionId).state, "idle");
+  await two.provider.stopAll();
 });

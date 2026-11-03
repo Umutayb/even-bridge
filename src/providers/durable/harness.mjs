@@ -25,8 +25,10 @@ import { expandHome } from "./models.mjs";
  * @param {boolean} [o.telemetryOff=true]
  * @param {object} [o.settings] extra HarnessSettings merged over the defaults.
  * @param {(report: object) => void} [o.onReport]
+ * @param {boolean} [o.resume=true] call `harness.resume()` at once. Pass false when the host must
+ *   rebuild state the resumed tasks need first (the guard's cwd map); it then calls `resume()` itself.
  */
-export async function openDurable({ storePath, storage, models, registry, envFor, telemetryOff = true, settings = {}, onReport } = {}) {
+export async function openDurable({ storePath, storage, models, registry, envFor, telemetryOff = true, settings = {}, onReport, resume = true } = {}) {
   if (telemetryOff) process.env.PI_TELEMETRY = "0";
   if (!storage) {
     if (!storePath) throw new Error("openDurable: storePath or storage is required");
@@ -47,7 +49,7 @@ export async function openDurable({ storePath, storage, models, registry, envFor
     },
     ctx,
   );
-  harness.resume();
+  if (resume) harness.resume();
   let closing;
   return {
     harness,

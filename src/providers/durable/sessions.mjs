@@ -55,7 +55,15 @@ export class SessionMap {
       sid TEXT NOT NULL,
       created_at INTEGER NOT NULL
     )`);
-    this.db.prepare("DELETE FROM requests WHERE created_at < ?").run(this.now() - requestTtlS);
+    // Subagent children (owned conversations the sessions table does not know): which
+    // session's conversation owns them and the agent file's role, so the guard can
+    // resolve a child's cwd and read-only role again after a restart, before resume.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS children (
+      child_id INTEGER PRIMARY KEY,
+      parent_sid TEXT NOT NULL,
+      role TEXT
+    )`);
+    this.requestTtlS = requestTtlS;
     this.stmt = {
       insert: this.db.prepare(`INSERT INTO sessions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`),
       page: this.db.prepare(`SELECT rowid AS _rowid, ${COLUMNS} FROM sessions WHERE archived = 0 AND last_seen >= ? AND rowid > ? ORDER BY rowid LIMIT ?`),
@@ -68,7 +76,11 @@ export class SessionMap {
       setConversation: this.db.prepare("UPDATE sessions SET conversation_id = ? WHERE sid = ?"),
       noteRequest: this.db.prepare("INSERT OR IGNORE INTO requests (request_id, sid, created_at) VALUES (?, ?, ?)"),
       sidForRequest: this.db.prepare("SELECT sid FROM requests WHERE request_id = ?"),
+      pruneRequests: this.db.prepare("DELETE FROM requests WHERE created_at < ?"),
+      noteChild: this.db.prepare("INSERT INTO children (child_id, parent_sid, role) VALUES (?, ?, ?) ON CONFLICT(child_id) DO UPDATE SET parent_sid = excluded.parent_sid, role = excluded.role"),
+      children: this.db.prepare("SELECT child_id, parent_sid, role FROM children"),
     };
+    this.pruneRequests();
   }
 
   /** @returns {string} the new sid ("dur-" + uuid). */
@@ -125,6 +137,21 @@ export class SessionMap {
   /** The sid a new-session `requestId` created, if any. */
   sidForRequest(requestId) {
     return this.stmt.sidForRequest.get(String(requestId))?.sid;
+  }
+
+  /** Drop request rows older than the TTL (on open, and periodically by the provider). @returns {number} rows removed */
+  pruneRequests() {
+    return Number(this.stmt.pruneRequests.run(this.now() - this.requestTtlS).changes);
+  }
+
+  /** Remember a subagent child conversation of `parentSid`, with its agent file's role. */
+  noteChild(childId, parentSid, role = null) {
+    this.stmt.noteChild.run(childId, parentSid, role ?? null);
+  }
+
+  /** Every recorded child: `{ child_id, parent_sid, role }`. */
+  children() {
+    return this.stmt.children.all().map(plain);
   }
 
   touch(sid) {

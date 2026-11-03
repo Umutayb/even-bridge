@@ -36,12 +36,17 @@ import { SessionMap } from "./sessions.mjs";
 import { ViewTranslator } from "./wire.mjs";
 import { createGuardExtension, shellEnv as guardShellEnv } from "./guard.mjs";
 import { loadAgentFiles } from "./agent-files.mjs";
-import { createSubagentExtension } from "./subagent.mjs";
+import { allowedAgentsFrom, createSubagentExtension } from "./subagent.mjs";
 
 const NAME = "durable";
 const WIRE_PROVIDER = "claude";
 const VERSION = "pi-durable 1.5.0";
 export const DEFAULT_MAX_TURNS = 60;
+/** Hard ceiling; the router enforces the product limit (60). */
+export const MAX_TURNS_CEILING = 500;
+const LIST_BATCH = 8; // listAgents lookups in flight at once
+const PRUNE_EVERY_MS = 6 * 3600 * 1000;
+const REATTACH = { baseMs: 1000, maxMs: 30_000, maxTries: 8 };
 /** Where agents may work when no roots are configured: never "anywhere". */
 export const DEFAULT_AGENT_ROOT = "~/sandbox/agents";
 const HISTORY_WINDOW = 200; // entries a history read / seed looks at
@@ -135,7 +140,7 @@ export function resolveAgentCwd(want, { allowedCwds = [], home = homedir() } = {
 function parseMaxTurns(v) {
   if (v == null || v === "") return DEFAULT_MAX_TURNS;
   const n = Number(v);
-  if (!Number.isInteger(n) || n < 1) throw httpError(400, "maxTurns must be an integer of 1 or more");
+  if (!Number.isInteger(n) || n < 1 || n > MAX_TURNS_CEILING) throw httpError(400, `maxTurns must be an integer from 1 to ${MAX_TURNS_CEILING}`);
   return n;
 }
 
@@ -155,6 +160,10 @@ function parseMaxTurns(v) {
  * @param {string} [o.agentsDir] lets-code agent files the `subagent` tool offers.
  * @param {Map<string, object>} [o.agents] ready agent definitions instead of `agentsDir` (tests).
  * @param {object} [o.subagent] extra options for createSubagentExtension (e.g. `defaultTimeoutS`).
+ * @param {string[]|null} [o.allowedAgents] agents the subagent tool offers (default: EVEN_BRIDGE_DURABLE_AGENTS or the
+ *   built-in list; null = every loaded agent).
+ * @param {{baseMs?: number, maxMs?: number, maxTries?: number}} [o.reattach] backoff for re-attaching a watch that died mid-run.
+ * @param {number} [o.pruneEveryMs] how often stale requestId rows are pruned (default 6 h).
  */
 export function createDurableProvider(
   emitRaw,
@@ -174,16 +183,23 @@ export function createDurableProvider(
     agentsDir = "~/.pi/agent/agents",
     agents,
     subagent = {},
+    allowedAgents = allowedAgentsFrom(env),
+    reattach = {},
+    pruneEveryMs = PRUNE_EVERY_MS,
   } = {},
 ) {
+  const backoff = { ...REATTACH, ...reattach };
   const map = new SessionMap(storePath);
   const { models, refs, default: defaultRef } = loadPiModels(modelsPath, env);
-  // Subagent children are owned conversations the session map does not know:
-  // child conversation id → parent conversation id. Filled when the subagent
-  // tool creates (or, on a rerun, reuses) a child, and on open from the
-  // ownership index. A child resolves to its parent's cwd (its own agent cwd is
-  // a copy of it); an unknown conversation stays undefined, which the guard blocks.
+  // Subagent children are owned conversations the sessions table does not know:
+  // child conversation id → parent conversation id, and child → agent role.
+  // Filled when the subagent tool creates (or, on a rerun, reuses) a child,
+  // persisted in the session map's `children` table, and rebuilt from it on
+  // open BEFORE `resume()` so a resumed child's first tool call already
+  // resolves. A child resolves to its parent's cwd (its own agent cwd is a copy
+  // of it); an unknown conversation stays undefined, which the guard blocks.
   const childParents = new Map();
+  const childRoles = new Map();
   const cwdOf = (conversationId) => {
     let id = conversationId;
     for (let hops = 0; hops < 8; hops++) {
@@ -194,11 +210,31 @@ export function createDurableProvider(
     }
     return undefined;
   };
-  const guardExt = createGuardExtension({ cwdOf, ...guard });
+  const readonlyOf = (conversationId) => childRoles.get(conversationId) === "readonly";
+  /** The session row whose conversation (directly or through children) owns `conversationId`. */
+  const rootRowOf = (conversationId) => {
+    let id = conversationId;
+    for (let hops = 0; hops < 8; hops++) {
+      const row = map.byConversation(id);
+      if (row) return row;
+      if (!childParents.has(id)) return undefined;
+      id = childParents.get(id);
+    }
+    return undefined;
+  };
+  const guardExt = createGuardExtension({ cwdOf, readonlyOf, ...guard });
   const subagentExt = createSubagentExtension({
     agents: agents ?? loadAgentFiles(agentsDir, { log }),
+    allowed: allowedAgents,
     ...subagent,
-    onChild: ({ childId, parentId }) => childParents.set(childId, parentId),
+    onChild: ({ childId, parentId, role }) => {
+      childParents.set(childId, parentId);
+      if (role) childRoles.set(childId, role);
+      else childRoles.delete(childId);
+      const parentRow = rootRowOf(parentId);
+      if (parentRow) map.noteChild(childId, parentRow.sid, role ?? null);
+      else log.warn?.(`[durable] subagent child ${childId}: parent conversation ${parentId} has no session; not persisted`);
+    },
   });
   const registry = createRegistry();
   registry.install(CodingTools);
@@ -206,22 +242,27 @@ export function createDurableProvider(
   registry.install(subagentExt); // children keep the guard and drop this one
   const EXTENSIONS = [CodingTools, guardExt, subagentExt];
 
-  /** Record the subagent children of `conv` (after a restart, before their tools reach the guard again). */
-  async function noteChildren(conv) {
-    let cursor;
-    do {
-      const page = await conv.commit((tx) => tx.scanConversations({ ownerConversationId: conv.id }, 100, cursor), durable.ctx);
-      for (const c of page.items) childParents.set(c.id, conv.id);
-      cursor = page.next;
-    } while (cursor !== undefined);
+  /** Rebuild the child → parent / role maps from the session map (on open, before resume). */
+  function loadChildren() {
+    for (const c of map.children()) {
+      const parent = map.get(c.parent_sid);
+      if (parent?.conversation_id == null) continue;
+      childParents.set(c.child_id, parent.conversation_id);
+      if (c.role) childRoles.set(c.child_id, c.role);
+    }
   }
   // Defense in depth: the guard's `prepare` already rebuilds the bash env from
   // its allowlist; the environment itself starts from that allowlist too.
   const shellEnv = guardShellEnv({ PI_TELEMETRY: "0" }, env);
   const envFor = ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? defaultCwd ?? process.cwd(), shellEnv });
 
-  /** sid → watcher { conv, watch, translator, view, clients, pending, stopped, starting } */
+  /** sid → watcher { conv, watch, translator, view, pending, stopped, starting } */
   const live = new Map();
+  /** sid → attached SSE clients; outside the watcher so a re-attached watcher keeps them. */
+  const clientCounts = new Map();
+  const clientsOf = (sid) => clientCounts.get(sid) ?? 0;
+  /** sid → consecutive failed re-attach attempts. */
+  const reattachTries = new Map();
   /** sid → "busy"|"idle", the last state we saw (kept after a watcher stops). */
   const states = new Map();
   /** sid → last line of the newest answer, kept when a watcher stops (listAgents). */
@@ -236,7 +277,7 @@ export function createDurableProvider(
   let durable; // { harness, ctx, close }
   // `opened`: the harness is usable. `ready`: also re-attached after a restart.
   // Internal paths await `opened` (the resume step itself needs them).
-  const opened = openDurable({ storePath, storage, models, registry, envFor, settings }).then(
+  const opened = openDurable({ storePath, storage, models, registry, envFor, settings, resume: false }).then(
     (d) => (durable = d),
     (err) => {
       throw httpError(503, `durable store failed to open: ${err.message}`, err);
@@ -245,28 +286,42 @@ export function createDurableProvider(
   const ready = (async () => {
     try {
       await opened;
-      // Resume after a restart: Durable continues unfinished runs (openDurable
-      // calls resume()); re-attach a watcher to each busy one seen recently so
-      // its frames reach the ring again.
+      // After a restart, before anything runs (openDurable did not resume):
+      // 1. the guard's child maps, so a resumed child's tool call resolves;
+      // 2. every live row's state from its stored `pi.live`, so getStatus never
+      //    says idle for a run the harness is about to continue.
+      loadChildren();
       const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
-      for (const row of map.rows({ seenSince: since })) {
+      const recentBusy = [];
+      const staleBusy = [];
+      for (const row of map.rows()) {
         if (row.conversation_id == null) continue;
-        try {
-          const conv = await durable.harness.conversation(row.conversation_id, durable.ctx);
-          if (conv) await noteChildren(conv);
-        } catch (err) {
-          log.warn?.(`[durable] subagent children of ${row.sid}: ${err.message}`);
-        }
         try {
           const lv = await durable.harness.snapshot(LiveDoc, row.conversation_id, durable.ctx);
           if (lv?.run) {
             states.set(row.sid, "busy");
-            await ensureWatcher(row.sid);
+            (row.last_seen >= since ? recentBusy : staleBusy).push(row);
           } else states.set(row.sid, "idle");
         } catch (err) {
           log.warn?.(`[durable] resume check for ${row.sid} failed: ${err.message}`);
         }
       }
+      // 3. resume; re-attach a watcher to each recent busy run so its frames
+      //    reach the ring again, and abort runs nobody has looked at in 7 days.
+      durable.harness.resume();
+      for (const row of recentBusy) await ensureWatcher(row.sid).catch(() => {});
+      await Promise.all(
+        staleBusy.map(async (row) => {
+          try {
+            const conv = await durable.harness.conversation(row.conversation_id, durable.ctx);
+            log.warn?.(`[durable] aborting ${row.sid}: unfinished run last seen over 7 days ago`);
+            await conv?.abort(durable.ctx);
+            states.set(row.sid, "idle");
+          } catch (err) {
+            log.warn?.(`[durable] aborting stale ${row.sid} failed: ${err.message}`);
+          }
+        }),
+      );
       return durable;
     } finally {
       resumed = true;
@@ -275,6 +330,17 @@ export function createDurableProvider(
   ready.catch((err) => log.error?.(`[durable] ${err.message}`));
 
   const ctx = () => durable.ctx;
+
+  // requestId rows only matter for retries; keep the table small in a long-lived bridge.
+  const pruneTimer = setInterval(() => {
+    try {
+      const n = map.pruneRequests();
+      if (n) log.log?.(`[durable] pruned ${n} stale request id(s)`);
+    } catch (err) {
+      log.warn?.(`[durable] request prune failed: ${err.message}`);
+    }
+  }, pruneEveryMs);
+  pruneTimer.unref?.();
 
   async function conversationOf(sid) {
     const row = map.get(sid);
@@ -300,11 +366,17 @@ export function createDurableProvider(
     }
   }
 
-  /** Start (or reuse) the watcher of `sid`; resolves once it has its first view. */
-  function ensureWatcher(sid) {
+  /**
+   * Start (or reuse) the watcher of `sid`; resolves once it has its first view.
+   * `carry`: the translator of a watch that died mid-run. Reusing it means the
+   * new watch's first view is diffed against what was already emitted: the
+   * in-flight run's prompt and busy are not reported again, and whatever was
+   * committed in between is.
+   */
+  function ensureWatcher(sid, carry) {
     const have = live.get(sid);
     if (have) return have.starting;
-    const w = { conv: undefined, watch: undefined, translator: undefined, view: undefined, clients: 0, pending: 0, stopped: false };
+    const w = { conv: undefined, watch: undefined, translator: undefined, view: undefined, pending: 0, stopped: false };
     live.set(sid, w);
     w.starting = (async () => {
       const { conv } = await conversationOf(sid);
@@ -318,7 +390,7 @@ export function createDurableProvider(
       w.watch = watch;
       // prime (default): the first view is history already in the ring; an
       // in-flight run is still reported (its prompt, busy, streamed partial).
-      w.translator = new ViewTranslator(sid, (f) => onFrame(sid, f), { log });
+      w.translator = carry ?? new ViewTranslator(sid, (f) => onFrame(sid, f), { log });
       w.view = watch.value;
       w.translator.apply(watch.value);
       watch.start(async (call) => {
@@ -338,9 +410,10 @@ export function createDurableProvider(
         // attach a fresh one so the run keeps reaching the ring.
         if (!w.stopped && !closed && states.get(sid) === "busy") {
           log.warn?.(`[durable] watch ${sid} ended (${end?.kind}) while busy; re-attaching`);
-          setTimeout(() => ensureWatcher(sid).catch(() => {}), 0).unref?.();
+          scheduleReattach(sid, w.translator);
         }
       });
+      reattachTries.delete(sid);
       // A client may have left while we attached. A macrotask, so a prompt
       // awaiting this watcher registers its submit first.
       setTimeout(() => maybeStop(sid), 0).unref?.();
@@ -348,10 +421,27 @@ export function createDurableProvider(
     })();
     w.starting.catch((err) => {
       if (live.get(sid) === w) live.delete(sid);
-      states.delete(sid); // no watcher can tell us when it ends: fall back to "unknown"
+      // The state stays as it was: a busy run is still running without a watcher.
       log.warn?.(`[durable] watch ${sid} failed: ${err.message}`);
+      if (carry && !closed && states.get(sid) === "busy") scheduleReattach(sid, carry);
     });
     return w.starting;
+  }
+
+  /** Re-attach a dead watch with exponential backoff (baseMs, 2×, 4× … maxMs), giving up after maxTries. */
+  function scheduleReattach(sid, translator) {
+    const tries = reattachTries.get(sid) ?? 0;
+    if (tries >= backoff.maxTries) {
+      reattachTries.delete(sid);
+      log.error?.(`[durable] watch ${sid}: giving up re-attaching after ${tries} failed attempts; its frames stop reaching the ring`);
+      return;
+    }
+    reattachTries.set(sid, tries + 1);
+    const delay = Math.min(backoff.baseMs * 2 ** tries, backoff.maxMs);
+    setTimeout(() => {
+      if (closed || live.has(sid) || states.get(sid) !== "busy") return;
+      ensureWatcher(sid, translator).catch(() => {});
+    }, delay).unref?.();
   }
 
   function stopWatcher(sid) {
@@ -371,7 +461,7 @@ export function createDurableProvider(
    */
   function maybeStop(sid) {
     const w = live.get(sid);
-    if (!w || !w.watch || w.clients > 0 || w.pending > 0 || hub?.clientCount?.(sid) > 0) return;
+    if (!w || !w.watch || clientsOf(sid) > 0 || w.pending > 0 || hub?.clientCount?.(sid) > 0) return;
     if (states.get(sid) === "busy") return;
     const v = w.view;
     if (v?.docs?.["pi.live"]?.run || v?.docs?.["pi.inbox"]?.items?.length || w.translator?.busy) return;
@@ -546,16 +636,14 @@ export function createDurableProvider(
 
     watchTranscript(sessionId) {
       if (!map.get(sessionId)) return;
-      const p = ensureWatcher(sessionId);
-      const w = live.get(sessionId);
-      if (w) w.clients += 1;
-      p.catch(() => {});
+      clientCounts.set(sessionId, clientsOf(sessionId) + 1);
+      ensureWatcher(sessionId).catch(() => {});
     },
 
     unwatchTranscript(sessionId) {
-      const w = live.get(sessionId);
-      if (!w) return;
-      w.clients = Math.max(0, w.clients - 1);
+      const n = clientsOf(sessionId) - 1;
+      if (n > 0) clientCounts.set(sessionId, n);
+      else clientCounts.delete(sessionId);
       maybeStop(sessionId);
     },
 
@@ -661,41 +749,49 @@ export function createDurableProvider(
       provider.forgetSession(sessionId);
     },
 
-    /** Every live (non-archived) agent; status and last-line lookups run concurrently. */
-    async listAgents() {
+    /**
+     * Live (non-archived) agents seen in the last 7 days (`{all:true}`: every one),
+     * newest first; status and last-line lookups run in batches of 8.
+     */
+    async listAgents({ all = false } = {}) {
       await opened;
-      const rows = [...map.rows()].filter((r) => r.conversation_id != null).reverse(); // newest first
-      return Promise.all(
-        rows.map(async (r) => {
-          let state = states.get(r.sid) ?? "idle";
-          let lastLine = "";
-          try {
-            state = await stateOf(r.sid, r.conversation_id);
-            const w = live.get(r.sid);
-            if (w?.view) lastLine = lastLineOf(w.view.entries);
-            else if (lastLines.has(r.sid)) lastLine = lastLines.get(r.sid);
-            else {
-              const conv = await durable.harness.conversation(r.conversation_id, ctx());
-              const page = conv ? await conv.entries({}, 20, undefined, ctx()) : { items: [] };
-              lastLine = lastLineOf([...page.items].reverse());
-              lastLines.set(r.sid, lastLine);
-            }
-          } catch (err) {
-            log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
+      const seenSince = all ? 0 : Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
+      const rows = [...map.rows({ seenSince })].filter((r) => r.conversation_id != null).reverse(); // newest first
+      const out = [];
+      for (let i = 0; i < rows.length; i += LIST_BATCH) {
+        out.push(...(await Promise.all(rows.slice(i, i + LIST_BATCH).map(agentRow))));
+      }
+      return out;
+
+      async function agentRow(r) {
+        let state = states.get(r.sid) ?? "idle";
+        let lastLine = "";
+        try {
+          state = await stateOf(r.sid, r.conversation_id);
+          const w = live.get(r.sid);
+          if (w?.view) lastLine = lastLineOf(w.view.entries);
+          else if (lastLines.has(r.sid)) lastLine = lastLines.get(r.sid);
+          else {
+            const conv = await durable.harness.conversation(r.conversation_id, ctx());
+            const page = conv ? await conv.entries({}, 20, undefined, ctx()) : { items: [] };
+            lastLine = lastLineOf([...page.items].reverse());
+            lastLines.set(r.sid, lastLine);
           }
-          return {
-            sid: r.sid,
-            name: r.name,
-            cwd: r.cwd,
-            model: modelLabel(r),
-            state,
-            origin: r.origin,
-            createdAt: r.created_at * 1000,
-            lastSeen: r.last_seen * 1000,
-            lastLine,
-          };
-        }),
-      );
+        } catch (err) {
+          log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
+        }
+        return {
+          sid: r.sid,
+          name: r.name,
+          cwd: r.cwd,
+          model: modelLabel(r),
+          state,
+          origin: r.origin,
+          createdAt: r.created_at * 1000,
+          lastSeen: r.last_seen * 1000,
+          lastLine,
+        };
+      }
     },
 
     /**
@@ -706,6 +802,7 @@ export function createDurableProvider(
     async stopAll({ abort = false } = {}) {
       if (closed) return;
       closed = true;
+      clearInterval(pruneTimer);
       try {
         await ready;
       } catch {
@@ -732,6 +829,8 @@ export function createDurableProvider(
     },
     _live: live,
     _childParents: childParents,
+    _childRoles: childRoles,
+    _clientCounts: clientCounts,
     _lastLines: lastLines,
     _idleWaiters: idleWaiters,
     _untilIdle: untilIdle,

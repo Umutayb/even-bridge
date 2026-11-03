@@ -584,3 +584,25 @@ test("the shell env also drops api keys, credentials and private values", () => 
   guardPrepare(ex, { wrapper: "none", baseEnv });
   assert.deepEqual(ex.env, { PATH: "/usr/bin", NODE_ENV: "x", OK: "1" });
 });
+
+test("readonly: writes, removals, git mutation and inline interpreter code are refused; reads pass", () => {
+  const s = sandbox();
+  const ro = (cmd) => judgeCommand(cmd, s.cwd, s.home, { tmp: s.tmp, readonly: true }).block;
+  for (const cmd of ["echo x > f", "cat a | tee b", "touch z", "mkdir d", "rm a.txt", "cp a b", "mv a b", "sed -i s/a/b/ f",
+    "git commit -m x", "git add .", "git checkout main", "git branch new", "git stash", "git config user.name x",
+    "bash -c 'touch z'", "python3 -c 'open(\"f\",\"w\")'", "node -e 1"]) {
+    assert.match(ro(cmd) ?? "", /^read-only agent: /, cmd);
+  }
+  for (const cmd of ["ls", "cat a/b", "grep -r foo .", "git status", "git log -3", "git diff HEAD~1", "git branch", "git branch -a",
+    "git tag -l", "git config --get user.name", "git stash list", "ls > /dev/null", "npm test"]) {
+    assert.equal(ro(cmd), undefined, cmd);
+  }
+  // Not readonly: the same write is fine inside the workspace.
+  assert.equal(judgeCommand("echo x > f", s.cwd, s.home, { tmp: s.tmp }).block, undefined);
+  const log = () => {};
+  const o = { cwd: s.cwd, home: s.home, tmp: s.tmp, readonly: true, log };
+  assert.match(guardBeforeTool({ name: "write", arguments: { path: "x" } }, o).block, /read-only agent: write is refused/);
+  assert.match(guardBeforeTool({ name: "edit", arguments: { path: "x" } }, o).block, /read-only agent: edit is refused/);
+  assert.equal(guardBeforeTool({ name: "read", arguments: { path: "a/b" } }, o), undefined);
+  s.done();
+});
