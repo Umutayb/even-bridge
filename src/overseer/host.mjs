@@ -164,11 +164,11 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
 /** A list row as one fenced line for the model (untrusted fields defused and cut). */
 export function rowLine(r) {
   const parts = [
-    `id ${r.id}`,
+    `id ${defuse(r.id, { oneLine: true, max: 80 })}`,
     `kind ${r.kind}`,
     r.engine ? `engine ${r.engine}` : null,
     r.title ? `name "${defuse(r.title, { oneLine: true, max: LINE_MAX })}"` : null,
-    `state ${r.state}`,
+    `state ${defuse(r.state, { oneLine: true, max: 40 })}`,
     `driver ${r.driver}`,
     r.ageS != null ? `age ${r.ageS}s` : null,
     r.cwd ? `cwd ${defuse(r.cwd, { oneLine: true, max: LINE_MAX })}` : null,

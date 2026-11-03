@@ -321,13 +321,17 @@ export function removeStaleRegistry(pid, { root = LC_REGISTRY_ROOT, alive = pidA
 
 /**
  * Does the git repo of `dir` track a `.pi` dir anywhere? Such a repo cannot host a lets-code agent:
- * sealing would quarantine tracked files (a deletion an agent or the factory then commits). Not a repo,
- * or git failing: false.
+ * sealing would quarantine tracked files (a deletion an agent or the factory then commits). Not a repo:
+ * false. Any other git failure (timeout, git missing, dubious ownership, a corrupt index): true, so the
+ * caller refuses (fail closed), with the reason logged.
  */
-export function tracksDotPi(dir, { git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }) } = {}) {
+export function tracksDotPi(dir, { git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }), log = console } = {}) {
   try {
     return String(git(["ls-files", "--", ":(glob).pi/**", ":(glob)**/.pi/**"], dir)).trim() !== "";
-  } catch {
-    return false;
+  } catch (err) {
+    const said = `${err?.stderr ?? ""} ${err?.message ?? ""}`;
+    if (/not a git repository/i.test(said)) return false;
+    log?.warn?.(`[durable:lc] git ls-files in ${dir} failed (${String(err?.code ?? err?.signal ?? "").trim() || said.trim().split("\n")[0].slice(0, 160)}); refusing it as a repo that tracks .pi`);
+    return true;
   }
 }

@@ -99,6 +99,13 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
     while (asks.done.length > ASKS_DONE_KEEP) asks.done.shift();
   }
 
+  /** An ask whose answer went to the outbox: a retry of it is never answered again (it would be heard twice). */
+  function noteDelivered(asks, requestId) {
+    asks.delivered ??= [];
+    if (!asks.delivered.includes(requestId)) asks.delivered.push(requestId);
+    while (asks.delivered.length > ASKS_DONE_KEEP) asks.delivered.shift();
+  }
+
   async function reconcileOnce() {
     const asks = await harness.snapshot(OverseerAsks, ROOT_CONVERSATION_ID, ctx);
     for (const p of asks?.pending ?? []) {
@@ -113,6 +120,7 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
         if (i < 0) return null; // moved by someone else meanwhile
         a.pending.splice(i, 1);
         noteDone(a, p.requestId);
+        noteDelivered(a, p.requestId);
         return { ...pushOutbox(await tx.doc(OverseerOutbox, ROOT_CONVERSATION_ID), { kind, text, requestId: p.requestId }) };
       }, ctx);
       if (item) told(item);
@@ -130,7 +138,12 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
     const d = await durable.ready;
     harness = d.harness;
     ctx = d.ctx;
-    await harness.root(ctx); // the provider created and configured it before resuming
+    // Fail closed: the provider created and configured the root before resuming; it must have the
+    // overseer's extension only (no CodingTools), else the overseer is not reported on.
+    if (durable.overseerError) throw new Error(`overseer root setup failed: ${durable.overseerError.message}`);
+    const agent = await (await harness.root(ctx)).agent(ctx);
+    const names = agent.extensions.map((e) => e.name);
+    if (names.length !== 1 || names[0] !== "even-overseer") throw new Error(`overseer root has extensions [${names.join(", ")}], expected [even-overseer]`);
     await reconcile();
     // Asks still running after a restart: their answers reach the outbox as soon as they settle.
     const asks = await harness.snapshot(OverseerAsks, ROOT_CONVERSATION_ID, ctx);
@@ -159,7 +172,7 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
       const root = await harness.root(ctx);
       hold(requestId);
       try {
-        const submissionId = await harness.commit(async (tx) => {
+        const { submissionId, delivered } = await harness.commit(async (tx) => {
           // Before any table write (Durable's rule for submit(tx)); doc reads and writes may follow.
           const id = await root.submit(tx, { type: "input", content: question, requestId, whenBusy: "followUp" });
           const asks = await tx.doc(OverseerAsks, ROOT_CONVERSATION_ID);
@@ -167,8 +180,10 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
           if (!asks.pending.some((p) => p.requestId === requestId) && !asks.done.includes(requestId)) {
             asks.pending.push({ requestId, submissionId: id, at: Date.now() });
           }
-          return id;
+          return { submissionId: id, delivered: (asks.delivered ?? []).includes(requestId) };
         }, ctx);
+        // Its answer is already in the outbox ("what's new" says it): never a second copy here.
+        if (delivered) return { status: "pending", requestId };
         const sub = await harness.submission(submissionId, ctx);
         let rec = await sub.status(ctx);
         if (!settledStatus(rec.status) && wait > 0) {

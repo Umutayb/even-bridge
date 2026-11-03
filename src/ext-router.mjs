@@ -290,7 +290,9 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
     out.push(...local);
     for (const p of ext) out.push(...(extLists.get(p.name) || []));
-    out.sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+    // Durable rows carry epoch ms, CC/RC/pi rows ISO strings: compare as ms (the wire values stay as they are).
+    const ms = (t) => (typeof t === "number" ? t : Date.parse(t ?? "") || 0);
+    out.sort((a, b) => ms(b.timestamp) - ms(a.timestamp));
     if (overseer?.sid) {
       // The overseer is pinned first (plan ruling 6), whatever the other rows' timestamps.
       const i = out.findIndex((s) => s.id === overseer.sid);

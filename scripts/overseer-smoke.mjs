@@ -218,6 +218,11 @@ async function main() {
   // The overseer's own transcript (what the phone Terminal shows): which tools it used.
   const h = (await api("GET", "/sessions/dur-overseer/history?limit=6")).json?.history ?? [];
   for (const x of h) say(`  overseer history ${x.role}: ${short(x.text, 200)}`);
+  // The answer must come from the tools, not a lucky guess: the transcript shows sessions_list / session_read.
+  const msgs = (await api("GET", "/messages?sessionId=dur-overseer&after=0")).json?.messages ?? [];
+  const used = msgs.map((m) => m.message ?? m).filter((f) => f?.type === "tool_start" || f?.type === "tool_end").map((f) => f.name);
+  say(`  overseer tools used: ${[...new Set(used)].join(", ") || "none"}`);
+  if (!used.some((n) => n === "sessions_list" || n === "session_read")) fail("the overseer answered without sessions_list or session_read");
 
   // The live bridge does not know the throwaway session.
   const live = await fetch(`http://127.0.0.1:${LIVE_PORT}/api/sessions`, { headers: { authorization: `Bearer ${TOKEN}` }, signal: AbortSignal.timeout(15_000) })

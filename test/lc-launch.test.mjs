@@ -319,3 +319,19 @@ test("tracksDotPi: a repo tracking .pi (top or nested) is found; untracked or no
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("tracksDotPi fails closed: not a repo is false, any other git error refuses (true) with a log line", () => {
+  const warned = [];
+  const log = { warn: (l) => warned.push(l) };
+  const throwing = (props) => () => {
+    throw Object.assign(new Error(props.message ?? "Command failed: git ls-files"), props);
+  };
+  assert.equal(tracksDotPi("/x", { git: throwing({ stderr: "fatal: not a git repository (or any of the parent directories): .git\n", status: 128 }), log }), false);
+  assert.equal(warned.length, 0);
+  assert.equal(tracksDotPi("/x", { git: throwing({ code: "ETIMEDOUT", signal: "SIGTERM" }), log }), true, "a timeout refuses");
+  assert.equal(tracksDotPi("/x", { git: throwing({ code: "ENOENT", message: "spawnSync git ENOENT" }), log }), true, "git missing refuses");
+  assert.equal(tracksDotPi("/x", { git: throwing({ stderr: "fatal: detected dubious ownership in repository at '/x'", status: 128 }), log }), true);
+  assert.equal(tracksDotPi("/x", { git: throwing({ stderr: "error: index file corrupt", status: 128 }), log }), true);
+  assert.equal(warned.length, 4);
+  assert.match(warned[0], /refusing/);
+});

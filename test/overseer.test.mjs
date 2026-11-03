@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableProvider } from "../src/providers/durable/provider.mjs";
 import { createOverseerHost } from "../src/overseer/host.mjs";
-import { createOverseerExtension } from "../src/overseer/extension.mjs";
+import { createOverseerExtension, NOTES_OPEN } from "../src/overseer/extension.mjs";
 import { createOverseer, overseerProviderOptions, OVERSEER_INSTRUCTIONS, OverseerAsks, ROOT_CONVERSATION_ID } from "../src/overseer/overseer.mjs";
 import { startFakeOpenAI, fakeModelsJson } from "./helpers/fake-openai.mjs";
 
@@ -180,7 +180,9 @@ test("notes_put refuses more than 16 KB", async () => {
     mark = fake.requests.length;
     await s.overseer.ask('TOOL notes_put {"text":"watch the docs agent"}', { requestId: "q6", waitMs: 10000 });
     await s.overseer.ask("CALL notes_get", { requestId: "q7", waitMs: 10000 });
-    assert.ok(toolTexts(mark).some((t) => t.includes("watch the docs agent")), "notes_get reads what notes_put wrote");
+    const read = toolTexts(mark).find((t) => t.includes("watch the docs agent"));
+    assert.ok(read, "notes_get reads what notes_put wrote");
+    assert.ok(read.includes(NOTES_OPEN.slice(2, 12)) && read.includes("end of notes"), "notes come back fenced");
   } finally {
     await s.provider.stopAll();
   }
@@ -231,8 +233,50 @@ test("the notify tool writes the outbox; more than 500 characters is refused", a
     const mark = fake.requests.length;
     await s.overseer.ask(`TOOL notify {"text":"${"y".repeat(501)}"}`, { requestId: "q11", waitMs: 10000 });
     assert.equal((await s.overseer.outbox({ since: 0 })).items.length, 1);
-    assert.ok(toolTexts(mark).length > 0);
+    const refusal = toolTexts(mark).find((t) => /at most 500 characters/.test(t));
+    assert.ok(refusal, `the 501-character note is refused: ${toolTexts(mark).map((t) => t.slice(0, 200)).join(" | ")}`);
   } finally {
     await s.provider.stopAll();
   }
+});
+
+test("a retry of an ask whose answer went to the outbox is not answered again", async () => {
+  const s = await open(newDir());
+  try {
+    assert.equal((await s.overseer.ask("SLOW late one", { requestId: "q12", waitMs: 50 })).status, "pending");
+    await until(async () => (await s.overseer.outbox({ since: 0 })).items.some((i) => i.requestId === "q12"));
+    assert.deepEqual(await s.overseer.ask("SLOW late one", { requestId: "q12", waitMs: 5000 }), { status: "pending", requestId: "q12" });
+    assert.equal((await s.overseer.outbox({ since: 0 })).items.filter((i) => i.requestId === "q12").length, 1);
+    assert.equal((await userEntries(s, "SLOW late one")).length, 1);
+  } finally {
+    await s.provider.stopAll();
+  }
+});
+
+test("notify: at most 3 notes per run", async () => {
+  const extension = createOverseerExtension({ host: {} });
+  const notify = extension.tools.find((t) => t.name === "notify");
+  const box = { seq: 0, readUpTo: 0, items: [], notifyRun: null };
+  let run = { first: 10 };
+  const api = {
+    conversationId: 1,
+    snapshot: async () => ({ run }),
+    commit: async (fn) => fn({ doc: async () => box }),
+  };
+  const results = [];
+  for (let i = 0; i < 4; i++) results.push(await notify.execute({ text: `n${i}` }, api, {}));
+  assert.deepEqual(results.map((r) => Boolean(r.isError)), [false, false, false, true]);
+  assert.match(results[3].output[0].text, /at most 3 notes per run/);
+  run = { first: 20 }; // the next run may write again
+  assert.equal((await notify.execute({ text: "next run" }, api, {})).isError, undefined);
+  assert.deepEqual(box.items.map((i) => i.text), ["n0", "n1", "n2", "next run"]);
+});
+
+test("the overseer fails closed when its root is not set up as the overseer", async () => {
+  const fakeDurable = (extensions, overseerError = null) => ({
+    overseerError,
+    ready: Promise.resolve({ ctx: {}, harness: { root: async () => ({ agent: async () => ({ extensions: extensions.map((name) => ({ name })) }) }) } }),
+  });
+  await assert.rejects(createOverseer({ durable: fakeDurable(["even-overseer", "coding-tools"]), log: quiet }).ready, /expected \[even-overseer\]/);
+  await assert.rejects(createOverseer({ durable: fakeDurable(["even-overseer"], new Error("disk full")), log: quiet }).ready, /root setup failed: disk full/);
 });

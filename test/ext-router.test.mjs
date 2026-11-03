@@ -827,3 +827,25 @@ test("GET /sessions pins the overseer first", async (t) => {
   const ids2 = (await (await fetch(`${await listen(t, off.app)}/api/sessions?limit=10`)).json()).sessions.map((s) => s.id);
   assert.notEqual(ids2[0], "dur-overseer", "without the overseer nothing is pinned");
 });
+
+test("GET /sessions sorts durable (ms) and CC/RC/pi (ISO) rows by time; the overseer stays pinned", async (t) => {
+  const newer = Date.parse("2025-07-01T00:00:00Z");
+  const durable = { ...stubDurable(), listSessions: async () => [
+    { id: "dur-overseer", title: "Overseer", timestamp: 5, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-new", title: "a", timestamp: newer, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-old", title: "b", timestamp: Date.parse("2025-01-01T00:00:00Z"), cwd: "/w", provider: "claude", status: null },
+  ] };
+  // local 2025-04-01, rc 2025-05-01, pi 2025-06-01 (ISO strings); an empty CC dir, so the local stub answers
+  const rcTranscriptBase = mkdtempSync(join(tmpdir(), "er-cc-"));
+  t.after(() => rmSync(rcTranscriptBase, { recursive: true, force: true }));
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, rcTranscriptBase });
+  let base = await listen(t, off.app);
+  let ids = (await (await fetch(`${base}/api/sessions?limit=1`)).json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids, ["dur-new"], "a durable row newer than every ISO row comes first");
+  ids = (await (await fetch(`${base}/api/sessions?limit=10`)).json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids, ["dur-new", "pi-1", "rc-1", "local-1", "dur-old", "dur-overseer"]);
+  const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, rcTranscriptBase, overseer: { ...stubOverseer(), sid: "dur-overseer" } });
+  base = await listen(t, on.app);
+  ids = (await (await fetch(`${base}/api/sessions?limit=3`)).json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids, ["dur-overseer", "dur-new", "pi-1"]);
+});

@@ -300,6 +300,7 @@ export function createDurableProvider(
     map.byConversation = (id) => (id === ROOT_CONVERSATION_ID ? overseerRow() : byConversation(id));
   }
   const isOverseer = (sid) => Boolean(ov) && sid === ov.sid;
+  let overseerError = null; // the root could not be created/configured (the overseer stays off)
   const notTheOverseer = (sid) => {
     if (isOverseer(sid)) throw httpError(403, "The overseer cannot be stopped or archived");
   };
@@ -472,6 +473,8 @@ export function createDurableProvider(
           const root = await durable.harness.root(durable.ctx, { agent });
           await root.configure(agent, durable.ctx); // an existing root follows this build's agent
         } catch (err) {
+          // Fail closed: createOverseer refuses to start and dur-overseer is not listed.
+          overseerError = err;
           log.warn?.(`[durable] overseer root: ${err.message}`);
         }
       }
@@ -827,7 +830,7 @@ export function createDurableProvider(
         .list({ limit, cwd })
         .filter((r) => r.conversation_id != null)
         .map((r) => ({ id: r.sid, title: r.name, timestamp: r.last_seen * 1000, cwd: r.cwd, provider: WIRE_PROVIDER, status: null }));
-      if (!ov || (cwd && cwd !== defaultCwd)) return rows;
+      if (!ov || overseerError || (cwd && cwd !== defaultCwd)) return rows;
       // The overseer first (the phone Terminal opens it like any session).
       return [{ id: ov.sid, title: ov.title, timestamp: Date.now(), cwd: defaultCwd ?? "", provider: WIRE_PROVIDER, status: null }, ...rows].slice(0, limit);
     },
@@ -1174,6 +1177,11 @@ export function createDurableProvider(
       if (!isLc(row)) throw httpError(409, "the factory needs the lets-code engine");
       await ready;
       return lcEngine.setFactory(sessionId, on, opts);
+    },
+
+    /** Why the overseer's root could not be set up, or null. */
+    get overseerError() {
+      return overseerError;
     },
 
     _map: map,

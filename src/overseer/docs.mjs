@@ -13,6 +13,8 @@ export const NOTES_CAP_BYTES = 16384;
 export const OUTBOX_KEEP = 50;
 export const ASK_WAIT_MAX_MS = 15000;
 export const NOTIFY_MAX_CHARS = 500;
+/** notify calls one overseer run may make (an injected loop cannot flood the outbox and evict late answers). */
+export const NOTIFY_PER_RUN = 3;
 /** Settled asks remembered after they left `pending` (a retried requestId never lands in the outbox twice). */
 export const ASKS_DONE_KEEP = 200;
 export const OUTBOX_KINDS = Object.freeze(["answer", "notify", "action", "checkin", "system"]);
@@ -26,14 +28,15 @@ export const OverseerOutbox = defineDoc({
   kind: "even.overseer.outbox",
   version: 1,
   ...latest,
-  initial: () => ({ seq: 0, readUpTo: 0, items: [] }),
+  initial: () => ({ seq: 0, readUpTo: 0, items: [], notifyRun: null }),
 });
 
 export const OverseerAsks = defineDoc({
   kind: "even.overseer.asks",
   version: 1,
   ...latest,
-  initial: () => ({ pending: [], done: [] }),
+  // done: requestIds settled (answered in time or moved to the outbox); delivered: those moved to the outbox.
+  initial: () => ({ pending: [], done: [], delivered: [] }),
 });
 
 /**
