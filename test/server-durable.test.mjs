@@ -6,7 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cwdAllowed, durableEnabled, durableOptions } from "../src/server.mjs";
+import { cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT } from "../src/server.mjs";
 import { fakeModelsJson } from "./helpers/fake-openai.mjs";
 
 const CHILD = fileURLToPath(new URL("./helpers/server-child.mjs", import.meta.url));
@@ -56,8 +56,14 @@ test("cwdAllowed: strictly below a root, never ~ or /, ~ roots expand", (t) => {
   assert.equal(cwdAllowed("/etc", ["~/x"], home), false);
   assert.equal(cwdAllowed(home, [], home), false, "never ~");
   assert.equal(cwdAllowed("/", [], home), false, "never /");
-  assert.equal(cwdAllowed("/etc", [], home), true, "no roots = anywhere else");
+  assert.equal(cwdAllowed("/etc", [], home), false, "no roots = the default root only");
+  assert.equal(cwdAllowed("~/sandbox/agents/a", [], home), true, "default root");
   assert.equal(cwdAllowed(undefined, [], home), false);
+});
+
+test("the mirrored default root matches the provider's", async () => {
+  const { DEFAULT_AGENT_ROOT } = await import("../src/providers/durable/provider.mjs");
+  assert.equal(DURABLE_DEFAULT_ROOT, DEFAULT_AGENT_ROOT);
 });
 
 test("a ~ root from EVEN_BRIDGE_DURABLE_CWDS reaches the provider's resolveAgentCwd and accepts ~/x/y", async (t) => {

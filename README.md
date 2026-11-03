@@ -173,7 +173,7 @@ bridge never loads pi-durable and every route behaves as before.
 | `EVEN_BRIDGE_DURABLE_ENABLE` | off | `1` enables the `durable` provider and the `/api/agents` endpoints |
 | `EVEN_BRIDGE_DURABLE_STORE` | `~/.even-terminal/durable.sqlite` | Durable's SQLite store (the bridge's session index sits next to it as `<store>.sessions.sqlite`); one bridge process per store |
 | `EVEN_BRIDGE_DURABLE_MODELS` | `~/.pi/agent/models.json` | lets-code's models.json (default model = the private vLLM) |
-| `EVEN_BRIDGE_DURABLE_CWDS` | empty = any existing dir except `~` and `/` | colon-separated roots, e.g. `~/github:~/sandbox/agents`; a new agent's cwd must lie **strictly below** a root (a bare root is refused; a missing dir below a root is created). A prompt without `cwd` uses the project dir (`PROJECT_DIR`/`--cwd`), so that dir must itself sit below a root or such prompts get a 400 |
+| `EVEN_BRIDGE_DURABLE_CWDS` | `~/sandbox/agents` | colon-separated roots, e.g. `~/github:~/sandbox/agents`; a new agent's cwd must lie **strictly below** a root (a bare root is refused; a missing dir below a root is created). A prompt without `cwd` uses the project dir (`PROJECT_DIR`/`--cwd`), so that dir must itself sit below a root or such prompts get a 400 |
 | `BWRAP` | off | `1` runs agent bash commands under `bwrap` when installed, instead of `systemd-run --user --scope` resource caps |
 
 The startup line reads `durable=on` once the store is open and resumed,

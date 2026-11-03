@@ -75,11 +75,14 @@ export function durableOptions(env = process.env, { cwd } = {}) {
   return opts;
 }
 
+/** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
+export const DURABLE_DEFAULT_ROOT = "~/sandbox/agents";
+
 /**
  * Would a new agent be allowed to work in `dir`? The same rule as the
- * provider's resolveAgentCwd (strictly below a root; never ~ or /; empty roots
- * = anywhere else) but without its side effect (it creates missing dirs).
- * Used for the startup warning about the default cwd.
+ * provider's resolveAgentCwd (strictly below a root; never ~ or /; no roots
+ * configured = DURABLE_DEFAULT_ROOT) but without its side effect (it creates
+ * missing dirs). Used for the startup warning about the default cwd.
  */
 export function cwdAllowed(dir, roots = [], home = homedir()) {
   if (!dir) return false;
@@ -87,8 +90,9 @@ export function cwdAllowed(dir, roots = [], home = homedir()) {
   const real = (p) => (existsSync(p) ? realpathSync(p) : p);
   const d = real(expand(dir));
   if (d === real(home) || d === "/") return false;
-  const rs = roots.filter(Boolean).map((r) => real(expand(r)));
-  return rs.length === 0 || rs.some((r) => d.startsWith(r + sep));
+  const configured = roots.filter(Boolean);
+  const rs = (configured.length ? configured : [DURABLE_DEFAULT_ROOT]).map((r) => real(expand(r)));
+  return rs.some((r) => d.startsWith(r + sep));
 }
 
 /**
@@ -165,7 +169,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
     if (durableProvider && !cwdAllowed(durableOpts.defaultCwd, durableOpts.allowedCwds)) {
       console.warn(
         `[bridge] durable: default cwd ${durableOpts.defaultCwd} is not under EVEN_BRIDGE_DURABLE_CWDS ` +
-          `(${durableOpts.allowedCwds.join(":") || "unset"}); prompts without a cwd will be refused`,
+          `(${durableOpts.allowedCwds.join(":") || `unset, so ${DURABLE_DEFAULT_ROOT}`}); prompts without a cwd will be refused`,
       );
     }
   }
