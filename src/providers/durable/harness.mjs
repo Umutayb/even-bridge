@@ -27,8 +27,9 @@ import { expandHome } from "./models.mjs";
  * @param {(report: object) => void} [o.onReport]
  * @param {boolean} [o.resume=true] call `harness.resume()` at once. Pass false when the host must
  *   rebuild state the resumed tasks need first (the guard's cwd map); it then calls `resume()` itself.
+ * @param {{ now?: () => number, setTimer?: Function }} [o.clock] the Harness clock and timers (tests: a fake clock).
  */
-export async function openDurable({ storePath, storage, models, registry, envFor, telemetryOff = true, settings = {}, onReport, resume = true } = {}) {
+export async function openDurable({ storePath, storage, models, registry, envFor, telemetryOff = true, settings = {}, onReport, resume = true, clock } = {}) {
   if (telemetryOff) process.env.PI_TELEMETRY = "0";
   if (!storage) {
     if (!storePath) throw new Error("openDurable: storePath or storage is required");
@@ -46,6 +47,8 @@ export async function openDurable({ storePath, storage, models, registry, envFor
       identity: { attribution: null },
       settings: { ...settings, compaction: { enabled: true, ...(settings.compaction ?? {}) } },
       ...(onReport ? { onReport } : {}),
+      ...(clock?.now ? { now: clock.now } : {}),
+      ...(clock?.setTimer ? { setTimer: clock.setTimer } : {}),
     },
     ctx,
   );

@@ -924,6 +924,21 @@ test("POST /overseer/ask passes mode tell only when asked", async (t) => {
   ]);
 });
 
+test("POST /overseer/ask passes a hand-off on a told ask only", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  const handoff = { tag: "ideate:bees", label: "ideate-bees", ttlS: 27000 };
+  let r = await postJson(`${base}/api/overseer/ask`, { question: "work on it", requestId: "r1", waitMs: 0, handoff });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: "a hand-off needs mode tell" });
+  r = await postJson(`${base}/api/overseer/ask`, { question: "work on it", requestId: "r1", waitMs: 0, mode: "tell", handoff: [1] });
+  assert.deepEqual(await r.json(), { error: "'handoff' must be an object" });
+  r = await postJson(`${base}/api/overseer/ask`, { question: "work on it", requestId: "r1", waitMs: 0, mode: "tell", handoff });
+  assert.equal(r.status, 200);
+  assert.deepEqual(overseer.calls.ask, [["work on it", { requestId: "r1", waitMs: 0, mode: "tell", handoff }]]);
+});
+
 test("/overseer/actions routes fall through without the overseer's actions", async (t) => {
   const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer: stubOverseer() });
   const base = await listen(t, app);

@@ -17,10 +17,14 @@ import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, writeSync } fro
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { defineDoc } from "@earendil-works/pi-durable";
-import { OVERSEER_SID, OverseerOutbox, pushOutbox, ROOT_CONVERSATION_ID } from "./docs.mjs";
+import { HANDOFF_MODEL, OVERSEER_SID, OverseerHandoffs, OverseerOutbox, pushOutbox, ROOT_CONVERSATION_ID } from "./docs.mjs";
+import { hhmm } from "./checkins.mjs";
 
 export const ACTION_TTL_MS = 90000;
-export const ACTION_KINDS = Object.freeze(["session_start", "session_message", "session_interrupt", "session_stop", "model_switch"]);
+export const ACTION_KINDS = Object.freeze(["session_start", "session_message", "session_interrupt", "session_stop", "model_switch", "standing_order"]);
+/** A standing order: at most 3 uses, at most 12 h (plan ruling 12). */
+export const STANDING_MAX_TIMES = 3;
+export const STANDING_MAX_MS = 12 * 3600 * 1000;
 export const ACTION_STATES = Object.freeze(["pending", "confirmed", "denied", "expired", "failed"]);
 export const ACTION_ORIGINS = Object.freeze(["overseer", "evenai"]);
 /** Settled items kept in the doc (pending ones always stay). */
@@ -54,6 +58,8 @@ export const DEFAULT_DISABLE_FILE = "~/.even-terminal/agents.disabled";
 
 const latest = { scope: "conversation", history: "latest", fork: "initial", checkpointWhen: () => true };
 export const OverseerActions = defineDoc({ kind: "even.overseer.actions", version: 1, ...latest, initial: () => ({ items: [] }) });
+/** Confirmed standing orders `{ orders: [{ actionId, sid, text, maxTimes, used, until }] }` (used up / past ones pruned). */
+export const OverseerStanding = defineDoc({ kind: "even.overseer.standing", version: 1, ...latest, initial: () => ({ orders: [] }) });
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 /** A plain copy of a doc draft's item (drafts are unusable once their commit settled). */
@@ -89,7 +95,13 @@ export function summarize(kind, args = {}) {
       const engineWord = args.engine === "lets-code" ? "lets-code" : "native";
       const task = String(args.task ?? "");
       const what = `${task.slice(0, SUMMARY_TASK_MAX)}${task.length > SUMMARY_TASK_MAX ? "…" : ""}`;
-      return `Start ${engineWord} agent '${args.label}' in ${tildePath(args.cwd)} on ${args.model}${args.factory ? " with the factory on" : ""} to: "${what}"?`;
+      const until = args.until != null ? ` until ${hhmm(args.until)}` : "";
+      return `Start ${engineWord} agent '${args.label}' in ${tildePath(args.cwd)} on ${args.model}${until}${args.factory ? " with the factory on" : ""} to: "${what}"?`;
+    }
+    case "standing_order": {
+      const text = String(args.text ?? "");
+      const what = `${text.slice(0, 140)}${text.length > 140 ? "…" : ""}`;
+      return `Let the overseer tell agent '${args.label}' "${what}" up to ${args.maxTimes} time${args.maxTimes > 1 ? "s" : ""} until ${hhmm(args.until)}?`;
     }
     case "session_message": {
       const text = String(args.text ?? "");
@@ -219,7 +231,7 @@ export function createOverseerActions({
   /** The single-writer rules (spec): run at propose and again right before executing. */
   function writerCheck(kind, id, d) {
     if (d.kind === "durable" && id === OVERSEER_SID) throw httpError(403, "the overseer cannot act on itself");
-    if (kind === "session_message") {
+    if (kind === "session_message" || kind === "standing_order") {
       if (d.kind === "cc-local") throw httpError(403, "cc-local sessions are read-only for the overseer");
       if (d.kind === "pi" && String(d.driver).startsWith("terminal")) throw httpError(403, `${id} is driven from a terminal; the overseer only watches it`);
       return;
@@ -277,8 +289,57 @@ export function createOverseerActions({
       if (typeof steer !== "boolean") throw httpError(400, "'steer' must be true or false");
       return { id, label, text, steer };
     }
+    if (kind === "standing_order") {
+      // The later messages are sent without a confirm, so the text is short enough to be read in full.
+      const text = strArg(args.text, "text", { max: OVERSEER_TEXT_MAX });
+      if (COMMAND_RE.test(text)) throw httpError(400, NO_COMMANDS);
+      const maxTimes = args.maxTimes;
+      if (!Number.isInteger(maxTimes) || maxTimes < 1 || maxTimes > STANDING_MAX_TIMES) {
+        throw httpError(400, `'maxTimes' must be an integer from 1 to ${STANDING_MAX_TIMES}`);
+      }
+      const until = typeof args.until === "string" ? Date.parse(args.until) : args.until;
+      const t = now();
+      if (!Number.isFinite(until) || until <= t || until > t + STANDING_MAX_MS) throw httpError(400, "'until' must be within 12 hours from now");
+      return { id, label, text, maxTimes, until: Math.floor(until) };
+    }
     return { id, label };
   }
+
+  /** The hand-off a start proposed in `submissions` belongs to (a told instruction that carried one), or null. */
+  async function handoffOf(submissions) {
+    const subs = (submissions ?? []).map(String);
+    if (!subs.length) return null;
+    const doc = await harness.snapshot(OverseerHandoffs, ROOT_CONVERSATION_ID, ctx);
+    return plain((doc?.items ?? []).find((h) => subs.includes(String(h.submissionId))) ?? null);
+  }
+
+  /**
+   * A start for a hand-off is held to it (Ideate decision 8): its own folder only, qwen, at most the
+   * hand-off's TTL (to its deadline); the summary the user confirms names the folder, model, deadline and task.
+   */
+  async function handoffStart(raw, h) {
+    const args = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    if (args.cwd != null && args.cwd !== "" && resolve(expand(String(args.cwd), home)) !== h.cwd) {
+      throw httpError(400, `a hand-off agent works only in ${tildePath(h.cwd, home)}`);
+    }
+    if (args.model != null && args.model !== "" && args.model !== HANDOFF_MODEL) throw httpError(400, `a hand-off agent runs on ${HANDOFF_MODEL}`);
+    // The deadline is fixed when the hand-off is asked for (e.g. 07:00); the agent lives at most until then.
+    const deadline = h.at + h.ttlS * 1000;
+    const left = Math.floor((deadline - now()) / 1000);
+    if (left < TTL_S.min) throw httpError(409, "this hand-off's deadline has passed");
+    if (args.ttlS != null && (!Number.isInteger(args.ttlS) || args.ttlS < TTL_S.min)) throw httpError(400, `'ttlS' must be an integer from ${TTL_S.min} to ${left}`);
+    const ttlS = Math.min(args.ttlS ?? left, left);
+    const engines = Array.isArray(durable.engines) ? durable.engines : ["native"];
+    const out = await checkArgs(
+      "session_start",
+      { label: h.label, task: args.task, cwd: h.cwd, engine: engines.includes("lets-code") ? "lets-code" : "native", model: HANDOFF_MODEL, ttlS, ...(args.maxTurns != null ? { maxTurns: args.maxTurns } : {}), ...(args.factory != null ? { factory: args.factory } : {}) },
+      "overseer",
+    );
+    return { ...out, handoff: h.tag, until: Math.min(deadline, now() + ttlS * 1000) };
+  }
+
+  /** An unexpired action that waits for the user's answer (the one-at-a-time rule counts the overseer's own only). */
+  const waitsForUser = (i, t) => i.state === "pending" && i.expiresAt >= t && i.origin === "overseer" && !i.standing;
 
   /** The limits, at propose and again at confirm. */
   async function checkLimits(kind, args) {
@@ -308,7 +369,12 @@ export function createOverseerActions({
     await ready;
     if (!ACTION_KINDS.includes(kind)) throw httpError(400, `'kind' must be one of ${ACTION_KINDS.join(", ")}`);
     if (!ACTION_ORIGINS.includes(origin)) throw httpError(400, `invalid origin ${JSON.stringify(origin)}`);
-    const args = await checkArgs(kind, rawArgs, origin);
+    const h = kind === "session_start" && origin === "overseer" ? await handoffOf(submissions) : null;
+    const args = h ? await handoffStart(rawArgs, h) : await checkArgs(kind, rawArgs, origin);
+    if (kind === "session_message" && origin === "overseer") {
+      const done = await underStandingOrder(args, submissions);
+      if (done) return done;
+    }
     const items = (await snapshot()).items;
     if (requestId != null) {
       const same = items.find((i) => i.requestId === requestId && i.origin === origin);
@@ -319,8 +385,12 @@ export function createOverseerActions({
       }
     }
     // One question at a time: the phone's answer (it carries no id) and the spoken yes always mean this one.
+    // Only the overseer's own proposals wait for the user; Even AI's one gate is confirmed by the shim at once.
     const t0 = now();
-    if (items.some((i) => i.state === "pending" && i.expiresAt >= t0)) throw httpError(409, ONE_PENDING);
+    if (origin === "overseer" && items.some((i) => waitsForUser(i, t0))) throw httpError(409, ONE_PENDING);
+    if (h && items.some((i) => i.args?.handoff === h.tag && (i.state === "pending" || (i.state === "confirmed" && !i.error)))) {
+      throw httpError(409, "this hand-off already has an agent");
+    }
     await checkLimits(kind, args);
     const t = now();
     const item = {
@@ -337,22 +407,32 @@ export function createOverseerActions({
     if (submissions.length) item.submissions = submissions.map(String);
     const box = await harness.commit(async (tx) => {
       const doc = await tx.doc(OverseerActions, ROOT_CONVERSATION_ID);
+      // Checked again in the commit: two concurrent proposals never both pass (commits are serialized).
+      if (origin === "overseer" && doc.items.some((i) => waitsForUser(i, t))) throw httpError(409, ONE_PENDING);
+      if (h && doc.items.some((i) => i.args?.handoff === h.tag && (i.state === "pending" || (i.state === "confirmed" && !i.error)))) {
+        throw httpError(409, "this hand-off already has an agent");
+      }
       doc.items.push(item);
       prune(doc);
       return { ...pushOutbox(await tx.doc(OverseerOutbox, ROOT_CONVERSATION_ID), { kind: "action", text: item.summary, tag: item.id }) };
     }, ctx);
     note("propose", item);
-    frame({
-      type: "permission_request",
-      toolName: "overseer",
-      description: item.summary,
-      detail: kind === "session_start" ? `${kind}: ${args.task}` : kind === "session_message" ? `${kind}: ${args.text}` : kind,
-      toolUseId: item.id,
-      options: [
-        { text: "Yes", key: "allow" },
-        { text: "No", key: "deny" },
-      ],
-    });
+    // The phone's prompt is for the overseer's proposals; Even AI's own one-gate actions were already
+    // confirmed by the user's spoken yes, and the phone never answers them.
+    if (origin === "overseer") {
+      frame({
+        type: "permission_request",
+        toolName: "overseer",
+        description: item.summary,
+        detail:
+          kind === "session_start" ? `${kind}: ${args.task}` : kind === "session_message" || kind === "standing_order" ? `${kind}: ${args.text}` : kind,
+        toolUseId: item.id,
+        options: [
+          { text: "Yes", key: "allow" },
+          { text: "No", key: "deny" },
+        ],
+      });
+    }
     try {
       onOutbox(box);
     } catch {
@@ -361,7 +441,62 @@ export function createOverseerActions({
     return view(item);
   }
 
-  const view = (i) => ({ id: i.id, kind: i.kind, summary: i.summary, expiresAt: i.expiresAt, args: i.args });
+  const view = (i) => ({ id: i.id, kind: i.kind, summary: i.summary, expiresAt: i.expiresAt, args: i.args, ...(i.standing ? { standing: i.standing } : {}) });
+
+  /**
+   * A session_message of the overseer whose sid and EXACT text a confirmed standing order covers (uses
+   * left, before its `until`): one use is taken and the action is written in ONE commit, then it runs
+   * through the same confirm as any action (kill switch, driver probe, audit), without a new question.
+   * Returns the action's view with `standing` and `result`, or null (no order matches).
+   */
+  async function underStandingOrder(args, submissions) {
+    const t = now();
+    const item = await harness.commit(async (tx) => {
+      const st = await tx.doc(OverseerStanding, ROOT_CONVERSATION_ID);
+      st.orders = (st.orders ?? []).filter((o) => o.until >= t && o.used < o.maxTimes);
+      const o = st.orders.find((x) => x.sid === args.id && x.text === args.text);
+      if (!o) return null;
+      o.used += 1;
+      const it = {
+        id: "act-" + randomUUID().replace(/-/g, "").slice(0, 12),
+        kind: "session_message",
+        args,
+        summary: summarize("session_message", args),
+        origin: "overseer",
+        createdAt: t,
+        expiresAt: t + ttlMs,
+        state: "pending",
+        standing: o.actionId,
+        use: o.used,
+      };
+      if (submissions.length) it.submissions = submissions.map(String);
+      const doc = await tx.doc(OverseerActions, ROOT_CONVERSATION_ID);
+      doc.items.push(it);
+      prune(doc);
+      return plain(it);
+    }, ctx);
+    if (!item) return null;
+    audit.write({ event: "standing", id: item.id, kind: item.kind, origin: item.origin, summary: item.summary, by: "standing", order: item.standing, use: item.use });
+    const r = await confirm(item.id, { confirmFrameId: `standing:${item.standing}`, by: "standing" });
+    const t2 = now();
+    const out = await harness.commit(
+      async (tx) => ({
+        ...pushOutbox(await tx.doc(OverseerOutbox, ROOT_CONVERSATION_ID), {
+          kind: "system",
+          text: `Sent agent '${args.label}' "${args.text}" under your standing order (use ${item.use}).`,
+          tag: item.id,
+          at: t2,
+        }),
+      }),
+      ctx,
+    );
+    try {
+      onOutbox(out);
+    } catch {
+      /* a listener never fails an action */
+    }
+    return { ...view(item), result: r.result };
+  }
 
   // ── confirm / deny ────────────────────────────────────────────────────────
   const stored = (item) => {
@@ -414,7 +549,12 @@ export function createOverseerActions({
       if (claimed.kind !== "session_start" && claimed.kind !== "model_switch") {
         writerCheck(claimed.kind, claimed.args.id, await describe(claimed.args.id));
       }
-      result = claimed.kind === "model_switch" ? await modelSwitch(claimed) : await host.execute(claimed);
+      result =
+        claimed.kind === "model_switch"
+          ? await modelSwitch(claimed)
+          : claimed.kind === "standing_order"
+            ? await recordStanding(claimed)
+            : await host.execute(claimed);
     } catch (err) {
       const error = { statusCode: typeof err.statusCode === "number" ? err.statusCode : 500, message: String(err.message ?? err) };
       await commit((doc) => {
@@ -473,9 +613,34 @@ export function createOverseerActions({
     return (await snapshot()).items.filter((i) => i.state === "pending" && i.expiresAt >= t).map(view);
   }
 
-  /** The phone's answer to the permission_request on dur-overseer: the oldest pending action. */
+  /** A confirmed standing order is written; it runs nothing by itself. */
+  async function recordStanding(item) {
+    const { id: sid, text, maxTimes, until } = item.args;
+    await harness.commit(async (tx) => {
+      const st = await tx.doc(OverseerStanding, ROOT_CONVERSATION_ID);
+      const t = now();
+      st.orders = (st.orders ?? []).filter((o) => o.until >= t && o.used < o.maxTimes && o.actionId !== item.id);
+      st.orders.push({ actionId: item.id, sid, text, maxTimes, used: 0, until });
+    }, ctx);
+    return { order: item.id };
+  }
+
+  /** The confirmed standing orders with uses left (`[{ actionId, sid, text, maxTimes, used, until }]`). */
+  async function standing() {
+    await ready;
+    const t = now();
+    const st = await harness.snapshot(OverseerStanding, ROOT_CONVERSATION_ID, ctx);
+    return plain((st?.orders ?? []).filter((o) => o.until >= t && o.used < o.maxTimes));
+  }
+
+  /**
+   * The phone's answer to the permission_request on dur-overseer: the overseer's oldest pending action
+   * (Even AI's own one-gate actions never reach the phone, so the phone never answers them).
+   */
   async function respond(decision) {
-    const [oldest] = await pending();
+    await ready;
+    const t = now();
+    const oldest = (await snapshot()).items.find((i) => waitsForUser(i, t));
     if (!oldest) return false;
     if (String(decision ?? "").startsWith("allow")) {
       try {
@@ -597,6 +762,7 @@ export function createOverseerActions({
     deny,
     pending,
     respond,
+    standing,
     forSubmission,
     noteRefusal,
     refusedFor,

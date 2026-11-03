@@ -100,7 +100,7 @@ test("the overseer has no coding tools", async () => {
     const agent = await (await s.harness.root(s.ctx)).agent(s.ctx);
     assert.deepEqual(agent.extensions.map((e) => e.name), ["even-overseer"]);
     const tools = agent.tools.map((t) => t.name).sort();
-    assert.deepEqual(tools, ["notes_get", "notes_put", "notify", "session_interrupt", "session_message", "session_read", "session_start", "session_stop", "sessions_list"]);
+    assert.deepEqual(tools, ["checkin_cancel", "checkin_schedule", "notes_get", "notes_put", "notify", "session_interrupt", "session_message", "session_read", "session_start", "session_stop", "sessions_list", "standing_order"]);
     for (const t of ["bash", "read", "write", "edit", "subagent"]) assert.ok(!tools.includes(t), t);
     assert.equal(agent.maxTurns, 12);
     assert.equal(agent.instructions, OVERSEER_INSTRUCTIONS);

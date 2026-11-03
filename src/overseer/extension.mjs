@@ -3,15 +3,19 @@
 //   sessions_list {}            every session with its kind, state and driver (untrusted fields fenced)
 //   session_read {id, n?≤20}    status + last n history items, fenced as untrusted data, ≤ 4 KB
 //   notes_get {} / notes_put {text}   its own notes doc (≤ 16 KB)
-//   notify {text≤500}           a short item in the outbox Even AI reads
-// and four GATED tools that only propose (src/overseer/actions.mjs): session_start,
-// session_message, session_interrupt, session_stop. A proposal runs only after the user
-// confirms it outside the model (phone permission prompt, or Even AI's spoken yes).
+//   notify {text≤500, tag?}     a short item in the outbox Even AI reads (tag: a hand-off's only)
+//   checkin_schedule / checkin_cancel   a sleeping task that wakes the overseer later (capped; checkins.mjs)
+// and five GATED tools that only propose (src/overseer/actions.mjs): session_start,
+// session_message, session_interrupt, session_stop, standing_order. A proposal runs only after
+// the user confirms it outside the model (phone permission prompt, or Even AI's spoken yes); a
+// session_message a confirmed standing order covers (same session, exact text, uses and time left)
+// runs through the same confirm without a new question.
 // The tools call the host (src/overseer/host.mjs) in this process. `host` is the object the
 // server fills in once every provider exists (before the durable store resumes any run).
 import { defineExtension, defineTool, LiveDoc } from "@earendil-works/pi-durable";
 import { bytes, NOTES_CAP_BYTES, NOTIFY_MAX_CHARS, NOTIFY_PER_RUN, OverseerNotes, OverseerOutbox, pushOutbox } from "./docs.mjs";
 import { defuse, rowLine, UNTRUSTED_CLOSE } from "./host.mjs";
+import { createCheckinBox, createCheckinTasks, createCheckinTools } from "./checkins.mjs";
 
 export const OVERSEER_EXTENSION = "even-overseer";
 export const SESSION_READ_MAX_N = 20;
@@ -27,8 +31,9 @@ const obj = (properties, required = []) => ({ type: "object", properties, requir
  * @param {object} o
  * @param {object} o.host `{ sessionsList, sessionRead }` (filled in by the server before runs resume)
  * @param {(item: object) => void} [o.onOutbox] told about each new outbox item
+ * @param {object} [o.checkins] the check-in box (src/overseer/checkins.mjs createCheckinBox; the server binds it)
  */
-export function createOverseerExtension({ host, onOutbox } = {}) {
+export function createOverseerExtension({ host, onOutbox, checkins = createCheckinBox() } = {}) {
   const needHost = (fn) => {
     if (typeof host?.[fn] !== "function") throw new Error("the overseer host is not ready yet");
     return host[fn];
@@ -98,13 +103,22 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
 
   const notify = defineTool({
     name: "notify",
-    description: `Leave a short note (at most ${NOTIFY_MAX_CHARS} characters) in the outbox the user's glasses read ("what's new").`,
-    parameters: obj({ text: { type: "string", maxLength: NOTIFY_MAX_CHARS } }, ["text"]),
+    description:
+      `Leave a short note (at most ${NOTIFY_MAX_CHARS} characters) in the outbox the user's glasses read ("what's new"). ` +
+      "Give `tag` only when a hand-off told you to tag its results.",
+    parameters: obj({ text: { type: "string", maxLength: NOTIFY_MAX_CHARS }, tag: { type: "string", maxLength: 64 } }, ["text"]),
     // Not replay-safe: a rerun after a crash would add the note twice.
     async execute(args, api, context) {
       const t = String(args.text ?? "").trim();
       if (!t) return fail("the note is empty");
       if (t.length > NOTIFY_MAX_CHARS) return fail(`a note is limited to ${NOTIFY_MAX_CHARS} characters`);
+      let tag;
+      if (args.tag != null && args.tag !== "") {
+        // Only the tag of a hand-off the user started (the result is linked back to its source).
+        tag = String(args.tag);
+        const known = typeof host?.handoffTag === "function" ? await host.handoffTag(tag) : false;
+        if (!known) return fail("unknown tag: only a hand-off's tag may be used");
+      }
       // The run this call belongs to: its first entry (or its first input / generation task).
       const run = (await api.snapshot(LiveDoc, api.conversationId, context))?.run;
       const key = run?.first ?? run?.inputs?.[0] ?? run?.taskId;
@@ -116,7 +130,7 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
         const n = box.notifyRun?.key === runKey ? box.notifyRun.n : 0;
         if (n >= NOTIFY_PER_RUN) return null;
         box.notifyRun = { key: runKey, n: n + 1 };
-        return { ...pushOutbox(box, { kind: "notify", text: t }) };
+        return { ...pushOutbox(box, { kind: "notify", text: t, ...(tag ? { tag } : {}) }) };
       }, context);
       if (!item) return fail(`at most ${NOTIFY_PER_RUN} notes per run`);
       try {
@@ -141,6 +155,8 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
         const run = (await api.snapshot(LiveDoc, api.conversationId, context))?.run;
         try {
           const p = await actions.propose(name, args, { origin: "overseer", submissions: run?.inputs ?? [] });
+          // A message the user's standing order covers was sent at once (host-checked, exact text).
+          if (p.standing) return ok(`sent under the user's standing order (${p.id}): ${p.summary}`);
           return ok(`proposed (${p.id}), waiting for the user: ${p.summary}`);
         } catch (err) {
           actions.noteRefusal?.(run?.inputs ?? [], name, err.message ?? err);
@@ -177,9 +193,36 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
   );
   const sessionInterrupt = gated("session_interrupt", "Propose interrupting a bridge agent's current turn." + PROPOSE, { id: { type: "string" } }, ["id"]);
   const sessionStop = gated("session_stop", "Propose stopping (aborting and archiving) a bridge agent." + PROPOSE, { id: { type: "string" } }, ["id"]);
+  const standingOrder = gated(
+    "standing_order",
+    "Propose a standing order: once the user confirms it, a later session_message to that session with EXACTLY this text " +
+      "is sent without asking again, at most maxTimes times, until the given time (at most 12 hours)." +
+      PROPOSE,
+    {
+      id: { type: "string", description: "the session id from sessions_list" },
+      text: { type: "string", maxLength: 140, description: "the exact message, at most 140 characters" },
+      maxTimes: { type: "integer", minimum: 1, maximum: 3 },
+      until: { type: "string", description: "ISO-8601 time, at most 12 hours from now" },
+    },
+    ["id", "text", "maxTimes", "until"],
+  );
 
+  const tasks = createCheckinTasks(checkins);
   return defineExtension({
     name: OVERSEER_EXTENSION,
-    tools: [sessionsList, sessionRead, notesGet, notesPut, notify, sessionStart, sessionMessage, sessionInterrupt, sessionStop],
+    tools: [
+      sessionsList,
+      sessionRead,
+      notesGet,
+      notesPut,
+      notify,
+      ...createCheckinTools(checkins),
+      sessionStart,
+      sessionMessage,
+      sessionInterrupt,
+      sessionStop,
+      standingOrder,
+    ],
+    tasks: [tasks.checkin, tasks.nightly],
   });
 }

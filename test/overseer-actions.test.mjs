@@ -48,7 +48,7 @@ const newDir = () => {
  * One bridge process: provider + overseer + actions, as server.mjs wires them. `extra`: pi/cc/rc stubs,
  * `clock` (an object whose `t` is now), `slots` (Claude free slots), `failSetup`.
  */
-async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup } = {}) {
+async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup, handoffs = false } = {}) {
   const frames = [];
   const host = {};
   const extension = createOverseerExtension({ host });
@@ -68,8 +68,9 @@ async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup } = {})
   Object.assign(host, createOverseerHost({ durable: provider, pi, cc, rc, log: quiet }));
   await provider.ready;
   if (failSetup) return { provider, frames, dir };
-  const overseer = createOverseer({ durable: provider, host, log: quiet });
+  const overseer = createOverseer({ durable: provider, host, log: quiet, handoffs });
   await overseer.ready;
+  host.handoffTag = (t) => overseer.handoffTag(t);
   const actions = createOverseerActions({
     durable: provider,
     host,
@@ -550,5 +551,121 @@ test("a start cut off by a restart after its agent was created is found by its r
     assert.ok(lines.some((l) => l.id === p.id && l.event === "execute" && l.by === "restart"));
   } finally {
     await two.close();
+  }
+});
+
+// ── Task 6: one question at a time without races; Even AI's own actions; hand-offs ─────────
+
+test("two concurrent proposals: only one waits for the user", async () => {
+  const s = await open(newDir());
+  try {
+    const got = await Promise.allSettled([
+      s.actions.propose("session_start", { label: "race-a", task: "x" }, { origin: "overseer" }),
+      s.actions.propose("session_start", { label: "race-b", task: "y" }, { origin: "overseer" }),
+      s.actions.propose("session_start", { label: "race-c", task: "z" }, { origin: "overseer" }),
+    ]);
+    assert.equal(got.filter((g) => g.status === "fulfilled").length, 1, JSON.stringify(got.map((g) => g.status)));
+    for (const g of got.filter((x) => x.status === "rejected")) {
+      assert.equal(g.reason.statusCode, 409);
+      assert.equal(g.reason.message, "another action is waiting for your answer");
+    }
+    assert.equal((await items(s)).filter((i) => i.state === "pending").length, 1);
+    assert.equal(permissionFrames(s).length, 1);
+  } finally {
+    await s.close();
+  }
+});
+
+test("Even AI's one-gate actions are never blocked by a waiting proposal and never reach the phone", async () => {
+  const s = await open(newDir());
+  try {
+    const { sessionId } = await s.provider.prompt(undefined, "first", s.work, { name: "docs", origin: "evenai" });
+    await until(async () => (await s.provider.getSessionStatus(sessionId)) === "idle" && (await s.provider.getHistory(sessionId, 2)).length === 2);
+    const ovs = await s.actions.propose("session_interrupt", { id: sessionId }, { origin: "overseer" });
+    // The user's own staged message, already confirmed by a spoken yes: proposed and confirmed at once.
+    const g = await s.actions.propose("session_message", { id: sessionId, text: "add a README" }, { origin: "evenai", requestId: "tok-9" });
+    assert.deepEqual(permissionFrames(s).map((f) => f.toolUseId), [ovs.id], "no phone prompt for Even AI's action");
+    // The phone's answer means the overseer's proposal, never Even AI's.
+    assert.equal(await s.provider.respondPermission("dur-overseer", "deny"), true);
+    assert.equal((await items(s)).find((i) => i.id === ovs.id).state, "denied");
+    assert.equal((await items(s)).find((i) => i.id === g.id).state, "pending");
+    assert.equal(await s.provider.respondPermission("dur-overseer", "allow"), false, "nothing of the overseer waits");
+    assert.equal((await items(s)).find((i) => i.id === g.id).state, "pending", "the phone did not confirm it");
+    const r = await s.actions.confirm(g.id, { confirmFrameId: "q-9", by: "evenai" });
+    assert.equal(r.ok, true);
+    // And a pending Even AI action does not block the overseer's next question.
+    const g2 = await s.actions.propose("session_message", { id: sessionId, text: "and tests" }, { origin: "evenai", requestId: "tok-10" });
+    const ovs2 = await s.actions.propose("session_interrupt", { id: sessionId }, { origin: "overseer" });
+    assert.ok(g2.id && ovs2.id);
+  } finally {
+    await s.close();
+  }
+});
+
+test("a start proposed for a hand-off is held to its folder, qwen and deadline", async () => {
+  const s = await open(newDir(), { handoffs: true });
+  try {
+    const handoff = { tag: "ideate:bees", label: "ideate-bees", ttlS: 27000 };
+    // Claude is refused for a hand-off; nothing is proposed.
+    let r = await s.overseer.ask('TOOL session_start {"label":"bees","task":"develop design B","model":"sonnet"}', { requestId: "h1", waitMs: 10000, mode: "tell", handoff });
+    assert.deepEqual(r.actions, []);
+    assert.deepEqual(r.refused, [{ kind: "session_start", reason: "a hand-off agent runs on qwen" }]);
+    // Another folder is refused.
+    r = await s.overseer.ask(`TOOL session_start {"label":"bees","task":"develop design B","cwd":"${join(s.dir, "elsewhere")}"}`, { requestId: "h2", waitMs: 10000, mode: "tell", handoff });
+    assert.match(r.refused[0].reason, /^a hand-off agent works only in .*ideate-bees$/);
+    // The label, folder, model and deadline come from the hand-off, whatever the overseer named.
+    r = await s.overseer.ask('TOOL session_start {"label":"anything","task":"develop design B","ttlS":43200}', { requestId: "h3", waitMs: 10000, mode: "tell", handoff });
+    assert.equal(r.actions.length, 1, JSON.stringify(r));
+    const a = r.actions[0];
+    assert.equal(a.args.label, "ideate-bees");
+    assert.equal(a.args.cwd, join(s.dir, "ideate-bees"));
+    assert.equal(a.args.model, "qwen");
+    assert.equal(a.args.handoff, "ideate:bees");
+    assert.ok(a.args.ttlS <= 27000 && a.args.ttlS > 26900, String(a.args.ttlS));
+    assert.match(a.summary, /^Start native agent 'ideate-bees' in .*\/ideate-bees on qwen until \d\d:\d\d to: "develop design B"\?$/);
+    assert.equal(permissionFrames(s).at(-1).description, a.summary, "the phone asks the same");
+    await s.actions.confirm(a.id, { confirmFrameId: "f1" });
+    const [agent] = await s.provider.listAgents();
+    assert.equal(agent.origin, "overseer");
+    assert.equal(agent.cwd, join(s.dir, "ideate-bees"));
+    assert.ok(agent.ttlS <= 27000);
+    // One agent per hand-off.
+    r = await s.overseer.ask('TOOL session_start {"label":"x","task":"more"}', { requestId: "h4", waitMs: 10000, mode: "tell", handoff });
+    assert.deepEqual(r.refused, [{ kind: "session_start", reason: "this hand-off already has an agent" }]);
+    // A start outside the hand-off's run is an ordinary proposal.
+    r = await s.overseer.ask('TOOL session_start {"label":"plain","task":"x"}', { requestId: "h5", waitMs: 10000, mode: "tell" });
+    assert.equal(r.actions[0].args.handoff, undefined);
+    assert.equal(r.actions[0].args.label, "plain");
+  } finally {
+    await s.close();
+  }
+});
+
+test("hand-offs are refused while off; notify carries only a hand-off's tag", async () => {
+  const off = await open(newDir());
+  try {
+    await rejectsWith(off.overseer.ask("x", { requestId: "o1", mode: "tell", handoff: { tag: "ideate:a", label: "ideate-a", ttlS: 600 } }), 400, /^hand-offs are off$/);
+  } finally {
+    await off.close();
+  }
+  const s = await open(newDir(), { handoffs: true });
+  try {
+    const bad = [
+      [{ tag: "Ideate:A", label: "ideate-a", ttlS: 600 }, /handoff\.tag/],
+      [{ tag: "ideate:a", label: "../x", ttlS: 600 }, /handoff\.label/],
+      [{ tag: "ideate:a", label: "ideate-a", ttlS: 43201 }, /handoff\.ttlS/],
+    ];
+    for (const [h, re] of bad) await rejectsWith(s.overseer.ask("x", { requestId: "b" + Math.random(), mode: "tell", handoff: h }), 400, re);
+    await rejectsWith(s.overseer.ask("x", { requestId: "b9", mode: "ask", handoff: bad[0][0] }), 400, /mode tell/);
+    let r = await s.overseer.ask('TOOL notify {"text":"bees.md is written","tag":"ideate:bees"}', { requestId: "n1", waitMs: 10000 });
+    let box = await s.overseer.outbox({ since: 0 });
+    assert.equal(box.items.filter((i) => i.kind === "notify").length, 0, "an unknown tag is refused");
+    await s.overseer.ask("start nothing", { requestId: "n2", waitMs: 10000, mode: "tell", handoff: { tag: "ideate:bees", label: "ideate-bees", ttlS: 600 } });
+    r = await s.overseer.ask('TOOL notify {"text":"bees.md is written","tag":"ideate:bees"}', { requestId: "n3", waitMs: 10000 });
+    box = await s.overseer.outbox({ since: 0 });
+    assert.deepEqual(box.items.filter((i) => i.kind === "notify").map((i) => [i.text, i.tag]), [["bees.md is written", "ideate:bees"]]);
+    assert.ok(r);
+  } finally {
+    await s.close();
   }
 });

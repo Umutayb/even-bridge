@@ -20,6 +20,16 @@ export const ASKS_DONE_KEEP = 200;
 export const OUTBOX_KINDS = Object.freeze(["answer", "notify", "action", "checkin", "system"]);
 export { ROOT_CONVERSATION_ID };
 
+/** A hand-off's tag (`<source>:<key>`, e.g. "ideate:bees") and agent label; the tag routes results back. */
+export const HANDOFF_TAG_RE = /^[a-z]{1,16}:[a-z0-9][a-z0-9-]{0,39}$/;
+export const HANDOFF_LABEL_RE = /^[a-z0-9][a-z0-9-]{0,23}$/;
+export const HANDOFF_TTL_S = Object.freeze({ min: 300, max: 43200 });
+/** The only model a hand-off agent may run on (the private default). */
+export const HANDOFF_MODEL = "qwen";
+/** How long a hand-off's tag stays usable for `notify` (its results come in overnight). */
+export const HANDOFF_TAG_MS = 24 * 3600 * 1000;
+export const HANDOFFS_KEEP = 20;
+
 const latest = { scope: "conversation", history: "latest", fork: "initial", checkpointWhen: () => true };
 
 export const OverseerNotes = defineDoc({ kind: "even.overseer.notes", version: 1, ...latest, initial: () => ({ text: "" }) });
@@ -38,6 +48,13 @@ export const OverseerAsks = defineDoc({
   // done: requestIds settled (answered in time or moved to the outbox); delivered: those moved to the outbox.
   initial: () => ({ pending: [], done: [], delivered: [] }),
 });
+
+/**
+ * Hand-offs (EVEN_BRIDGE_OVERSEER_HANDOFF=1): a told instruction that carries a hand-off request
+ * `{tag, label, cwd, ttlS, requestId, submissionId, at}`; a start the overseer proposes while working
+ * on that submission is held to it (its folder, qwen, at most ttlS) and its results may carry the tag.
+ */
+export const OverseerHandoffs = defineDoc({ kind: "even.overseer.handoffs", version: 1, ...latest, initial: () => ({ items: [] }) });
 
 /**
  * Append one item to an outbox draft (inside a commit): the next seq, the newest OUTBOX_KEEP kept.

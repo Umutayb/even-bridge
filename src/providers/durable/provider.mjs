@@ -231,6 +231,7 @@ function parseMaxTurns(v) {
  *   `overseerProviderOptions`): `{ extension, sid, title, maxTurns, instructions }`. The root conversation is
  *   created (or reconfigured) with only that extension before anything resumes, and is served as the virtual
  *   session `sid`. Unset: nothing changes.
+ * @param {{ now?: () => number, setTimer?: Function }} [o.clock] test seam: the Harness clock and timers.
  */
 /** The TTL an overseer-started agent may carry (stored in the row; the shim reaper adopts it). */
 export const AGENT_TTL_S = Object.freeze({ min: 300, max: 43200 });
@@ -264,6 +265,7 @@ export function createDurableProvider(
     forbidden = forbiddenDirs({ env }),
     lc,
     overseer,
+    clock,
   } = {},
 ) {
   const backoff = { ...REATTACH, ...reattach };
@@ -442,7 +444,7 @@ export function createDurableProvider(
       lcBox.task = made.task;
       registry.install(defineExtension({ name: "even-lc", tasks: [made.task] }));
     }
-    return openDurable({ storePath, storage, models, registry, envFor, settings, resume: false });
+    return openDurable({ storePath, storage, models, registry, envFor, settings, resume: false, clock });
   })().then(
     (d) => (durable = d),
     (err) => {

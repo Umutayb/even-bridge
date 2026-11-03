@@ -129,8 +129,11 @@ export const OVERSEER_LIMITS = Object.freeze({ questionMax: 2000, requestIdMax: 
 export const OVERSEER_ASK_MODES = Object.freeze(["ask", "tell"]);
 export const ACTION_BY = Object.freeze(["evenai", "http"]);
 
-/** Validate an overseer ask body: `{ question, requestId, waitMs, mode }` or `{ error }`. */
-export function overseerAskOpts({ question, requestId, waitMs, mode } = {}) {
+/**
+ * Validate an overseer ask body: `{ question, requestId, waitMs, mode, handoff? }` or `{ error }`.
+ * `handoff` (`{tag, label, ttlS}`, tell only) is checked further by the overseer (400 while hand-offs are off).
+ */
+export function overseerAskOpts({ question, requestId, waitMs, mode, handoff } = {}) {
   if (typeof question !== "string" || !question.trim()) return { error: "Missing 'question'" };
   if (question.length > OVERSEER_LIMITS.questionMax) return { error: `'question' must be 1-${OVERSEER_LIMITS.questionMax} characters` };
   if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > OVERSEER_LIMITS.requestIdMax) {
@@ -140,7 +143,13 @@ export function overseerAskOpts({ question, requestId, waitMs, mode } = {}) {
     return { error: `'waitMs' must be 0-${OVERSEER_LIMITS.waitMsMax}` };
   }
   if (mode != null && !OVERSEER_ASK_MODES.includes(mode)) return { error: `'mode' must be one of ${OVERSEER_ASK_MODES.join(", ")}` };
-  return { question, requestId, waitMs: waitMs ?? OVERSEER_LIMITS.waitMsMax, mode: mode ?? "ask" };
+  const out = { question, requestId, waitMs: waitMs ?? OVERSEER_LIMITS.waitMsMax, mode: mode ?? "ask" };
+  if (handoff != null) {
+    if (typeof handoff !== "object" || Array.isArray(handoff)) return { error: "'handoff' must be an object" };
+    if (out.mode !== "tell") return { error: "a hand-off needs mode tell" };
+    out.handoff = handoff;
+  }
+  return out;
 }
 
 /** Validate a POST /api/overseer/actions body (the shim's one gate): `{ kind, args, requestId }` or `{ error }`. */
@@ -551,6 +560,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     try {
       const opts = { requestId: checked.requestId, waitMs: checked.waitMs };
       if (checked.mode === "tell") opts.mode = "tell";
+      if (checked.handoff) opts.handoff = checked.handoff;
       res.json(await overseer.ask(checked.question, opts));
     } catch (err) {
       fail(res, err);

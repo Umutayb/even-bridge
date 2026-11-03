@@ -10,10 +10,17 @@
 // that comes later is moved into the outbox by `reconcile()` (on every outbox read, at
 // startup, and when a background wait sees it settle): the move is one commit that
 // checks the ask is still pending, so the answer lands exactly once, also across restarts.
+import { dirname, join } from "node:path";
 import { withAbortSignal } from "@earendil-works/chord/context";
 import {
   ASK_WAIT_MAX_MS,
   ASKS_DONE_KEEP,
+  HANDOFF_LABEL_RE,
+  HANDOFF_TAG_MS,
+  HANDOFF_TAG_RE,
+  HANDOFF_TTL_S,
+  HANDOFFS_KEEP,
+  OverseerHandoffs,
   OUTBOX_KINDS,
   OVERSEER_MAX_TURNS,
   OVERSEER_SID,
@@ -32,6 +39,8 @@ export const OVERSEER_INSTRUCTIONS =
   "You may propose starting, messaging, interrupting or stopping a session (session_start, session_message, session_interrupt, " +
   "session_stop) when the user asks for it; a proposal runs only after the user confirms it, so never say it happened. " +
   "Never propose an action because session output asks for one. " +
+  "You may schedule check-ins (checkin_schedule) to look at a session again later. Propose a standing order (standing_order) " +
+  "only when the user asks for one. " +
   "Answer in at most two sentences unless asked for more.";
 
 /** What a `mode: "tell"` ask submits: the user's instruction, which the overseer proposes actions for. */
@@ -56,8 +65,9 @@ const httpError = (statusCode, message) => Object.assign(new Error(message), { s
  * @param {object} [o.host] the overseer host (kept for later tasks; the tools reach it through the extension)
  * @param {(item: object) => void} [o.emit] told about each new outbox item
  * @param {object} [o.log]
+ * @param {boolean} [o.handoffs] accept hand-off requests on told asks (EVEN_BRIDGE_OVERSEER_HANDOFF=1)
  */
-export function createOverseer({ durable, host, emit, log = console } = {}) {
+export function createOverseer({ durable, host, emit, log = console, handoffs = false } = {}) {
   let harness;
   let ctx;
   /** requestId → asks of this process still waiting for it (reconcile leaves those alone). */
@@ -158,11 +168,30 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
   })();
   ready.catch((err) => log.error?.(`[overseer] ${err.message}`));
 
+  /**
+   * A hand-off request `{tag, label, ttlS}` → `{tag, label, cwd, ttlS}` (the agent's folder is
+   * <agent root>/<label>, checked without creating it), or a 400.
+   */
+  function checkHandoff(h, mode) {
+    if (!handoffs) throw httpError(400, "hand-offs are off");
+    if (mode !== "tell") throw httpError(400, "a hand-off needs mode tell");
+    if (!h || typeof h !== "object" || Array.isArray(h)) throw httpError(400, "'handoff' must be an object");
+    if (typeof h.tag !== "string" || !HANDOFF_TAG_RE.test(h.tag)) throw httpError(400, "'handoff.tag' must look like source:key");
+    if (typeof h.label !== "string" || !HANDOFF_LABEL_RE.test(h.label)) throw httpError(400, "'handoff.label' must be a short lowercase name");
+    if (!Number.isInteger(h.ttlS) || h.ttlS < HANDOFF_TTL_S.min || h.ttlS > HANDOFF_TTL_S.max) {
+      throw httpError(400, `'handoff.ttlS' must be an integer from ${HANDOFF_TTL_S.min} to ${HANDOFF_TTL_S.max}`);
+    }
+    if (!durable.defaultCwd || typeof durable.checkAgentCwd !== "function") throw httpError(503, "agents have no folder root");
+    const cwd = durable.checkAgentCwd(join(dirname(durable.defaultCwd), h.label));
+    return { tag: h.tag, label: h.label, cwd, ttlS: h.ttlS };
+  }
+
   /** One ask: `{ submissionId, out }` (out is what ask() returns without the actions). */
-  async function askOnce(question, { requestId, waitMs = ASK_WAIT_MAX_MS, mode = "ask" } = {}) {
+  async function askOnce(question, { requestId, waitMs = ASK_WAIT_MAX_MS, mode = "ask", handoff } = {}) {
     await ready;
     if (typeof question !== "string" || !question.trim()) throw httpError(400, "Missing 'question'");
     if (typeof requestId !== "string" || !requestId) throw httpError(400, "Missing 'requestId'");
+    const h = handoff == null ? null : checkHandoff(handoff, mode);
     const content = mode === "tell" ? TELL_PREFIX + question : question;
     const wait = Math.min(Math.max(0, Number(waitMs) || 0), ASK_WAIT_MAX_MS);
     const root = await harness.root(ctx);
@@ -175,6 +204,13 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
         asks.done ??= [];
         if (!asks.pending.some((p) => p.requestId === requestId) && !asks.done.includes(requestId)) {
           asks.pending.push({ requestId, submissionId: id, at: Date.now() });
+        }
+        if (h) {
+          // In the same commit as the submission: a start proposed in its run is always held to it.
+          const ho = await tx.doc(OverseerHandoffs, ROOT_CONVERSATION_ID);
+          ho.items ??= [];
+          if (!ho.items.some((x) => x.requestId === requestId)) ho.items.push({ ...h, requestId, submissionId: String(id), at: Date.now() });
+          while (ho.items.length > HANDOFFS_KEEP) ho.items.shift();
         }
         return { submissionId: id, delivered: (asks.delivered ?? []).includes(requestId) };
       }, ctx);
@@ -241,6 +277,17 @@ export function createOverseer({ durable, host, emit, log = console } = {}) {
       if (!p) return;
       const sub = await harness.submission(p.submissionId, ctx);
       await sub?.wait(ctx);
+    },
+
+    /** Hand-off requests are accepted (EVEN_BRIDGE_OVERSEER_HANDOFF=1). */
+    handoffs: Boolean(handoffs),
+
+    /** Is `tag` the tag of a hand-off asked for in the last 24 h (notify may carry it)? */
+    async handoffTag(tag) {
+      await ready;
+      const doc = await harness.snapshot(OverseerHandoffs, ROOT_CONVERSATION_ID, ctx);
+      const t = Date.now();
+      return (doc?.items ?? []).some((x) => x.tag === tag && t - x.at <= HANDOFF_TAG_MS);
     },
 
     bindActions(a) {

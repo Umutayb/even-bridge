@@ -189,6 +189,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
   let overseerMods = null;
   let overseerState = "off";
   const overseerHost = {};
+  let checkinBox = null;
   if (durableOpts && overseerEnabled(process.env)) {
     try {
       overseerMods = {
@@ -196,8 +197,11 @@ export async function startServer({ flags = {}, cwd } = {}) {
         ...(await import("./overseer/extension.mjs")),
         ...(await import("./overseer/host.mjs")),
         ...(await import("./overseer/actions.mjs")),
+        ...(await import("./overseer/checkins.mjs")),
       };
-      const extension = overseerMods.createOverseerExtension({ host: overseerHost });
+      // Check-ins and the nightly reset are tasks of the root: registered now, bound once the overseer runs.
+      checkinBox = overseerMods.createCheckinBox();
+      const extension = overseerMods.createOverseerExtension({ host: overseerHost, checkins: checkinBox });
       durableOpts.overseer = overseerMods.overseerProviderOptions({ extension });
     } catch (err) {
       overseerMods = null;
@@ -226,8 +230,11 @@ export async function startServer({ flags = {}, cwd } = {}) {
           host: overseerHost,
           // Item kinds and numbers only: the texts may carry session output.
           emit: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+          // Hand-offs (the Ideate overnight hand-off, gated): a told ask may carry {tag, label, ttlS}.
+          handoffs: String(process.env.EVEN_BRIDGE_OVERSEER_HANDOFF ?? "").trim() === "1",
         });
         await o.ready;
+        overseerHost.handoffTag = (tag) => o.handoffTag(tag);
         // Gated actions: proposals, the confirm endpoint, the phone's permission prompt on dur-overseer.
         const actions = overseerMods.createOverseerActions({
           durable: durableProvider,
@@ -241,6 +248,12 @@ export async function startServer({ flags = {}, cwd } = {}) {
         await actions.ready;
         overseerHost.actions = actions;
         o.bindActions(actions);
+        const checkins = overseerMods.createOverseerCheckins({
+          durable: durableProvider,
+          box: checkinBox,
+          onOutbox: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+        });
+        await checkins.ready;
         durableProvider.onOverseerPermission = (decision) => actions.respond(decision);
         overseer = o;
         overseerState = "on";
