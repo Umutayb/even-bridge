@@ -318,11 +318,21 @@ Typing into a terminal is code execution if done carelessly, so the tmux route i
 - It is typed literally: `tmux send-keys -t <pane> -l -- <text>`, then `send-keys -t <pane> Enter`
   as a separate key ("C-d", "Escape" or a leading "-" are characters, never key names or options; a
   trailing ";", tmux's command separator, is sent as "\\;"); never through a paste buffer.
-- A terminal session waiting at a permission, confirm or select prompt is never typed into (the
-  characters and the Enter would answer the prompt, usually "Yes"): its inventory row says
-  `canMessage: false, why: "waiting-in-terminal"`, propose refuses it (409), execute checks its state
-  again, and right before typing the pane is captured and a dialog on screen (Claude Code's "Do you
-  want to …" / "❯ 1. Yes", y/n prompts, select menus) blocks it (409).
+- A terminal is typed into only when the bottom of its pane shows the program's own idle input
+  box (an ALLOWLIST, `inputReady` in src/providers/pi/detect.mjs, shapes taken from the installed
+  pi 1.0.3 and Claude Code 2.1.316): for pi, the editor between two full-width rules with the
+  footer below (the cwd line and the stats line with the context indicator "12.3%/128k"); for
+  Claude Code, the "❯ " input line between two rules with at most 4 footer lines below. pi puts
+  its selectors, confirms ("→ Yes / No", "↑↓ navigate  enter select  escape cancel"), inputs and
+  submenus in the editor's place, and Claude Code's permission menu and trust prompt replace its
+  input box, so any of those (and anything unrecognised, an unreadable pane, Claude Code's "!" bash
+  mode) blocks: 409 "<kind> '<label>' is showing a prompt or menu in its terminal; answer it there".
+  Inside the input region a menu hint, two numbered lines in a row, or a blank line in a multi-line
+  pi region also block. The transcript above the input box is never searched (an answer that says
+  "Do you want to …" does not block). The check runs right before typing; the same screen check
+  is the state of a tmux row (`terminalScreen`: anything but the input box is `waiting`, and the
+  row says `canMessage: false, why: "waiting-in-terminal"`), so propose refuses it too. A terminal
+  pi always reports idle and cc-local only busy/idle, so for tmux rows the screen IS the gate.
 - The pane is bound to the terminal's own process: pi's external pid (with two pi terminals in one
   folder, the pane whose screen shows this conversation, else none), Claude Code's owner pid. Right
   before typing (after the per-pane gap) the pane must still run `pi` / `claude` with `pane_pid` an

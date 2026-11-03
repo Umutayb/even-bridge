@@ -74,7 +74,7 @@ export const WHY_NOT = Object.freeze({
   "no-terminal": "no terminal runs it; open it in tmux first",
   "phone-claude": "the phone's Claude bridge runs it; message it from the phone",
   "driver-unknown": "who drives it could not be checked",
-  "waiting-in-terminal": "it is waiting for an answer in its terminal; answer it there",
+  "waiting-in-terminal": "it is showing a prompt or menu in its terminal; answer it there",
   unknown: "its kind is unknown",
 });
 const LINE_MAX = 160; // characters of a last line / title in a list row
@@ -233,13 +233,19 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     }));
   }
 
+  /** "input" | "menu" | null: what the terminal of a tmux-driven pi / Claude Code session shows (the allowlist). */
+  const screenOf = (p, kind, id) => (typeof p?.terminalScreen === "function" ? safe(`${kind} screen ${id}`, () => p.terminalScreen(id), "menu") : null);
+
   async function fileRows(p, kind, sessions) {
     const rows = [];
     for (const s of sessions ?? []) {
       if (!s?.id) continue;
       // A failed probe is "unknown" (no route), never "none" (which would mean pi RPC).
       const driver = await safe(`${kind} driver ${s.id}`, async () => (await p.driverOf?.(s.id)) ?? "none", "unknown");
-      const state = s.status ?? (await safe(`${kind} status ${s.id}`, () => p.getSessionStatus?.(s.id), null)) ?? "idle";
+      let state = s.status ?? (await safe(`${kind} status ${s.id}`, () => p.getSessionStatus?.(s.id), null)) ?? "idle";
+      // A terminal in tmux: its screen is the truth (a terminal pi reports idle, cc-local only busy/idle). Anything
+      // but its idle input box is "waiting" (a prompt or menu typing would answer).
+      if (driver === "terminal-tmux" && (await screenOf(p, kind, s.id)) === "menu") state = "waiting";
       const hist = await safe(`${kind} history ${s.id}`, () => p.getHistory?.(s.id, 2), []);
       const t = msOf(s.timestamp);
       rows.push({ id: s.id, kind, title: s.title ?? "", cwd: s.cwd ?? "", state, driver, ageS: ageS(t), lastActivity: t, lastLine: lastLineOf(hist) });
@@ -325,8 +331,10 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
   const refuse = (message) => Object.assign(new Error(message), { statusCode: 403 });
   /** The normalized state of a session of a known kind, now ("idle" when unreadable is never assumed: null). */
   const stateNow = async (kind, id) => {
-    const st = await safe(`${kind} status ${id}`, () => providerOf(kind).getSessionStatus?.(id), null);
-    return st == null ? null : normalizeState(st);
+    const p = providerOf(kind);
+    const st = await safe(`${kind} status ${id}`, () => p.getSessionStatus?.(id), null);
+    if ((kind === "pi" || kind === "cc-local") && (await driverOf(id)) === "terminal-tmux" && (await screenOf(p, kind, id)) === "menu") return "waiting";
+    return normalizeState(st ?? "idle");
   };
 
   return {
@@ -352,8 +360,7 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     async stateOf(id) {
       const kind = await kindOf(id);
       if (!kind) return null;
-      const st = await safe(`${kind} status ${id}`, () => providerOf(kind).getSessionStatus?.(id), null);
-      return normalizeState(st ?? "idle");
+      return stateNow(kind, id);
     },
 
     /**
@@ -471,7 +478,7 @@ export function waitingInTerminal(route, state) {
 
 /** The refusal for a message to a terminal session that waits at a permission / select prompt. */
 export function waitingText(kind, label) {
-  return `${KIND_WORD[kind] ?? "session"} '${defuse(label, { oneLine: true, max: 60 })}' is waiting for an answer in its terminal; answer it there`;
+  return `${KIND_WORD[kind] ?? "session"} '${defuse(label, { oneLine: true, max: 60 })}' is showing a prompt or menu in its terminal; answer it there`;
 }
 
 /** The refusal text for a session that cannot receive a message (host text; "driven from a terminal" kept for the shim). */

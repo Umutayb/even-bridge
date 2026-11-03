@@ -129,28 +129,88 @@ export async function findPiTmuxPane(cwd, { tmuxBin = "tmux", procRoot = "/proc"
 export const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
- * A pane that shows a permission / confirm / select dialog: typed characters and the Enter would answer it (the
- * highlighted option, usually "Yes"), not reach the prompt. Claude Code ("Do you want to …", "❯ 1. Yes", "Esc to
- * cancel"), pi's confirm and select dialogs, and generic y/n prompts. False positives only block a message.
+ * Prompts, menus and dialogs (a fast reject, applied only to the input region the allowlist found, never to the
+ * transcript above it): pi's selectors ("→ Yes", "↑↓ navigate  enter select  escape cancel", "Enter to select ·
+ * Esc to go back", "Press Enter to continue"), Claude Code's permission and trust menus ("❯ 1. Yes", "Esc to
+ * cancel", "Yes, I trust this folder"), y/n prompts. Two numbered lines in a row count as a menu too.
  */
-export const DIALOG_RE = new RegExp(
+export const MENU_HINT_RE = new RegExp(
   [
-    "Do you want to\\b",
-    "❯\\s*\\d+\\.\\s",
-    "^\\s*\\d+\\.\\s*Yes\\b",
-    "Esc to (?:cancel|exit)",
+    "\\bnavigate\\b",
+    "\\benter\\b.{0,4}\\b(?:select|confirm|continue)\\b",
+    "\\besc(?:ape)?\\b.{0,4}\\b(?:cancel|go back|exit|close)\\b",
+    "Press Enter",
+    "^\\s*→ ",
+    "^\\s*(?:│\\s*)?[❯>]\\s*\\d+[.)]\\s",
     "\\((?:y/n|Y/n|y/N)\\)|\\[(?:y/n|Y/n|y/N)\\]",
-    "\\b(?:Allow|Approve)\\b[^\\n]*\\b(?:Deny|Reject)\\b",
-    "Press enter to (?:confirm|select)",
-    "↑/↓|↑↓ to (?:navigate|select)",
+    "Yes, I trust this folder",
   ].join("|"),
   "im",
 );
+const NUMBERED_RE = /^\s*(?:[❯>]\s*)?\d+[.)]\s/;
+const RULE_RE = /^─{8,}$/; // a full-width rule: pi-tui's editor borders, Claude Code's input box (round, no sides)
+const PI_SCROLL_RULE_RE = /^─── [↑↓] \d+ more ─*$/; // pi-tui editor border with hidden lines
+/** pi's footer stats line: the context indicator "12.3%/128k" or "?/128k" (footer.js contextPercentDisplay). */
+const PI_STATS_RE = /(?:^|\s)(?:\d+(?:\.\d+)?%|\?)\/\d+(?:\.\d+)?[kM]?(?:\s|\(|$)/;
+const CLAUDE_TOP_RE = /^(?:─{8,}|╭─{6,}╮)$/;
+const CLAUDE_BOTTOM_RE = /^(?:─{8,}|╰─{6,}╯)$/;
+/** Claude Code's input line: the prompt character "❯" (or ">" in older builds), never "!" (bash mode). */
+const CLAUDE_INPUT_RE = /^(?:│\s*)?[❯>](?:\s|$)/;
 
-/** Does a captured pane show a dialog (see DIALOG_RE)? Only the last 15 lines count (older ones are history). */
-export function screenShowsDialog(screen) {
-  if (screen == null) return true; // unreadable: assume the worst
-  return DIALOG_RE.test(String(screen).split("\n").slice(-15).join("\n"));
+/**
+ * ALLOWLIST (Task 6b I6): may a line be typed into this pane now? Only when the bottom of the captured screen is
+ * the program's own idle input box:
+ *   - pi (pi-tui, interactive-mode.js): the editor between two full-width rules (the bottom one may read
+ *     "─── ↓ N more"), with the footer below it (the cwd line and the stats line with the context indicator
+ *     "12.3%/128k"). When pi shows a selector, confirm, input or submenu, that component takes the editor's
+ *     place (editorContainer), so the region between the rules then holds spacer lines, "→ Yes", hints, etc.
+ *   - Claude Code: its input box (borderStyle round without sides: a full-width rule, the "❯ " line and any
+ *     continuation lines, a rule), with at most 4 footer lines ("? for shortcuts", modes) below. A permission
+ *     menu or the trust prompt replaces the box: there is no rule-"❯ "-rule at the bottom then.
+ * Inside the region found, a menu hint (MENU_HINT_RE), two numbered lines in a row, or (pi) a blank line in a
+ * multi-line region also block. Anything unrecognised blocks: `{ ready: false, why }`.
+ * @param {string|null} screen capture-pane output
+ * @param {"pi"|"claude"} program
+ */
+export function inputReady(screen, program) {
+  if (screen == null) return { ready: false, why: "unreadable" };
+  const lines = String(screen).split("\n").map((l) => l.replace(/\s+$/, ""));
+  while (lines.length && !lines.at(-1).trim()) lines.pop();
+  const t = (i) => (lines[i] ?? "").trim();
+  const menuIn = (region) => {
+    if (MENU_HINT_RE.test(region.join("\n"))) return true;
+    for (let i = 1; i < region.length; i++) if (NUMBERED_RE.test(region[i - 1]) && NUMBERED_RE.test(region[i])) return true;
+    return false;
+  };
+  const n = lines.length;
+  if (program === "pi") {
+    let stats = -1;
+    for (let i = n - 1; i >= Math.max(0, n - 4); i--) if (PI_STATS_RE.test(lines[i])) { stats = i; break; }
+    if (stats < 0) return { ready: false, why: "no pi footer" };
+    let b = -1;
+    for (let i = stats - 1; i >= Math.max(0, stats - 4); i--) if (RULE_RE.test(t(i)) || PI_SCROLL_RULE_RE.test(t(i))) { b = i; break; }
+    if (b < 0) return { ready: false, why: "no editor below" };
+    let top = -1;
+    for (let i = b - 1; i >= Math.max(0, b - 40); i--) if (RULE_RE.test(t(i)) || PI_SCROLL_RULE_RE.test(t(i))) { top = i; break; }
+    if (top < 0) return { ready: false, why: "no editor above" };
+    const content = lines.slice(top + 1, b);
+    if (!content.length) return { ready: false, why: "empty region" };
+    if (content.length > 1 && content.some((l) => !l.trim())) return { ready: false, why: "a menu or dialog" };
+    if (menuIn(lines.slice(top))) return { ready: false, why: "a menu or dialog" };
+    return { ready: true };
+  }
+  if (program === "claude") {
+    let b = -1;
+    for (let i = n - 1; i >= Math.max(0, n - 6); i--) if (CLAUDE_BOTTOM_RE.test(t(i))) { b = i; break; }
+    if (b < 0) return { ready: false, why: "no input box" };
+    let top = -1;
+    for (let i = b - 1; i >= Math.max(0, b - 40); i--) if (CLAUDE_TOP_RE.test(t(i))) { top = i; break; }
+    if (top < 0 || top + 1 >= b) return { ready: false, why: "no input box" };
+    if (!CLAUDE_INPUT_RE.test(t(top + 1))) return { ready: false, why: "not the input line" };
+    if (menuIn(lines.slice(top))) return { ready: false, why: "a menu or dialog" };
+    return { ready: true };
+  }
+  return { ready: false, why: "unknown program" };
 }
 
 /**

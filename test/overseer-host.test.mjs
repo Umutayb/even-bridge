@@ -406,14 +406,33 @@ test("I5: a terminal session waiting at a permission or select prompt is never t
   k.cc.deliverToTerminal = async (id, text) => (screenSaysMenu ? { sessionId: id, blocked: true, waiting: true } : (typed.push([id, text]), { sessionId: id }));
   const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
   const msg = () => host.execute({ id: "act-1", kind: "session_message", args: { id: "c1c1c1c1", label: "proj-c1c1c1", text: "status?", steer: false }, origin: "overseer" });
-  await assert.rejects(msg(), (e) => e.statusCode === 409 && e.message === "Claude session 'proj-c1c1c1' is waiting for an answer in its terminal; answer it there");
+  await assert.rejects(msg(), (e) => e.statusCode === 409 && e.message === "Claude session 'proj-c1c1c1' is showing a prompt or menu in its terminal; answer it there");
   assert.deepEqual(typed, [], "state waiting: nothing typed");
   // The state says idle but the screen shows a menu right before typing: refused too.
   ccState = "idle";
   screenSaysMenu = true;
-  await assert.rejects(msg(), (e) => e.statusCode === 409 && /waiting for an answer in its terminal/.test(e.message));
+  await assert.rejects(msg(), (e) => e.statusCode === 409 && /showing a prompt or menu in its terminal/.test(e.message));
   assert.deepEqual(typed, []);
   screenSaysMenu = false;
   assert.deepEqual(await msg(), { sessionId: "c1c1c1c1" });
   assert.deepEqual(typed, [["c1c1c1c1", "status?"]]);
+});
+
+test("n5: a tmux row's state comes from its screen (a terminal pi reports idle; cc-local only busy/idle)", async () => {
+  const k = everyKind();
+  let screen = "menu";
+  k.pi.terminalScreen = async (id) => (id === "bbbb2222-pi" ? screen : null);
+  k.pi.getSessionStatus = async () => "idle";
+  const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
+  let row = (await host.sessionsList()).find((r) => r.id === "bbbb2222-pi");
+  assert.deepEqual([row.state, row.canMessage, row.why], ["waiting", false, "waiting-in-terminal"]);
+  assert.equal(await host.stateOf("bbbb2222-pi"), "waiting");
+  screen = "input";
+  row = (await host.sessionsList()).find((r) => r.id === "bbbb2222-pi");
+  assert.deepEqual([row.state, row.canMessage, row.via], ["idle", true, "tmux"]);
+  assert.equal(await host.stateOf("bbbb2222-pi"), "idle");
+  k.pi.terminalScreen = async () => {
+    throw new Error("tmux gone");
+  };
+  assert.equal(await host.stateOf("bbbb2222-pi"), "waiting", "an unreadable screen is never 'input'");
 });

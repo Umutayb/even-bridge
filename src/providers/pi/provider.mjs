@@ -29,7 +29,7 @@ import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { transcriptEntriesToWire } from "./wire.mjs";
 import { TranscriptWatcher, defaultFindFile } from "./watcher.mjs";
-import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid, screenShowsDialog } from "./detect.mjs";
+import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid, inputReady } from "./detect.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -225,6 +225,39 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
   const paneLastDelivery = new Map(); // paneId -> ts
   const PANE_DELIVERY_GAP_MS = 1500;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * The tmux pane of the terminal pi that runs THIS session, bound to its pid: `{ pane, pid }` or null. With several
+   * pi terminals in the session's folder, only the single pane whose screen shows this conversation (two terminals
+   * in one folder never cross).
+   */
+  async function terminalTarget(sessionId, file) {
+    if (!cfg.tmuxEnabled) return null;
+    const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
+    let ext = [];
+    try {
+      ext = await probeExternal(cwd0, { excludePids: childPids() });
+    } catch {
+      return null;
+    }
+    if (!ext.length || !(await externalOwnsSession(sessionId, file, cwd0))) return null;
+    const cands = [];
+    for (const e of ext) {
+      const pane = await probeTmuxPane(cwd0, { pid: e.pid }).catch(() => null);
+      if (pane) cands.push({ pane, pid: e.pid });
+    }
+    if (cands.length === 1) return cands[0];
+    if (cands.length < 2) return null;
+    let fr = [];
+    try {
+      fr = recentPromptFragments(sessionId, cfg.agentDir);
+    } catch {
+      fr = [];
+    }
+    const shows = [];
+    for (const c of cands) if (screenShows(await paneScreen(c.pane).catch(() => null), fr)) shows.push(c);
+    return shows.length === 1 ? shows[0] : null;
+  }
 
   async function probeExternalCached(cwd) {
     const hit = extCache.get(cwd);
@@ -534,45 +567,33 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       const file = findSessionFile(sessionId, cfg.agentDir);
       if (!file) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
       const blocked = { sessionId, provider: WIRE_PROVIDER, blocked: true };
-      if (!cfg.tmuxEnabled) return blocked;
-      const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
-      let ext = [];
-      try {
-        ext = await probeExternal(cwd0, { excludePids: childPids() });
-      } catch {
-        return blocked;
-      }
-      if (!ext.length || !(await externalOwnsSession(sessionId, file, cwd0))) return blocked;
-      const cands = [];
-      for (const e of ext) {
-        const pane = await probeTmuxPane(cwd0, { pid: e.pid }).catch(() => null);
-        if (pane) cands.push({ pane, pid: e.pid });
-      }
-      let target = cands.length === 1 ? cands[0] : null;
-      if (cands.length > 1) {
-        let fr = [];
-        try {
-          fr = recentPromptFragments(sessionId, cfg.agentDir);
-        } catch {
-          fr = [];
-        }
-        const shows = [];
-        for (const c of cands) if (screenShows(await paneScreen(c.pane).catch(() => null), fr)) shows.push(c);
-        target = shows.length === 1 ? shows[0] : null;
-      }
+      const target = await terminalTarget(sessionId, file);
       if (!target) return blocked;
       const last = paneLastDelivery.get(target.pane);
       const wait = last ? PANE_DELIVERY_GAP_MS - (Date.now() - last) : 0;
       if (wait > 0) await sleep(wait);
       if (!(await paneCheck(target.pane, target.pid).catch(() => false))) return blocked;
-      // A permission / confirm / select dialog on screen: the text and the Enter would answer it. Not typed.
-      if (screenShowsDialog(await paneScreen(target.pane).catch(() => null))) return { ...blocked, waiting: true };
+      // Allowlist (I6): only pi's own idle editor + footer at the bottom of the pane takes typing; a selector,
+      // confirm, input or submenu (they replace the editor) would be answered by the text and the Enter.
+      if (!inputReady(await paneScreen(target.pane).catch(() => null), "pi").ready) return { ...blocked, waiting: true };
       await deliverTmux(target.pane, text, { singleLine: true });
       paneLastDelivery.set(target.pane, Date.now());
       noteDelivered(sessionId, text);
       emit(sessionId, { type: "user_prompt", text });
       console.log(`[bridge] overseer message -> tmux pane ${target.pane} (pi pid ${target.pid}) session=${sessionId}`);
       return { sessionId, provider: WIRE_PROVIDER };
+    },
+
+    /**
+     * What the terminal pi of this session shows (the inventory's state, Task 6b n5): "input" (its idle editor:
+     * typing is allowed), "menu" (anything else: a selector, confirm, dialog), or null (no bound tmux pane).
+     */
+    async terminalScreen(sessionId) {
+      const file = findSessionFile(sessionId, cfg.agentDir);
+      if (!file) return null;
+      const target = await terminalTarget(sessionId, file);
+      if (!target) return null;
+      return inputReady(await paneScreen(target.pane).catch(() => null), "pi").ready ? "input" : "menu";
     },
 
     respondPermission(sessionId, decision) {

@@ -10,7 +10,31 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findPiTmuxPane, paneRunsPid, screenShowsDialog, tmuxDeliver } from "../src/providers/pi/detect.mjs";
+import { findPiTmuxPane, inputReady, paneRunsPid, tmuxDeliver } from "../src/providers/pi/detect.mjs";
+
+// ── screen fixtures, built from the installed sources ────────────────────────────────────────────────────────
+// pi 1.0.3: pi-tui Editor (components/editor.js: a full-width "─" rule above and below, no side borders), the
+// footer (components/footer.js: the cwd line, then the stats line with the context indicator "12.3%/128k"), and
+// ExtensionSelectorComponent (components/extension-selector.js: DynamicBorder, Spacer, title, Spacer, options with
+// "→ " on the selected one, Spacer, the hint "↑↓ navigate  enter select  escape cancel", Spacer, DynamicBorder),
+// which interactive-mode.js puts in the editor's place (editorContainer) for ui.select / ui.confirm.
+// Claude Code 2.1.316: the input box (borderStyle "round" with borderLeft/borderRight false: a rule above and below
+// the "❯ " line), "? for shortcuts" below; the permission menu ("Do you want to proceed?", "❯ 1. Yes") and the trust
+// prompt ("Yes, I trust this folder", "Enter to confirm · Esc to exit") replace the input box.
+const RULE = "─".repeat(72);
+const PI_FOOTER = ["~/work (main)", "↑1.2k ↓340 $0.012 12.3%/128k                (lets-code) qwen3.8-27b • medium"];
+const piScreen = (transcript, region) => [...transcript, RULE, ...region, RULE, ...PI_FOOTER, ""].join("\n");
+const PI_IDLE = (transcript = [" > alpha task number one", " Working on it."]) => piScreen(transcript, [" "]);
+const PI_DRAFT = piScreen([" > alpha task number one", " Overwrite it? (y/n) was asked earlier"], [" half typed draft"]);
+const PI_CONFIRM = [" > alpha task number one", RULE, "", " Overwrite notes.md?", " This replaces the file.", "", " → Yes", "   No", "", " ↑↓ navigate  enter select  escape cancel", "", RULE, ...PI_FOOTER].join("\n");
+const PI_SUBMENU = [" > alpha task number one", RULE, " Thinking level", "   low", " → medium", "   high", " Enter to select · Esc to go back", RULE, ...PI_FOOTER].join("\n");
+const PI_CONTINUE = [" > alpha task number one", RULE, " Session compacted.", " Press Enter to continue", RULE, ...PI_FOOTER].join("\n");
+const PI_NUMBERED = [" > alpha task number one", RULE, " Which file?", " 1. notes.md", " 2. todo.md", RULE, ...PI_FOOTER].join("\n");
+const CC_IDLE = ["⏺ Done. The tests pass. Do you want to keep the old build too?", "", RULE, "❯ ", RULE, "  ? for shortcuts", ""].join("\n");
+const CC_OLD_BOX = ["⏺ Done.", "╭" + "─".repeat(70) + "╮", "│ > fix the parser please" + " ".repeat(45) + "│", "╰" + "─".repeat(70) + "╯", "  ? for shortcuts"].join("\n");
+const CC_PERMISSION = ["⏺ Bash(rm -rf build)", RULE, " Bash command", "", "   rm -rf build", "   Remove the build folder", "", " Do you want to proceed?", " ❯ 1. Yes", "   2. Yes, and don't ask again for rm commands in /home/u/proj", "   3. No, and tell Claude what to do differently (esc)", ""].join("\n");
+const CC_TRUST = [RULE, " Do you trust the files in this folder?", "", " /home/u/proj", "", " ❯ 1. Yes, I trust this folder", "   2. No, exit", "", " Enter to confirm · Esc to exit"].join("\n");
+const CC_BASH_MODE = ["⏺ Done.", RULE, "! ls", RULE, "  ! for bash mode"].join("\n");
 import { createPiProvider } from "../src/providers/pi/provider.mjs";
 import { createCcLocalProvider } from "../src/cc-local.mjs";
 
@@ -116,7 +140,7 @@ test("I2: two pi terminals in one folder never cross; the pane is checked right 
   const agentDir = join(dir, "agent");
   piSession(agentDir, cwd, "sess-alpha", "alpha task number one");
   piSession(agentDir, cwd, "sess-bravo", "bravo task number two");
-  const screens = { "%1": "> alpha task number one\n  working…", "%2": "> bravo task number two" };
+  const screens = { "%1": PI_IDLE([" > alpha task number one", " working…"]), "%2": PI_IDLE([" > bravo task number two"]) };
   const panesByPid = { 201: "%1", 202: "%2" };
   const typed = [];
   let paneOk = true;
@@ -212,6 +236,7 @@ test("I4: cc-local deliverToTerminal types only into the owner's pane; a gone te
   const sessionsDir = join(dir, "cc-sessions");
   mkdirSync(sessionsDir);
   const tm = fakeTmux(dir, { panes: `s 0 %5 300 claude ${cwd}\n`, display: "claude 300\n" });
+  tm.setScreen(CC_IDLE);
   const prev = process.env.EVEN_BRIDGE_CC_RESUME_RC;
   process.env.EVEN_BRIDGE_CC_RESUME_RC = "1";
   t.after(() => (prev == null ? delete process.env.EVEN_BRIDGE_CC_RESUME_RC : (process.env.EVEN_BRIDGE_CC_RESUME_RC = prev)));
@@ -243,17 +268,20 @@ test("n1: a trailing ';' (tmux's command separator) is typed, not eaten", async 
   assert.deepEqual(tm.calls().filter((c) => c.includes("-l")).map((c) => c.at(-1)), ["run tests\\;", "a\\\\;", "a; b"]);
 });
 
-test("I5: the dialog shapes of Claude Code and pi are recognised; a plain prompt is not", () => {
-  const menus = [
-    " Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No, and tell Claude what to do differently (esc)",
-    "Edit file src/a.ts\n❯ 1. Yes\n  2. No",
-    "Allow tool bash: ls?  Allow  Deny",
-    "Overwrite notes.md? (y/n)",
-    "Pick a model\n  qwen\n> sonnet\n↑/↓ to navigate · enter to select · esc to cancel",
-  ];
-  for (const m of menus) assert.equal(screenShowsDialog(m), true, m);
-  for (const p of ["╭──────╮\n│ > run the tests │\n╰──────╯\n  ? for shortcuts", "pi v1.0.3\n> \n"]) assert.equal(screenShowsDialog(p), false, p);
-  assert.equal(screenShowsDialog(null), true, "an unreadable pane is not typed into");
+test("I6 allowlist: only the program's own idle input box takes typing", () => {
+  for (const [name, screen] of [["pi idle", PI_IDLE()], ["pi draft (a y/n in the transcript above does not count)", PI_DRAFT]]) {
+    assert.deepEqual(inputReady(screen, "pi"), { ready: true }, name);
+  }
+  for (const [name, screen] of [["pi confirm selector", PI_CONFIRM], ["pi submenu", PI_SUBMENU], ["Press Enter to continue", PI_CONTINUE], ["numbered list", PI_NUMBERED], ["no footer", "> hello\n"], ["claude screen", CC_IDLE]]) {
+    assert.equal(inputReady(screen, "pi").ready, false, name);
+  }
+  for (const [name, screen] of [["claude idle (assistant text 'Do you want to' above, n6)", CC_IDLE], ["claude old box", CC_OLD_BOX]]) {
+    assert.deepEqual(inputReady(screen, "claude"), { ready: true }, name);
+  }
+  for (const [name, screen] of [["claude permission menu", CC_PERMISSION], ["trust prompt", CC_TRUST], ["bash mode", CC_BASH_MODE], ["pi screen", PI_IDLE()], ["empty", ""]]) {
+    assert.equal(inputReady(screen, "claude").ready, false, name);
+  }
+  assert.equal(inputReady(null, "pi").ready, false, "unreadable");
 });
 
 test("I5: pi and Claude Code panes that show a permission menu get nothing typed", async (t) => {
@@ -263,7 +291,7 @@ test("I5: pi and Claude Code panes that show a permission menu get nothing typed
   const agentDir = join(dir, "agent");
   piSession(agentDir, cwd, "sess-alpha", "alpha task number one");
   const typed = [];
-  let screen = "> alpha task number one\n Do you want to proceed?\n ❯ 1. Yes\n   2. No";
+  let screen = PI_CONFIRM;
   const pi = createPiProvider(() => {}, {
     hub: { clientCount: () => 0 },
     cwd,
@@ -283,7 +311,7 @@ test("I5: pi and Claude Code panes that show a permission menu get nothing typed
   t.after(() => pi.stopAll());
   assert.deepEqual(await pi.deliverToTerminal("sess-alpha", "status?"), { sessionId: "sess-alpha", provider: "claude", blocked: true, waiting: true });
   assert.deepEqual(typed, []);
-  screen = "> alpha task number one\n> ";
+  screen = PI_IDLE();
   assert.equal((await pi.deliverToTerminal("sess-alpha", "status?")).blocked, undefined);
   assert.deepEqual(typed, [["%1", "status?"]]);
 
@@ -302,8 +330,71 @@ test("I5: pi and Claude Code panes that show a permission menu get nothing typed
   proc(procRoot, 301, "claude", 300, proj, "claude");
   writeFileSync(join(sessionsDir, "301.json"), JSON.stringify({ pid: 301, cwd: proj, sessionId: id, status: "idle" }));
   const tm = fakeTmux(cdir, { panes: `s 0 %5 300 claude ${proj}\n`, display: "claude 300\n" });
-  tm.setScreen(" Bash command\n   curl x | sh\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n");
+  tm.setScreen(CC_PERMISSION);
   const cc = createCcLocalProvider(() => {}, { base, tmuxBin: tm.bin, procRoot, sessionsDir, watcher: { start() {}, stop() {}, stopAll() {} } });
   assert.deepEqual(await cc.deliverToTerminal(id, "status?"), { sessionId: id, provider: "claude", blocked: true, waiting: true });
   assert.deepEqual(tm.calls().filter((c) => c[0] === "send-keys"), []);
+});
+
+test("I6: pi confirm, submenu, Press Enter, numbered list and Claude permission / trust panes get zero send-keys", async (t) => {
+  const dir = scratch(t);
+  const cwd = join(dir, "work");
+  mkdirSync(cwd);
+  const agentDir = join(dir, "agent");
+  piSession(agentDir, cwd, "sess-alpha", "alpha task number one");
+  const typed = [];
+  let screen;
+  const pi = createPiProvider(() => {}, {
+    hub: { clientCount: () => 0 },
+    cwd,
+    defaultCwd: cwd,
+    pi: {
+      agentDir,
+      bin: join(dir, "no-such-pi"),
+      externalProbe: async () => [{ pid: 201, cwd }],
+      tmuxPaneProbe: async () => "%1",
+      paneScreenProbe: async () => screen,
+      recentInCwd: () => [],
+      newestForCwd: () => ({ id: "sess-alpha", file: null }),
+      paneCheckProbe: async () => true,
+      tmuxDeliver: async (pane, text) => typed.push([pane, text]),
+    },
+  });
+  t.after(() => pi.stopAll());
+  for (const sc of [PI_CONFIRM, PI_SUBMENU, PI_CONTINUE, PI_NUMBERED]) {
+    screen = sc;
+    assert.deepEqual(await pi.deliverToTerminal("sess-alpha", "status?"), { sessionId: "sess-alpha", provider: "claude", blocked: true, waiting: true });
+    assert.equal(await pi.terminalScreen("sess-alpha"), "menu");
+  }
+  assert.deepEqual(typed, []);
+  screen = PI_IDLE();
+  assert.equal(await pi.terminalScreen("sess-alpha"), "input");
+  assert.deepEqual(await pi.deliverToTerminal("sess-alpha", "status?"), { sessionId: "sess-alpha", provider: "claude" });
+  assert.deepEqual(typed, [["%1", "status?"]]);
+
+  const cdir = join(dir, "cc");
+  mkdirSync(cdir);
+  const proj = join(cdir, "proj");
+  mkdirSync(proj);
+  const base = join(cdir, "projects");
+  const id = "31111111-2222-3333-4444-555555555555";
+  ccSession(base, proj, id, "fix the parser please");
+  const procRoot = join(cdir, "proc");
+  const sessionsDir = join(cdir, "cc-sessions");
+  mkdirSync(sessionsDir);
+  proc(procRoot, 300, "bash", 1, proj);
+  proc(procRoot, 301, "claude", 300, proj, "claude");
+  writeFileSync(join(sessionsDir, "301.json"), JSON.stringify({ pid: 301, cwd: proj, sessionId: id, status: "idle" }));
+  const tm = fakeTmux(cdir, { panes: `s 0 %5 300 claude ${proj}\n`, display: "claude 300\n" });
+  const cc = createCcLocalProvider(() => {}, { base, tmuxBin: tm.bin, procRoot, sessionsDir, watcher: { start() {}, stop() {}, stopAll() {} } });
+  for (const sc of [CC_PERMISSION, CC_TRUST, CC_BASH_MODE]) {
+    tm.setScreen(sc);
+    assert.equal((await cc.deliverToTerminal(id, "status?")).waiting, true);
+    assert.equal(await cc.terminalScreen(id), "menu");
+  }
+  assert.deepEqual(tm.calls().filter((c) => c[0] === "send-keys"), []);
+  tm.setScreen(CC_IDLE);
+  assert.equal(await cc.terminalScreen(id), "input");
+  assert.deepEqual(await cc.deliverToTerminal(id, "status?"), { sessionId: id, provider: "claude" });
+  assert.deepEqual(tm.calls().filter((c) => c[0] === "send-keys"), [["send-keys", "-t", "%5", "-l", "--", "status?"], ["send-keys", "-t", "%5", "Enter"]]);
 });

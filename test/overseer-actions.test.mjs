@@ -385,13 +385,13 @@ test("I5: a message to a terminal session waiting at a prompt is refused at prop
   const s = await open(newDir(), { cc });
   try {
     for (const origin of ["overseer", "evenai"]) {
-      await rejectsWith(s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin, requestId: `w-${origin}` }), 409, /^Claude session 'proj-c1' is waiting for an answer in its terminal; answer it there$/);
+      await rejectsWith(s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin, requestId: `w-${origin}` }), 409, /^Claude session 'proj-c1' is showing a prompt or menu in its terminal; answer it there$/);
     }
     // idle at propose, waiting at the yes: refused at confirm, nothing typed
     state = "idle";
     const p = await s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin: "evenai", requestId: "w-late" });
     state = "requires_action";
-    await rejectsWith(s.actions.confirm(p.id, { confirmFrameId: "f" }), 409, /waiting for an answer in its terminal/);
+    await rejectsWith(s.actions.confirm(p.id, { confirmFrameId: "f" }), 409, /showing a prompt or menu in its terminal/);
   } finally {
     await s.close();
   }

@@ -39,7 +39,7 @@ import {
   findClaudeTmuxPane,
   findExternalClaude,
   paneRunsPid,
-  screenShowsDialog,
+  inputReady,
   screenShowsFragments,
   tmuxDeliver,
 } from "./providers/pi/detect.mjs";
@@ -120,6 +120,29 @@ export function createCcLocalProvider(
   async function driversOf(sessionId, cwd) {
     const external = await findExternalClaude(cwd, { procRoot, sessionsDir });
     return external.filter((p) => p.sessionId == null || p.sessionId === sessionId);
+  }
+
+  /**
+   * The tmux pane of the terminal claude that runs THIS conversation, bound to its pid (its own record, else the one
+   * pane whose screen shows this conversation): `{ pane, pid }` or null.
+   */
+  async function terminalTarget(sessionId, file) {
+    const meta = ccMeta(file);
+    const external = await driversOf(sessionId, meta.cwd);
+    const owner = external.find((p) => p.sessionId === sessionId);
+    if (owner) {
+      const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner.pid }).catch(() => null);
+      return pane ? { pane, pid: owner.pid } : null;
+    }
+    const frags = recentCcPromptFragments(file);
+    const shows = [];
+    for (const p of external) {
+      const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: p.pid }).catch(() => null);
+      if (!pane) continue;
+      const screen = await capturePane(pane, { tmuxBin }).catch(() => null);
+      if (screenShowsFragments(screen, frags)) shows.push({ pane, pid: p.pid });
+    }
+    return shows.length === 1 ? shows[0] : null;
   }
 
   async function stateOf(sessionId, file) {
@@ -301,32 +324,25 @@ export function createCcLocalProvider(
       const file = fileOf(sessionId);
       if (!file) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
       const blocked = { sessionId, provider: "claude", blocked: true };
-      const meta = ccMeta(file);
-      const external = await driversOf(sessionId, meta.cwd);
-      const owner = external.find((p) => p.sessionId === sessionId);
-      let target = null;
-      if (owner) {
-        const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner.pid }).catch(() => null);
-        if (pane) target = { pane, pid: owner.pid };
-      } else {
-        const frags = recentCcPromptFragments(file);
-        const shows = [];
-        for (const p of external) {
-          const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: p.pid }).catch(() => null);
-          if (!pane) continue;
-          const screen = await capturePane(pane, { tmuxBin }).catch(() => null);
-          if (screenShowsFragments(screen, frags)) shows.push({ pane, pid: p.pid });
-        }
-        if (shows.length === 1) target = shows[0];
-      }
+      const target = await terminalTarget(sessionId, file);
       if (!target) return blocked;
       if (!(await paneRunsPid(target.pane, target.pid, { commands: ["claude"], tmuxBin, procRoot }))) return blocked;
-      // A permission / select menu on screen: the text and the Enter would answer it (usually "Yes"). Not typed.
-      if (screenShowsDialog(await capturePane(target.pane, { tmuxBin }).catch(() => null))) return { ...blocked, waiting: true };
+      // Allowlist (I6): only Claude Code's own idle input box ("❯ " between two rules) at the bottom of the pane
+      // takes typing; a permission menu, the trust prompt or any dialog would be answered by the text and Enter.
+      if (!inputReady(await capturePane(target.pane, { tmuxBin }).catch(() => null), "claude").ready) return { ...blocked, waiting: true };
       await tmuxDeliver(target.pane, text, { tmuxBin, singleLine: true });
       claim(sessionId, CC_LOCAL_NAME);
-      log?.(`[bridge] cc-local overseer message -> tmux pane ${target.pane} (claude ${target.pid}, cwd ${meta.cwd})`);
+      log?.(`[bridge] cc-local overseer message -> tmux pane ${target.pane} (claude ${target.pid})`);
       return { sessionId, provider: "claude" };
+    },
+
+    /** What the terminal claude of this session shows: "input" (its idle input box), "menu" (anything else), or null. */
+    async terminalScreen(sessionId) {
+      const file = fileOf(sessionId);
+      if (!file) return null;
+      const target = await terminalTarget(sessionId, file);
+      if (!target) return null;
+      return inputReady(await capturePane(target.pane, { tmuxBin }).catch(() => null), "claude").ready ? "input" : "menu";
     },
 
     /**
