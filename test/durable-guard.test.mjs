@@ -353,7 +353,7 @@ test("git config writes and command-running -c options are refused", () => {
 test("reads may reach system dirs, writes and removals may not", () => {
   const s = sandbox();
   try {
-    for (const cmd of ["ls /usr/lib", "/usr/bin/python3 x.py", "cat /etc/os-release", "cat < /etc/hosts", "ls /proc/self/fd", "cd /usr/lib && ls"]) {
+    for (const cmd of ["ls /usr/lib", "/usr/bin/python3 x.py", "cat /etc/os-release", "cat < /etc/hosts", "cat /proc/self/status", "cat /proc/cpuinfo", "cd /usr/lib && ls"]) {
       assert.equal(blocked(cmd, s), undefined, `should allow: ${cmd}`);
     }
     for (const cmd of [
@@ -400,4 +400,187 @@ test("prepare gives the shell an allowlisted env without tokens or keys", () => 
   guardPrepare(ex, { wrapper: "none", baseEnv });
   assert.equal(ex.inheritEnv, false);
   assert.deepEqual(ex.env, { PATH: "/usr/bin", HOME: "/home/ay", LANG: "C.UTF-8", LC_ALL: "C", NODE_ENV: "x", XDG_RUNTIME_DIR: "/run/user/1000", PI_TELEMETRY: "0" });
+});
+
+// ---------------------------------------------------------------- fix round 2
+
+test("B1: unresolved paths are judged by their literal prefix", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of [
+      "cat ~/$(printf .ssh)/id_ed25519",
+      "S=$(printf .ss%s h); cat ~/$S/id_ed25519",
+      "rm ~/$(printf .bashrc)",
+      "cat $HOME/$X",
+      "cat /$(echo etc)/shadow",
+      "cat ../$X",
+      "cat ~$X",
+    ]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+    for (const cmd of ["cat src/$NAME.js", "cat $(git rev-parse --show-toplevel)/package.json", "sed '/^$/d' a.txt", "ls $TMPX/$X", "echo $PATH"]) {
+      assert.equal(blocked(cmd.replace("$TMPX", s.tmp), s), undefined, `should allow: ${cmd}`);
+    }
+  } finally {
+    s.done();
+  }
+});
+
+test("B2: /proc/self allows named entries only", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of [
+      "cat /proc/self/root/home/ay/.git-credentials",
+      "ln -s /proc/self/cwd/.. up",
+      "ls /proc/self/cwd",
+      "ls /proc/self/fd",
+      "cat /proc/self/exe",
+      "ls /proc/self/map_files",
+      "cat /proc/1/environ",
+      "cd /proc/self && cat root/home/x",
+      "cd /proc && ls",
+    ]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+    for (const cmd of ["cat /proc/self/status", "cat /proc/self/maps", "cat /proc/self/limits", "cat /proc/self/mountinfo", "cat /proc/meminfo"]) {
+      assert.equal(blocked(cmd, s), undefined, `should allow: ${cmd}`);
+    }
+  } finally {
+    s.done();
+  }
+});
+
+test("B3: a shell reading its script from stdin is refused unless -c carries a literal script", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of [
+      "echo ls | bash /dev/stdin",
+      "echo ls | bash /dev/fd/0",
+      "echo ls | source /dev/stdin",
+      "echo ls | . /dev/stdin",
+      "echo ls | bash -",
+      "echo ls | bash -s",
+      "echo ls | exec -a x bash",
+      "echo ls | env bash",
+      'echo x | xargs bash -c "$(cat)"',
+      "find . | xargs bash -c 'rm -rf ~'",
+      "find . | xargs -I{} bash -c 'git reset --hard'",
+      "bash /dev/stdin",
+      "bash -lc 'g\\it reset --hard'",
+      'echo x | bash -c "echo $(cat)"',
+      'bash -c "echo $X"',
+      'X=1; eval "rm $X"',
+    ]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+    for (const cmd of ["find . -name '*.js' | xargs bash -c 'echo $0'", "echo a | bash -c 'cat'", "bash -lc 'npm test'", "bash scripts/build.sh", "source ./env.sh"]) {
+      assert.equal(blocked(cmd, s), undefined, `should allow: ${cmd}`);
+    }
+  } finally {
+    s.done();
+  }
+});
+
+test("B4/B5: env -S is re-lexed, exec -a skips its name, env -C is refused", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of [
+      "env -S 'rm -rf ~'",
+      "env -S'git reset --hard'",
+      "env --split-string='sudo ls'",
+      "exec -a x rm -r /tmp/foo",
+      "exec -a x b\\ash <<< ls",
+      "env -C / rm -rf x",
+      "nice -n 5 rm -rf ..",
+    ]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+    assert.equal(blocked("env -S 'npm test'", s), undefined);
+    assert.equal(blocked("exec -a x npm test", s), undefined);
+  } finally {
+    s.done();
+  }
+});
+
+test("B6: paths under a link made earlier in the same command are refused", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of [
+      'ln -s "$(dirname "$PWD")" up && rm -rf up/other',
+      "ln -s $X up",
+      "ln -s /usr up && rm -rf up/x",
+      "ln -s /usr/lib up; cat up/x",
+      "ln -s /usr/lib up; echo x > up/y",
+      "mkdir d && ln -s /usr d && rm -rf d/usr/x",
+    ]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+    assert.equal(blocked("ln -s a/b link", s), undefined);
+    assert.equal(blocked("ln -s a/b link && ls a", s), undefined);
+  } finally {
+    s.done();
+  }
+});
+
+test("B7: git config and env that make git run programs are refused", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of [
+      "git config core.hooksPath /tmp/h",
+      "git config --local core.sshCommand 'sh -c id'",
+      "git config core.pager sh",
+      "git config core.editor x",
+      "git config core.fsmonitor x",
+      "git config core.alternateRefsCommand x",
+      "git config gpg.program x",
+      "git config gpg.ssh.program x",
+      "git config sequence.editor x",
+      "git config credential.helper x",
+      "git config include.path /tmp/c",
+      "git config includeIf.gitdir:/x.path /tmp/c",
+      "git config alias.x '!sh'",
+      "git config filter.x.clean x",
+      "git config diff.x.textconv x",
+      "git config remote.origin.uploadpackCommand x",
+      "git -c gpg.program=x commit",
+      "git -c include.path=/tmp/c status",
+      "git -c sequence.editor=x rebase -i",
+      "GIT_SSH_COMMAND='sh -c id' git fetch",
+      "GIT_SSH=x git fetch",
+      "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=sh git log",
+      "GIT_CONFIG_GLOBAL=/tmp/c git log",
+      "GIT_PAGER=sh git log",
+      "GIT_EDITOR=x git commit",
+      "GIT_EXTERNAL_DIFF=x git diff",
+      "env GIT_PAGER=sh git log",
+      "export GIT_SSH_COMMAND=x",
+      "GIT_DIR=/home/x/.git git log",
+      "GIT_WORK_TREE=.. git status",
+    ]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+    for (const cmd of ["git config user.name x", "git config --get core.pager", "GIT_DIR=./.git git log", "git -c color.ui=never log"]) {
+      assert.equal(blocked(cmd, s), undefined, `should allow: ${cmd}`);
+    }
+  } finally {
+    s.done();
+  }
+});
+
+test("more container and process tools are refused", () => {
+  const s = sandbox();
+  try {
+    for (const cmd of ["ctr run x", "lxc exec c sh", "lxc-attach -n c", "lxd init", "machinectl shell x", "killall5 -9", "kill $PPID", "kill -9 $$"]) {
+      assert.ok(blocked(cmd, s), `should block: ${cmd}`);
+    }
+  } finally {
+    s.done();
+  }
+});
+
+test("the shell env also drops api keys, credentials and private values", () => {
+  const baseEnv = { PATH: "/usr/bin", NODE_APIKEY: "k", NODE_API_KEY_X: "k", NODE_CREDENTIALS_FILE: "c", NODE_PRIVATE_THING: "p", NODE_ENV: "x" };
+  const ex = { command: "env", cwd: "/w", env: { OPENAI_APIKEY: "k", MY_CREDENTIAL: "c", PRIVATE_URL: "p", OK: "1" }, inheritEnv: true };
+  guardPrepare(ex, { wrapper: "none", baseEnv });
+  assert.deepEqual(ex.env, { PATH: "/usr/bin", NODE_ENV: "x", OK: "1" });
 });

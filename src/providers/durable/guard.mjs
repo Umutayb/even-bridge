@@ -22,11 +22,22 @@
 // /opt /snap /etc /proc/self); writes and removals only cwd and /tmp. Secret
 // system files (/etc/shadow*, /etc/sudoers*, /etc/ssh, ...) are refused for both.
 //
-// Known MVP limits (this is a lexer/regex guard, not a sandbox; real isolation
-// is bwrap, which borealis does not have installed):
-// - Code given to an interpreter is not inspected: `python3 -c`, `node -e`,
-//   `perl -e`, `python3 <<EOF`, or writing a script and then running
-//   `bash file.sh`. Only the denied home dirs are caught there, by name.
+// Known limits. This is a lexer/regex guard over shell text, not a sandbox: it
+// catches the obvious and the common evasions, and a determined model can
+// still get past it. The real isolation is bwrap (BWRAP=1), which borealis does
+// not have installed; systemd-run only caps memory and CPU. Still uncaught:
+// - Code run by an interpreter: `python3 -c`, `node -e`, `perl -e`, `ruby -e`,
+//   `python3 <<EOF`, `| python3`, or `npm test`/`make` running a script the
+//   model edited. Only the denied home dirs are caught there, by name.
+// - A script written first and run later (`echo ... > x.sh; bash x.sh`,
+//   `bash < x.sh`), and anything the program does on its own (git hooks
+//   already in the repo, npm lifecycle scripts, a Makefile).
+// - Paths built at run time beyond what the lexer sees (`cd "$(cat f)"` makes
+//   the cwd unknown and blocks what follows, but `$X/..`-style values that are
+//   computed are only checked by their literal prefix), and symlinks or files
+//   made by a program other than `ln` earlier in the same command.
+// - Network use: curl/wget are allowed (only piping them into a shell or an
+//   interpreter is refused).
 // - RULES also run on the raw text, so `echo "git reset --hard" x` is
 //   blocked too. That over-blocking is intended.
 // - Child conversations (subagents) must map to their parent's cwd; `cwdOf`
@@ -43,10 +54,17 @@ const DENIED_IN_HOME = [".ssh", ".aws", ".config", ".even-terminal", ".pi", ".gn
 const DENIED_ABS = ["/etc/ssh", "/etc/ssl/private", "/etc/netplan", "/etc/wpa_supplicant", "/etc/NetworkManager"];
 const DENIED_PREFIX = ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 const READ_SYSTEM = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/snap", "/etc"];
-const PROC_SELF = "/proc/self";
+// /proc: only named, harmless entries; never root, cwd, fd, exe, map_files (they lead anywhere).
+const PROC_SELF_OK = new Set(["status", "stat", "statm", "maps", "smaps", "smaps_rollup", "environ", "cmdline", "comm", "limits", "mountinfo", "mounts", "cgroup", "io", "sched", "oom_score", "loginuid", "sessionid", "uid_map", "gid_map", "wchan"]);
+const PROC_GLOBAL_OK = new Set(["cpuinfo", "meminfo", "loadavg", "uptime", "version", "stat"]);
 // The shell sees only these variables from the bridge's environment (never tokens or keys).
 const ENV_ALLOW = /^(?:PATH|HOME|LANG|LC_\w+|TERM|USER|LOGNAME|SHELL|TMPDIR|NVM_DIR|NODE_\w+|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)$/;
-const ENV_SECRET = /(?:TOKEN|_KEY|SECRET|PASSWORD|PASSWD)$|^(?:LETS_CODE_TOKEN|BRIDGE_TOKEN)$/i;
+const ENV_SECRET = /(?:TOKEN|_KEY|SECRET|PASSWORD|PASSWD)$|APIKEY|API_KEY|CREDENTIAL|PRIVATE|^(?:LETS_CODE_TOKEN|BRIDGE_TOKEN)$/i;
+// Environment assignments that make git run a program or look elsewhere.
+const GIT_ENV_EXEC = /^GIT_(?:CONFIG\w*|SSH\w*|PAGER|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|ASKPASS|PROXY_COMMAND|EXEC_PATH|TEMPLATE_DIR)$/;
+const GIT_ENV_PATH = /^GIT_(?:DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES)$/;
+// Config keys whose value is a program, or that pull in other config.
+const GIT_EXEC_KEYS = String.raw`(?:core\.(?:hookspath|sshcommand|pager|editor|fsmonitor|alternaterefscommand|gitproxy|askpass)|gpg\.(?:\w+\.)?program|sequence\.editor|credential\.|include\.path|includeif\.|alias\.|filter\.|protocol\.|uploadpack\.|diff\.\S*\.(?:textconv|command)|merge\.\S*\.driver|pager\.|[\w.-]*command(?=[\s=]|$))`;
 const DEVICES = /^\/dev\/(?:null|zero|u?random|stdin|stdout|stderr|tty|fd\/\d+)$/;
 const SECRET_NAME = /^(?:\.env(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|authorized_keys|.*\.(?:pem|key|p12|pfx|jks|keystore))$/;
 const SHELLS = /^(?:sh|bash|zsh|dash|ksh|fish)$/;
@@ -82,14 +100,16 @@ export const RULES = [
   { re: r(`${G}config\\b${A}\\s(?:--unset-all|--remove-section)${E}`), why: "git config --unset-all/--remove-section is refused" },
   { re: r(`${G}submodule\\s+deinit\\b${A}\\s(?:-f|--force)${E}`), why: "git submodule deinit -f discards work" },
   { re: /(?<![\w.-])(?:sudo|doas|pkexec)(?![\w./-])/, why: "sudo/doas/pkexec is refused" },
-  { re: /(?<![\w.-])(?:docker|podman|nerdctl)(?![\w./-])(?!\s+(?:ps|images|logs|inspect|version|info)(?=\s|$|[;&|)]))/, why: "container tools are refused (docker group membership is root-equivalent)" },
+  { re: /(?<![\w.-])(?:docker|podman|nerdctl|ctr|lxd|machinectl|lxc(?:-[\w-]+)?)(?![\w./-])(?!\s+(?:ps|images|logs|inspect|version|info)(?=\s|$|[;&|)]))/, why: "container tools are refused (docker group membership is root-equivalent)" },
   { re: /(?<![\w.-])(?:nsenter|unshare|chroot)(?![\w./-])/, why: "namespace and chroot tools are refused" },
-  { re: /(?<![\w.-])(?:pkill|killall|loginctl|crontab|systemd-run)(?![\w./-])/, why: "process, session and scheduler control is refused" },
+  { re: /(?<![\w.-])(?:pkill|killall5?|loginctl|crontab|systemd-run)(?![\w./-])/, why: "process, session and scheduler control is refused" },
   { re: r(`(?<![\\w.-])kill\\b${A}\\s(?:--\\s+)?-1${E}`), why: "kill -1 signals every process" },
-  { re: r(`(?<![\\w.-])kill\\b${A}(?:\\$\\(|\`)`), why: "kill with a computed target cannot be checked" },
+  { re: r(`(?<![\\w.-])kill\\b${A}(?:\\$|\`)`), why: "kill with a computed target ($PPID, $$, $(..)) cannot be checked" },
   { re: r(`(?<![\\w.-])(?:ba|z|da|k|fi)?sh(?![\\w./-])${A}<<<`), why: "a here-string fed to a shell cannot be checked; use bash -c '...'" },
   { re: r(`${G}config\\b${A}\\s--(?:global|system)${E}`), why: "git config --global/--system is refused" },
-  { re: /\bgit\b[^;&|\n]*\s(?:-c\s*|--config-env[= ])["']?(?:core\.(?:sshcommand|pager|editor|hookspath|fsmonitor|gitproxy|askpass)|credential\.|alias\.|protocol\.|uploadpack\.|diff\.\S*\.textconv|filter\.)/i, why: "git -c that runs commands (core.sshCommand, pager, hooksPath, credential.helper, ...) is refused" },
+  { re: new RegExp(String.raw`\bgit\b[^;&|\n]*\s(?:-c\s*|--config-env[= ])["']?${GIT_EXEC_KEYS}`, "i"), why: "git -c with a key that runs a program (core.sshCommand, pager, hooksPath, credential.helper, alias, ...) is refused" },
+  { re: new RegExp(String.raw`${G}config\b(?![^;&|\n]*\s(?:--get\S*|-l|--list|--show-\S+)(?=\s|$))[^;&|\n]*\s["']?${GIT_EXEC_KEYS}`, "i"), why: "git config writes of keys that run a program (core.hooksPath, core.sshCommand, include.path, alias.*, ...) are refused" },
+  { re: /(?<![\w.-])GIT_(?:CONFIG\w*|SSH\w*|PAGER|EDITOR|SEQUENCE_EDITOR|EXTERNAL_DIFF|ASKPASS|PROXY_COMMAND|EXEC_PATH|TEMPLATE_DIR)=/, why: "git environment that runs a program (GIT_SSH_COMMAND, GIT_PAGER, GIT_CONFIG_*, ...) is refused" },
   { re: /(?:^|[;&|(\n]|\$\()\s*su(?=\s|$)/, why: "su is refused" },
   { re: r(`\\|\\s*(?:env\\s+)?(?:\\S*\\/)?(?:ba|z|da|k|fi)?sh${E}(?!${A}\\s-c\\b)`), why: "a script piped into a shell cannot be checked; use bash -c '...' or a heredoc" },
   { re: /\b(?:curl|wget)\b[^;&\n]*\|\s*(?:\S*\/)?(?:python[\d.]*|perl|ruby|node|php)\b/, why: "a downloaded script piped into an interpreter is refused" },
@@ -142,6 +162,14 @@ function expandHome(p, home) {
   return s;
 }
 
+/** `/proc/self`, `/proc/self/<named entry>` or `/proc/<global entry>`, judged on the unnormalized path. */
+function procOk(abs) {
+  const segs = abs.split("/").filter((x) => x !== "" && x !== ".");
+  if (segs[0] !== "proc") return false;
+  if (segs.length === 2) return PROC_GLOBAL_OK.has(segs[1]) || segs[1] === "self";
+  return segs.length === 3 && segs[1] === "self" && PROC_SELF_OK.has(segs[2]);
+}
+
 const tilde = (p, home) => (within(p, home) ? "~" + p.slice(home.length) : p);
 
 /**
@@ -168,7 +196,7 @@ export function confinePath(p, cwd, home = homedir(), { tmp = TMP, base = cwd, m
   for (const d of DENIED_PREFIX) if (real.startsWith(d) || lexical.startsWith(d)) return { ok: false, why: `${d}* is off limits`, real };
   const roots = [realCwd, resolveReal(tmp) ?? tmp];
   if (roots.some((root) => within(real, root))) return { ok: true, real };
-  if (mode === "read" && (READ_SYSTEM.some((root) => within(real, resolveReal(root) ?? root)) || within(lexical, PROC_SELF))) return { ok: true, real };
+  if (mode === "read" && (READ_SYSTEM.some((root) => within(real, resolveReal(root) ?? root)) || procOk(isAbsolute(expanded) ? expanded : `${base}/${expanded}`))) return { ok: true, real };
   const where = mode === "read" ? "the workspace, /tmp and the system dirs" : `the workspace (${tilde(realCwd, home)} and ${tmp})`;
   return { ok: false, why: `'${p}' is outside ${where}${mode === "write" ? " for writing" : ""}`, real };
 }
@@ -213,21 +241,23 @@ function matchParen(src, i) {
  */
 function lex(src) {
   const out = [];
-  let seg = { argv: [], writes: [], reads: [] };
+  let seg = { argv: [], dyn: [], writes: [], reads: [] };
   let tok = null;
+  let dyn = false;  // the word has a `$`/backtick outside single quotes: the shell expands it
   let redir = null;
   const endTok = () => {
     if (tok === null) return;
     if (redir === "write") seg.writes.push(tok);
     else if (redir === "read") seg.reads.push(tok);
-    else if (redir !== "skip") seg.argv.push(tok);
+    else if (redir !== "skip") { seg.argv.push(tok); seg.dyn.push(dyn); }
     tok = null;
+    dyn = false;
     redir = null;
   };
   const endSeg = () => {
     endTok();
     if (seg.argv.length || seg.writes.length || seg.reads.length) out.push(seg);
-    seg = { argv: [], writes: [], reads: [] };
+    seg = { argv: [], dyn: [], writes: [], reads: [] };
   };
   // Note: `seg.piped` (stdin from a `|`) and `seg.herestring` (`<<<`) ride on the segment.
   const nested = (inner) => { out.push({ open: true }, ...lex(inner), { close: true }); };
@@ -242,6 +272,7 @@ function lex(src) {
       let k = i + 1, s = "";
       while (k < src.length && src[k] !== '"') {
         if (src[k] === "\\" && k + 1 < src.length) { s += src[k + 1]; k += 2; continue; }
+        if (src[k] === "$" || src[k] === "`") dyn = true;
         if (src[k] === "$" && src[k + 1] === "(") { k = substitution(k + 1) + 1; s += "$()"; continue; }
         if (src[k] === "`") { k = backtick(k) + 1; s += "$()"; continue; }
         s += src[k++];
@@ -249,9 +280,9 @@ function lex(src) {
       tok = (tok ?? "") + s; i = k; continue;
     }
     if (c === " " || c === "\t") { endTok(); continue; }
-    if (c === "$" && src[i + 1] === "(") { i = substitution(i + 1); tok = (tok ?? "") + "$()"; continue; }
-    if (c === "`") { i = backtick(i); tok = (tok ?? "") + "$()"; continue; }
-    if ((c === "<" || c === ">") && src[i + 1] === "(") { endTok(); i = substitution(i + 1); tok = "$()"; continue; }
+    if (c === "$" && src[i + 1] === "(") { i = substitution(i + 1); tok = (tok ?? "") + "$()"; dyn = true; continue; }
+    if (c === "`") { i = backtick(i); tok = (tok ?? "") + "$()"; dyn = true; continue; }
+    if ((c === "<" || c === ">") && src[i + 1] === "(") { endTok(); i = substitution(i + 1); tok = "$()"; dyn = true; continue; }
     if (c === "(") { endSeg(); out.push({ open: true }); continue; }
     if (c === ")") { endSeg(); out.push({ close: true }); continue; }
     if (c === ";" || c === "\n" || c === "|" || c === "&") {
@@ -273,6 +304,7 @@ function lex(src) {
       redir = c === ">" ? "write" : "read";
       continue;
     }
+    if (c === "$") dyn = true;
     tok = (tok ?? "") + c;
   }
   endSeg();
@@ -285,17 +317,33 @@ const hasGlob = (t) => /[*?[]/.test(t);
 const globRe = (pat) => new RegExp("^" + pat.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
 
 /** Strip `command`, `env K=V`, `xargs -n1`, `timeout 5`, `nohup`, ... in front of the real command. */
-function unwrapArgv(argv) {
+const WRAPPER_VALUE_FLAGS = { nice: /^-n$/, exec: /^-a$/, ionice: /^-[cnp]$/, stdbuf: /^-[ioe]$/ };
+
+function unwrapArgv(argv, assigns = []) {
   let a = argv;
   for (let guard = 0; guard < 10 && a.length; guard++) {
     const n = basename(a[0]);
     if (/^(?:then|do|else|elif|if|while|until|!|\{|\}|time|nohup|command|builtin|exec|stdbuf|nice|ionice)$/.test(n)) {
       a = a.slice(1);
-      while (a.length && /^-/.test(a[0]) && !/^-c$/.test(a[0])) a = a.slice(/^-n$/.test(a[0]) ? 2 : 1);
+      // Flags that take a value: `nice -n 5`, `exec -a NAME`, `ionice -c 3`, `stdbuf -o L`.
+      const valued = WRAPPER_VALUE_FLAGS[n];
+      while (a.length && /^-/.test(a[0])) a = a.slice(valued?.test(a[0]) ? 2 : 1);
       continue;
     }
-    if (n === "env") { a = a.slice(1); while (a.length && (/^-/.test(a[0]) || /^\w+=/.test(a[0]))) a = a.slice(1); continue; }
-    if (n === "timeout") { a = a.slice(1); while (a.length && /^-/.test(a[0])) a = a.slice(1); a = a.slice(1); continue; }
+    if (n === "env") {
+      a = a.slice(1);
+      while (a.length && (/^-/.test(a[0]) || /^\w+=/.test(a[0]))) {
+        const t = a[0];
+        // `env -S 'cmd args'` splits its value into words: lex it and go on with those.
+        const split = t === "-S" || t === "--split-string" ? a[1] ?? "" : t.startsWith("--split-string=") ? t.slice(15) : /^-S./.test(t) ? t.slice(2) : null;
+        if (split !== null) { a = [...lexWords(split), ...a.slice(t === "-S" || t === "--split-string" ? 2 : 1)]; break; }
+        if (/^\w+=/.test(t)) assigns.push(t);
+        if (/^-C|^--chdir/.test(t)) assigns.chdir = true;
+        a = a.slice(/^-[uC]$|^--(?:unset|chdir)$/.test(t) ? 2 : 1);
+      }
+      continue;
+    }
+    if (n === "timeout") { a = a.slice(1); while (a.length && /^-/.test(a[0])) a = a.slice(/^-[sk]$|^--(?:signal|kill-after)$/.test(a[0]) ? 2 : 1); a = a.slice(1); continue; }
     if (n === "xargs") {
       a = a.slice(1);
       while (a.length && /^-/.test(a[0])) a = a.slice(/^-[IndPLsE]$/.test(a[0]) ? 2 : 1);
@@ -304,6 +352,11 @@ function unwrapArgv(argv) {
     break;
   }
   return a;
+}
+
+/** All words of a string, ignoring operators (for `env -S`). */
+function lexWords(src) {
+  return lex(src).flatMap((seg) => seg.argv ?? []);
 }
 
 function flagsOf(args) {
@@ -355,12 +408,34 @@ function judge(cmd, cwd0, home, tmp, depth) {
     return Object.hasOwn(vars, k) ? vars[k] : m;
   });
 
+  // Links made earlier in this command (`ln -s X up && rm -rf up/y`): they do not exist yet when
+  // judged, so anything under them is unknown.
+  const links = [];
+  const viaLink = (t) => {
+    if (!links.length || cwd === UNKNOWN) return undefined;
+    const lx = resolve(cwd, expandHome(t, home) ?? t);
+    const l = links.find((x) => within(lx, x));
+    return l ? `'${t}' goes through a link made earlier in this command; run the ln on its own first` : undefined;
+  };
+  // An unresolved path (`~/$(printf .ssh)/x`, `/$X`): judge the literal part before the first `$`/backtick.
+  const unresolvedPrefix = (raw, t) => {
+    const i = t.search(/[`]|\$[{(\w$]|\{\}/);
+    const prefix = t.slice(0, i);
+    const cut = prefix.lastIndexOf("/");
+    const dir = cut > 0 ? prefix.slice(0, cut) : cut === 0 ? "/" : prefix.startsWith("~") ? "~" : "";
+    if (dir === "") return undefined;
+    const res = confine(dir, cwd ?? cwd0, "read");
+    if (!res.ok) return `cannot tell what '${raw}' refers to, and ${dir} is outside what may be touched`;
+    if (dir === "~" || /^~\/?$/.test(prefix)) return `cannot tell what '${raw}' refers to under ~`;
+    return undefined;
+  };
   const checkToken = (raw) => {
     const t = expand(raw);
-    if (DEVICES.test(t) || !pathLike(t) || unresolved(t)) return undefined;
+    if (DEVICES.test(t) || !pathLike(t)) return undefined;
+    if (unresolved(t)) return /[`]|\$[{(\w$]|\{\}/.test(t) ? unresolvedPrefix(raw, t) : undefined;  // a lone `$` (sed '/^$/d') is literal
     if (cwd === UNKNOWN && !isAbsolute(t) && !t.startsWith("~")) return `cannot tell what '${raw}' refers to after an unresolved cd`;
     const res = confine(t, cwd ?? cwd0, "read");
-    return res.ok ? undefined : res.why;
+    return res.ok ? viaLink(t) : res.why;
   };
   const checkWrite = (raw) => {
     const t = expand(raw);
@@ -371,7 +446,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
     const res = confine(t, cwd);
     if (!res.ok) return res.why;
     if (/(?:^|\/)\.git(?:\/|$)/.test(res.real)) return "writing inside .git is refused; use git commands instead";
-    return undefined;
+    return viaLink(t);
   };
   const checkRemoval = (name, raw, recursive) => {
     const t = expand(raw);
@@ -380,6 +455,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
     const glob = hasGlob(basename(t));
     const res = confine(glob ? dirname(t) || "." : t, cwd);
     if (!res.ok) return `${name} ${raw}: ${res.why}`;
+    { const v = viaLink(t); if (v) return `${name} ${raw}: ${v}`; }
     if (basename(t) === ".git" || /(?:^|\/)\.git(?:\/|$)/.test(res.real)) return `${name} ${raw}: removing .git is refused`;
     if (glob) {
       if (recursive && within(cwd, res.real) && globRe(basename(t)).test(".git")) return `${name} ${raw}: the pattern would take .git`;
@@ -398,17 +474,25 @@ function judge(cmd, cwd0, home, tmp, depth) {
     for (const w of seg.writes) { const v = checkWrite(w); if (v) return v; }
     for (const rd of seg.reads) { const v = checkToken(rd); if (v) return v; }
 
-    let argv = unwrapArgv(seg.argv);
+    const assigns = [];
+    let argv = unwrapArgv(seg.argv, assigns);
     if (/^(?:export|declare|local|typeset|readonly)$/.test(argv[0] ?? "")) argv = argv.slice(1).filter((a) => !a.startsWith("-"));
     // Assignments: remember `D=x` on its own, check the value either way.
+    const checkAssign = (name, value) => {
+      if (GIT_ENV_EXEC.test(name)) return `${name} makes git run a program; refused`;
+      if (GIT_ENV_PATH.test(name)) { const t = expand(value); const res = unresolved(t) ? { ok: false, why: "unresolved" } : confine(t, cwd ?? cwd0); if (!res.ok) return `${name} must point inside the workspace`; }
+      return checkToken(value);
+    };
     let k = 0;
     for (; k < argv.length; k++) {
       const m = /^(\w+)=(.*)$/s.exec(argv[k]);
       if (!m) break;
-      const v = checkToken(m[2]); if (v) return v;
+      const v = checkAssign(m[1], m[2]); if (v) return v;
       if (argv.length === 1 || argv.every((a) => /^\w+=/.test(a))) vars[m[1]] = expand(m[2]);
     }
-    argv = unwrapArgv(argv.slice(k));
+    argv = unwrapArgv(argv.slice(k), assigns);
+    if (assigns.chdir) return "env -C/--chdir cannot be followed; cd first";
+    for (const a of assigns) { const m = /^(\w+)=(.*)$/s.exec(a); const v = checkAssign(m[1], m[2]); if (v) return v; }
     if (!argv.length) { prevWords = ""; continue; }
     // The program word must be literal: `$G push`, `$(..) push`, `"" push` cannot be checked.
     const prog = expand(argv[0]);
@@ -440,17 +524,28 @@ function judge(cmd, cwd0, home, tmp, depth) {
       if (cwd === UNKNOWN && !isAbsolute(d) && !d.startsWith("~")) continue;
       const res = confine(d, cwd ?? cwd0, "read");
       if (!res.ok) return `cd ${args[0]}: ${res.why}`;
+      if (within(res.real, "/proc")) return `cd ${args[0]}: cd into /proc is refused`;
       cwd = res.real;
       continue;
     }
     if (name === "popd") { cwd = UNKNOWN; continue; }
 
-    if (SHELLS.test(name) || name === "eval") {
-      const ci = argv.indexOf("-c");
-      const script = name === "eval" ? argv.slice(1).join(" ") : ci > 0 ? argv[ci + 1] : undefined;
+    if (SHELLS.test(name) || name === "eval" || name === "source" || name === ".") {
+      // `bash -c S`, `bash -lc S`, `bash -ec S`: S is the script (a short-flag cluster with a `c`).
+      const ci = argv.findIndex((x, j) => j > 0 && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(x));
+      const script = name === "eval" ? argv.slice(1).join(" ") : SHELLS.test(name) && ci > 0 ? argv[ci + 1] : undefined;
+      const fromStdin = argv.slice(1).some((x) => /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/.test(expand(x)) || /^-[a-zA-Z]*s[a-zA-Z]*$/.test(x));
+      // A script the shell expands before handing it over (`bash -c "echo $X"`, `eval "$s"`) is
+      // whatever the variable holds: only single-quoted (or expansion-free) scripts are judged.
+      const off = seg.argv.length - argv.length;
+      const dynAt = (j) => seg.argv[off + j] === argv[j] ? seg.dyn?.[off + j] === true : /[`$]/.test(argv[j]);
+      const scriptDyn = name === "eval" ? argv.slice(1).some((_, j) => dynAt(j + 1)) : ci > 0 && dynAt(ci + 1);
       if (script !== undefined) {
+        if (scriptDyn) return `${name}: a script with $-expansions outside single quotes cannot be checked; single-quote it`;
         if (cwd === UNKNOWN) return "cannot tell where a nested script runs after an unresolved cd";
         const v = judge(script, cwd, home, tmp, depth + 1); if (v) return v;
+      } else if (seg.piped || fromStdin) {
+        return `${name} reading its script from stdin cannot be checked; use ${SHELLS.test(name) ? name : "bash"} -c '...'`;
       }
       continue;
     }
@@ -490,6 +585,10 @@ function judge(cmd, cwd0, home, tmp, depth) {
     }
 
     const { flags, pos } = flagsOf(argv.slice(1));
+    if (name === "ln") {
+      const srcs = pos.length > 1 ? pos.slice(0, -1) : pos;
+      if (srcs.some((x) => unresolved(expand(x)))) return "ln with a computed source cannot be checked; use a literal path";
+    }
     let targets = [];
     if (/^(?:cp|mv|ln|install|rsync)$/.test(name)) targets = pos.slice(-1);
     else if (/^(?:tee|touch|truncate|mkdir)$/.test(name)) targets = pos;
@@ -498,6 +597,15 @@ function judge(cmd, cwd0, home, tmp, depth) {
     for (const t of targets) { const v = checkWrite(t); if (v) return v; }
     if (name === "mv") for (const s of pos.slice(0, -1)) { const v = checkRemoval("mv", s, false); if (v) return v; }
     if (name === "rsync" && flags.some((f) => f.startsWith("--delete")) && pos.length) { const v = checkRemoval("rsync --delete", pos[pos.length - 1], true); if (v) return v; }
+    if (name === "ln" && cwd !== UNKNOWN && pos.length) {  // remembered only after its own checks passed
+      const srcs = pos.length > 1 ? pos.slice(0, -1) : pos;
+      const dest = pos.length > 1 ? expand(pos[pos.length - 1]) : basename(expand(pos[0]));
+      const destAbs = resolve(cwd, expandHome(dest, home) ?? dest);
+      let isDir = false;
+      try { isDir = lstatSync(destAbs).isDirectory(); } catch { /* a new name */ }
+      if (isDir) for (const x of srcs) links.push(join(destAbs, basename(expand(x))));
+      else links.push(destAbs);
+    }
   }
   return undefined;
 }
