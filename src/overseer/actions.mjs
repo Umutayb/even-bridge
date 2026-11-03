@@ -19,6 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { defineDoc } from "@earendil-works/pi-durable";
 import { HANDOFF_MODEL, OVERSEER_SID, OverseerHandoffs, OverseerOutbox, pushOutbox, ROOT_CONVERSATION_ID } from "./docs.mjs";
 import { hhmm } from "./checkins.mjs";
+import { cannotMessage, defuse, KIND_WORD } from "./host.mjs";
 
 export const ACTION_TTL_MS = 90000;
 export const ACTION_KINDS = Object.freeze(["session_start", "session_message", "session_interrupt", "session_stop", "model_switch", "standing_order"]);
@@ -55,6 +56,17 @@ export const LABEL_MAX = 24;
 const LABEL_RE = /^[\w .-]+$/;
 export const DEFAULT_AUDIT_PATH = "~/.even-terminal/overseer-actions.log";
 export const DEFAULT_DISABLE_FILE = "~/.even-terminal/agents.disabled";
+/**
+ * After a confirmed session_message the target is watched (in this process; a restart ends the watch) for its
+ * next status change: a reply, a question waiting for the user, or a finished turn becomes ONE outbox item
+ * (kind "reply"), which Even AI's "what's new" reads. Polled every REPLY_POLL_MS for at most REPLY_MAX_MS.
+ */
+export const REPLY_POLL_MS = 5000;
+export const REPLY_MAX_MS = 30 * 60 * 1000;
+/** An idle target with no busy phase seen: its reply is looked for after this long (tmux and RC report late). */
+export const REPLY_QUIET_MS = 15000;
+export const REPLY_TEXT_MAX = 200;
+export const REPLY_WATCH_MAX = 8;
 
 const latest = { scope: "conversation", history: "latest", fork: "initial", checkpointWhen: () => true };
 export const OverseerActions = defineDoc({ kind: "even.overseer.actions", version: 1, ...latest, initial: () => ({ items: [] }) });
@@ -101,11 +113,12 @@ export function summarize(kind, args = {}) {
     case "standing_order": {
       const text = String(args.text ?? "");
       const what = `${text.slice(0, 140)}${text.length > 140 ? "…" : ""}`;
-      return `Let the overseer tell agent '${args.label}' "${what}" up to ${args.maxTimes} time${args.maxTimes > 1 ? "s" : ""} until ${hhmm(args.until)}?`;
+      return `Let the overseer tell ${KIND_WORD[args.target] ?? "agent"} '${args.label}' "${what}" up to ${args.maxTimes} time${args.maxTimes > 1 ? "s" : ""} until ${hhmm(args.until)}?`;
     }
     case "session_message": {
+      // The target's kind and host-built label (a pi / Claude Code / RC session's own title is never named).
       const text = String(args.text ?? "");
-      return `Send agent '${args.label}': "${text.slice(0, 140)}${text.length > 140 ? "…" : ""}"${args.steer ? " now" : ""}?`;
+      return `Send ${KIND_WORD[args.target] ?? "agent"} '${args.label}': "${text.slice(0, 140)}${text.length > 140 ? "…" : ""}"${args.steer ? " now" : ""}?`;
     }
     case "session_interrupt":
       return `Interrupt agent '${args.label}'?`;
@@ -187,6 +200,9 @@ export function createOverseerActions({
   disableFile = DEFAULT_DISABLE_FILE,
   claudeSlots = () => claudeFreeSlots(),
   home = homedir(),
+  replyPollMs = REPLY_POLL_MS,
+  replyMaxMs = REPLY_MAX_MS,
+  replyQuietMs = REPLY_QUIET_MS,
 } = {}) {
   let harness;
   let ctx;
@@ -232,8 +248,9 @@ export function createOverseerActions({
   function writerCheck(kind, id, d) {
     if (d.kind === "durable" && id === OVERSEER_SID) throw httpError(403, "the overseer cannot act on itself");
     if (kind === "session_message" || kind === "standing_order") {
-      if (d.kind === "cc-local") throw httpError(403, "cc-local sessions are read-only for the overseer");
-      if (d.kind === "pi" && String(d.driver).startsWith("terminal")) throw httpError(403, `${id} is driven from a terminal; the overseer only watches it`);
+      // Every kind that has a transport (host.mjs messageRoute): a bridge agent, an RC session, a pi session
+      // (its tmux pane or pi RPC), a Claude Code session in a tmux pane. Never a terminal outside tmux.
+      if (!d.canMessage) throw httpError(403, cannotMessage(id, d.kind, d.why));
       return;
     }
     if (d.kind !== "durable") {
@@ -282,12 +299,14 @@ export function createOverseerActions({
     const d = await describe(id);
     writerCheck(kind, id, d);
     const label = oneLine(d.label || id, 40).replace(/'/g, "’");
+    // The target's kind, for the summary ("Send pi session '…'"); a bridge agent's args are as before.
+    const target = d.kind !== "durable" ? { target: d.kind } : {};
     if (kind === "session_message") {
       const text = strArg(args.text, "text", { max: origin === "overseer" ? OVERSEER_TEXT_MAX : EVENAI_TEXT_MAX });
       if (COMMAND_RE.test(text)) throw httpError(400, NO_COMMANDS);
       const steer = args.steer == null ? false : args.steer;
       if (typeof steer !== "boolean") throw httpError(400, "'steer' must be true or false");
-      return { id, label, text, steer };
+      return { id, label, text, steer, ...target };
     }
     if (kind === "standing_order") {
       // The later messages are sent without a confirm, so the text is short enough to be read in full.
@@ -300,7 +319,7 @@ export function createOverseerActions({
       const until = typeof args.until === "string" ? Date.parse(args.until) : args.until;
       const t = now();
       if (!Number.isFinite(until) || until <= t || until > t + STANDING_MAX_MS) throw httpError(400, "'until' must be within 12 hours from now");
-      return { id, label, text, maxTimes, until: Math.floor(until) };
+      return { id, label, text, maxTimes, until: Math.floor(until), ...target };
     }
     return { id, label };
   }
@@ -557,12 +576,15 @@ export function createOverseerActions({
     note("confirm", claimed, by);
     resolved(claimed, "allow");
     let result;
+    let baseline = null;
     try {
       // Everything is checked again right before it runs: limits, and (inside execute) the session's driver.
       if (claimed.kind === "session_start" || claimed.kind === "model_switch") await checkLimits(claimed.kind, claimed.args);
       if (claimed.kind !== "session_start" && claimed.kind !== "model_switch") {
         writerCheck(claimed.kind, claimed.args.id, await describe(claimed.args.id));
       }
+      // A message's target is watched for its reply; the newest answer before the send is the baseline.
+      if (claimed.kind === "session_message") baseline = await replyBaseline(claimed.args.id);
       result =
         claimed.kind === "model_switch"
           ? await modelSwitch(claimed)
@@ -584,7 +606,86 @@ export function createOverseerActions({
       if (i) i.result = result;
     });
     note("execute", claimed, "bridge");
+    if (claimed.kind === "session_message") watchReply(claimed, baseline);
     return { ok: true, result };
+  }
+
+  // ── replies: the target's next status change after a confirmed message, as one outbox item ──
+  /** Running reply watches (newest last); the oldest is dropped past REPLY_WATCH_MAX. */
+  const watches = new Set();
+
+  async function replyBaseline(id) {
+    try {
+      return typeof host.lastReply === "function" ? String((await host.lastReply(id)) ?? "") : null;
+    } catch {
+      return "";
+    }
+  }
+
+  async function pushReply(item, text) {
+    try {
+      const box = await harness.commit(
+        async (tx) => ({ ...pushOutbox(await tx.doc(OverseerOutbox, ROOT_CONVERSATION_ID), { kind: "reply", text, tag: item.id, at: now() }) }),
+        ctx,
+      );
+      onOutbox(box);
+    } catch (err) {
+      log.warn?.(`[overseer] reply item for ${item.id} failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Watch the target of a confirmed message: "waiting" → "<Kind> '<label>' is waiting for an answer."; back to
+   * idle with a new answer → "<Kind> '<label>' replied: <its newest answer, one line, ≤ 200 chars>"; idle after a
+   * busy phase without a new answer → "… finished its turn without a new answer." Nothing after REPLY_MAX_MS.
+   * The reply text is the session's own (untrusted): defused, one line, cut; it reaches only the outbox.
+   */
+  function watchReply(item, baseline) {
+    if (closed || baseline == null || typeof host.stateOf !== "function") return;
+    const { id, label } = item.args;
+    const word = KIND_WORD[item.args.target] ?? "agent";
+    const who = `${word[0].toUpperCase()}${word.slice(1)} '${label}'`;
+    const t0 = now();
+    const w = { timer: null, stop: false };
+    watches.add(w);
+    while (watches.size > REPLY_WATCH_MAX) {
+      const oldest = watches.values().next().value;
+      oldest.stop = true;
+      clearTimeout(oldest.timer);
+      watches.delete(oldest);
+    }
+    let seenBusy = false;
+    const end = () => watches.delete(w);
+    const tick = async () => {
+      if (closed || w.stop) return end();
+      let st = null;
+      try {
+        st = await host.stateOf(id);
+      } catch {
+        /* unknown this time */
+      }
+      if (st === "waiting") {
+        end();
+        return pushReply(item, `${who} is waiting for an answer.`);
+      }
+      if (st === "busy") seenBusy = true;
+      else if (st === "idle" && (seenBusy || now() - t0 >= replyQuietMs)) {
+        const r = await replyBaseline(id);
+        if (r && r !== baseline) {
+          end();
+          return pushReply(item, `${who} replied: ${defuse(r, { oneLine: true, max: REPLY_TEXT_MAX })}`);
+        }
+        if (seenBusy) {
+          end();
+          return pushReply(item, `${who} finished its turn without a new answer.`);
+        }
+      }
+      if (now() - t0 >= replyMaxMs || st == null) return end();
+      w.timer = setTimeout(tick, replyPollMs);
+      w.timer.unref?.();
+    };
+    w.timer = setTimeout(tick, replyPollMs);
+    w.timer.unref?.();
   }
 
   /**
@@ -790,6 +891,8 @@ export function createOverseerActions({
     close() {
       closed = true;
       if (timer) clearInterval(timer);
+      for (const w of watches) clearTimeout(w.timer);
+      watches.clear();
     },
   };
 }

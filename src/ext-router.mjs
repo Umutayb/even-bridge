@@ -20,7 +20,7 @@
 import { Router } from "express";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { getOwner } from "./ownership.mjs";
-import { findBridgeSessionId } from "./rc-transcripts.mjs";
+import { dropRcTwins } from "./session-twins.mjs";
 import { listCcSessions, ccProjectsBase } from "./cc-transcripts.mjs";
 
 const STATUS_CHECK_COUNT = 10; // mirrors core.js
@@ -268,41 +268,11 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       extLists.set(p.name, list);
     }
 
-    // RC transcripts: the claude-remote fork runs the real `claude
-    // --remote-control` CLI, so each live RC session ALSO exists as a local
-    // transcript file under ~/.claude/projects/. The same conversation would
-    // therefore appear twice (once as the cse_… RC session, once as a local
-    // claude session). We keep the RC entry (the phone must interact by its
-    // cse_ id — the upstream only knows that) and hide the local duplicate,
-    // borrowing the local entry's real title + cwd for a better list row.
+    // RC transcripts: each live RC session also exists as a local transcript; the local
+    // duplicate is hidden and the RC row borrows its title + cwd (src/session-twins.mjs, the
+    // same function the overseer's session inventory uses).
     const rcList = extLists.get("claude-remote") || [];
-    if (rcList.length > 0 && local.length > 0) {
-      const rcIds = new Set(rcList.map((s) => s.id));
-      const rcByTwin = new Map(); // local session id -> rc entry
-      const dropLocal = new Set();
-      for (const s of local) {
-        let rcId = null;
-        try {
-          rcId = findBridgeSessionId(s.cwd, s.id, rcTranscriptBase);
-        } catch {
-          /* ignore */
-        }
-        if (rcId && rcIds.has(rcId)) {
-          dropLocal.add(s.id);
-          rcByTwin.set(s.id, rcId);
-        }
-      }
-      if (dropLocal.size > 0) {
-        for (const rc of rcList) {
-          const twin = local.find((l) => rcByTwin.get(l.id) === rc.id);
-          if (twin) {
-            rc.title = twin.title || rc.title;
-            rc.cwd = twin.cwd || rc.cwd;
-          }
-        }
-        local = local.filter((s) => !dropLocal.has(s.id));
-      }
-    }
+    local = dropRcTwins(local, rcList, { base: rcTranscriptBase });
 
     // Honor the phone's project filter on the extended lists too (the RC
     // upstream ignores cwd; pi entries already carry their real cwd).
@@ -584,6 +554,21 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!Number.isSafeInteger(upTo) || upTo < 0) return res.status(400).json({ error: "'upTo' must be a non-negative integer" });
     try {
       res.json(await overseer.markRead(upTo));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // Every active session of both harnesses (durable agents, pi, local Claude Code, Remote Control) with a
+  // host-built label, a normalized state and whether it can receive a message: the same inventory the
+  // overseer's sessions_list reads (src/overseer/host.mjs). Titles and last lines are not sent. `all=1`: also
+  // sessions idle and undriven for longer than the active window.
+  router.get("/overseer/sessions", async (req, res, next) => {
+    const h = overseer?.host;
+    if (typeof h?.inventory !== "function") return next();
+    const all = req.query.all === "1" || req.query.all === "true";
+    try {
+      res.json({ sessions: await h.inventory({ all }) });
     } catch (err) {
       fail(res, err);
     }

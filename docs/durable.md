@@ -257,6 +257,73 @@ OOM kill left failed never blocks the next spawn's unit name).
   A child that crashes while the bridge runs gets a crash prompt after an error frame
   `lets-code exited mid-turn; starting it again (attempt n of 6)`.
 
+## Every session of both harnesses: listing and messaging (overseer, `EVEN_BRIDGE_OVERSEER_ENABLE=1`)
+
+With the overseer on, one inventory covers every active session the bridge can see:
+durable agents (native and lets-code), pi sessions (`~/.pi/agent/sessions`, terminal or
+bridge children), local Claude Code sessions (`~/.claude/projects`) and Remote Control
+sessions. It is one function, `sessionsList` in `src/overseer/host.mjs`, read by:
+
+- the overseer's `sessions_list` tool (fenced as untrusted data, titles and last lines included);
+- `GET /api/overseer/sessions[?all=1]` (Even AI's `list_sessions`): host-built fields only;
+- the gated actions (`describe`): the label and kind a summary names.
+
+The phone's `GET /api/sessions` keeps its own wire rows; it shares the RC-twin rule
+(`src/session-twins.mjs`: a live RC session's local transcript is listed once, as the RC row).
+
+A row (`/api/overseer/sessions`):
+
+| field | meaning |
+|---|---|
+| `id`, `kind` | `durable` \| `pi` \| `cc-local` \| `rc` (+ `engine` for durable) |
+| `label` | a bridge agent's name; otherwise `<folder>-<first 6 of the id>` in `[a-z0-9-]`. A session's own title is never used: it is text the session wrote. |
+| `state` | `idle` \| `busy` \| `waiting` (a permission or question prompt); unknown provider words count as busy |
+| `driver` | `bridge`, `terminal-tmux`, `terminal`, `rc`, `none` |
+| `lastActivity`, `ageS` | epoch ms of the last write / seen, and its age |
+| `canMessage`, `via` / `why` | see below |
+
+Active = every non-archived durable agent (seen in 7 days), plus any other session that is
+driven, not idle, or touched within 12 h (`ACTIVE_WINDOW_MS`); `all=1` drops that filter.
+Each provider lists at most 10 rows.
+
+Who can receive a message (`messageRoute`), and through which transport:
+
+| kind | driver | transport (`via`) |
+|---|---|---|
+| durable | bridge | durable prompt (`steer` or `followUp`) |
+| rc | rc | the Remote Control engine (`/api/prompt` upstream) |
+| pi | `none` / `bridge` | pi RPC: the bridge's `pi --mode rpc` child, resumed with `--session` if needed (`pi-rpc`) |
+| pi, cc-local | `terminal-tmux` | typed into the terminal's tmux pane (`tmux`); the terminal stays the only writer |
+| pi, cc-local | `terminal` | no (`terminal-no-tmux`) |
+| cc-local | `none` | no (`no-terminal`): nothing runs it, and the bridge does not spawn a claude for a message |
+| cc-local | `bridge` | no (`phone-claude`): the phone's Claude bridge runs it |
+
+This supersedes the plan's Q7/Q8 rulings (terminal pi and cc-local observe-only) at the
+user's request (Task 6b): a terminal in tmux receives a confirmed message; a terminal outside
+tmux never does, and no session is ever driven twice.
+
+`session_message` goes through the same gate as every action: the overseer proposes it (or
+Even AI stages `message_session` and proposes it through `POST /api/overseer/actions` at the
+user's yes), nothing runs before a confirm (`confirmFrameId`, 90 s expiry, one pending
+overseer action, the `agents.disabled` kill switch, the audit log), text starting with `/` or
+`!` is refused at propose and again at execute, the overseer's text is at most 140 characters.
+The summary names the target's kind and label: `Send pi session 'notes-0a1b2c': "run the tests"?`
+(`agent`, `pi session`, `Claude session`, `Claude RC session`). The route is probed again right
+before the send. A Claude Code pane that did not take the text (the terminal went away) is a
+failed action (409), never "sent". A standing order may cover messages to any of these kinds.
+
+Replies reach the glasses through the outbox. After a confirmed message the target is polled
+every 5 s for up to 30 min (in the bridge process; a restart ends the watch) and its next status
+change becomes ONE outbox item of kind `reply`, tagged with the action id:
+
+- `<Kind> '<label>' replied: <its newest answer, one line, defused, at most 200 characters>`
+  when it is idle again with a new answer (looked for after a busy phase, or after 15 s idle);
+- `<Kind> '<label>' is waiting for an answer.` when it stops at a permission or question prompt;
+- `<Kind> '<label>' finished its turn without a new answer.` after a busy phase without one.
+
+Even AI's "what's new" says `reply` items as host lines. The answer is the session's own text:
+it reaches only the outbox (never the overseer's context, never an action).
+
 ## Restart and resume
 
 A bridge shutdown does **not** abort running agents. On SIGTERM/SIGINT the

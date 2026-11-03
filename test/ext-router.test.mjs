@@ -801,6 +801,37 @@ test("/overseer routes fall through without the overseer", async (t) => {
   assert.deepEqual(fellThrough, ["POST /api/overseer/ask", "GET /api/overseer/outbox", "POST /api/overseer/outbox/read"]);
 });
 
+test("GET /overseer/sessions serves the host inventory; all=1 passes on; without the overseer it falls through", async (t) => {
+  const calls = [];
+  const row = { id: "p1", kind: "pi", label: "notes-p1", state: "idle", driver: "none", lastActivity: 5, ageS: 1, canMessage: true, via: "pi-rpc" };
+  const overseer = { ...stubOverseer(), host: { inventory: async (o) => (calls.push(o), [row]) } };
+  const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, on.app);
+  let r = await fetch(`${base}/api/overseer/sessions`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { sessions: [row] });
+  r = await fetch(`${base}/api/overseer/sessions?all=1`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(calls, [{ all: false }, { all: true }]);
+  const failing = { ...stubOverseer(), host: { inventory: async () => { throw Object.assign(new Error("store"), { statusCode: 503 }); } } };
+  const bad = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer: failing });
+  r = await fetch(`${await listen(t, bad.app)}/api/overseer/sessions`);
+  assert.equal(r.status, 503);
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable() });
+  await fetch(`${await listen(t, off.app)}/api/overseer/sessions`);
+  assert.deepEqual(off.fellThrough, ["GET /api/overseer/sessions"]);
+});
+
+test("dropRcTwins is the phone list's own twin rule (one function for both lists)", async () => {
+  const { dropRcTwins } = await import("../src/session-twins.mjs");
+  const local = [{ id: "l1", cwd: "/a", title: "real title" }, { id: "l2", cwd: "/b", title: "other" }];
+  const rcList = [{ id: "cse_1", cwd: "", title: "" }];
+  const kept = dropRcTwins(local, rcList, { twinOf: (cwd, id) => (id === "l1" ? "cse_1" : id === "l2" ? "cse_gone" : null) });
+  assert.deepEqual(kept.map((s) => s.id), ["l2"], "only a twin of a LISTED rc session is dropped");
+  assert.deepEqual(rcList, [{ id: "cse_1", cwd: "/a", title: "real title" }]);
+  assert.equal(dropRcTwins(local, [], {}), local);
+});
+
 test("GET /agents advertises the overseer only when it is on", async (t) => {
   const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc(), overseer: stubOverseer() });
   let r = await fetch(`${await listen(t, on.app)}/api/agents`);

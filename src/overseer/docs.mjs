@@ -1,7 +1,8 @@
 // The overseer's constants and its three documents on the root conversation
 // (EVEN_BRIDGE_OVERSEER_ENABLE=1 only; nothing here is loaded with the flag off).
 //   even.overseer.notes   its own notes (≤ 16 KB), read and written by its tools
-//   even.overseer.outbox  short items Even AI reads ("what's new"): answers that came late, notifies
+//   even.overseer.outbox  short items Even AI reads ("what's new"): answers that came late, notifies,
+//                         replies of sessions a confirmed message went to
 //   even.overseer.asks    `overseer_ask` submissions not answered within the wait (plan ruling 7)
 import { defineDoc, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 
@@ -17,7 +18,8 @@ export const NOTIFY_MAX_CHARS = 500;
 export const NOTIFY_PER_RUN = 3;
 /** Settled asks remembered after they left `pending` (a retried requestId never lands in the outbox twice). */
 export const ASKS_DONE_KEEP = 200;
-export const OUTBOX_KINDS = Object.freeze(["answer", "notify", "action", "checkin", "system"]);
+// reply: host text about a messaged session's next status change (its own answer quoted, defused, ≤ 200 chars).
+export const OUTBOX_KINDS = Object.freeze(["answer", "notify", "action", "checkin", "system", "reply"]);
 export { ROOT_CONVERSATION_ID };
 
 /** A hand-off's tag (`<source>:<key>`, e.g. "ideate:bees") and agent label; the tag routes results back. */
