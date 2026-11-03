@@ -8,11 +8,18 @@
 //   node scripts/overseer-smoke.mjs              # one lets-code agent, then the overseer is asked about it
 //   node scripts/overseer-smoke.mjs --keep       # leave the store and bridge.log (mode 0600: the banner holds the token)
 //   node scripts/overseer-smoke.mjs --timeout 240
+//   node scripts/overseer-smoke.mjs --actions    # Task 5: a told start, confirmed over HTTP; expiry; phone deny
 //
 // Checks: GET /api/agents advertises the overseer; dur-overseer is listed first by the durable
 // provider and cannot be stopped (403); the overseer's answer to "Which agents are running and
 // what are they doing?" names the agent (directly, or from the outbox when it took over 15 s).
 // No factory, no --factory: the lets-code agent runs in ask mode.
+//
+// --actions (plan Task 5, step 7): "Start a lets-code agent called ovs-a that writes hi to hi.txt" is
+// told to the overseer (mode tell): exactly one pending action and no agent until the confirm; the
+// confirm (POST /api/overseer/actions/:id/confirm) starts it, hi.txt appears, a second confirm returns
+// the same result; a fresh proposal confirmed after 91 s is 410; another one denied through
+// /api/permission-response on dur-overseer is denied. The audit log stays in the throwaway store dir.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -34,6 +41,8 @@ const LIVE_PORT = 3456;
 const CONFIG = join(homedir(), ".even-terminal", "config.json");
 const LABEL = "bees-notes";
 const QUESTION = "Which agents are running and what are they doing?";
+const TELL = "Start a lets-code agent called ovs-a that writes hi to hi.txt";
+const AUDIT = join(ROOT, "overseer-actions.log");
 
 if (process.argv.includes("--child")) {
   const { startServer } = await import(pathToFileURL(join(HERE, "..", "src", "server.mjs")).href);
@@ -43,6 +52,8 @@ if (process.argv.includes("--child")) {
 
 const argv = process.argv.slice(2);
 const KEEP = argv.includes("--keep");
+const ACTIONS = argv.includes("--actions");
+let actionCwd = null; // the told agent's folder (removed at the end)
 const TIMEOUT_MS = Number(argv[argv.indexOf("--timeout") + 1] || 0) * 1000 || 240_000;
 const t0 = Date.now();
 const say = (line) => console.log(`[overseer-smoke +${((Date.now() - t0) / 1000).toFixed(1)}s] ${line}`);
@@ -145,6 +156,7 @@ async function main() {
     EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1",
     EVEN_BRIDGE_OVERSEER_ENABLE: "1",
     EVEN_BRIDGE_DURABLE_STORE: STORE,
+    EVEN_BRIDGE_OVERSEER_AUDIT: AUDIT,
     EVEN_BRIDGE_DURABLE_CWDS: join(homedir(), "sandbox", "agents"),
     EVEN_BRIDGE_LC_BIN: LC_BIN,
     EVEN_BRIDGE_PI_ENABLE: "0",
@@ -174,6 +186,7 @@ async function main() {
   const stop403 = await api("POST", "/agents/dur-overseer/stop");
   if (stop403.status !== 403) fail(`stopping the overseer answered ${stop403.status}`);
   say("dur-overseer listed; stopping it is 403");
+  if (ACTIONS) return actionsSmoke();
 
   // One lets-code agent with a little work to do.
   const r1 = await api("POST", "/prompt", {
@@ -236,6 +249,86 @@ async function main() {
   say("agent stopped");
 }
 
+async function actionsSmoke() {
+  // 1. Told, not done: one pending action with the host's summary, no agent yet.
+  const requestId = `ovs-${randomUUID().replace(/-/g, "")}`;
+  let t = Date.now();
+  const tell = await api("POST", "/overseer/ask", { question: TELL, requestId, waitMs: 15000, mode: "tell" }, 30_000);
+  if (tell.status !== 200) fail(`tell ${tell.status}: ${JSON.stringify(tell.json)}`);
+  say(`tell answered ${tell.json.status} in ${((Date.now() - t) / 1000).toFixed(1)}s: ${short(tell.json.answer, 200)}`);
+  const pend = await waitFor(async () => {
+    const r = (await api("GET", "/overseer/actions?state=pending")).json?.actions ?? [];
+    return r.length ? r : null;
+  }, TIMEOUT_MS, "a pending action");
+  if (pend.length !== 1) fail(`${pend.length} pending actions: ${JSON.stringify(pend)}`);
+  const act = pend[0];
+  say(`pending action ${act.id} (${act.kind}): ${act.summary}`);
+  if (act.kind !== "session_start") fail(`expected session_start, got ${act.kind}`);
+  if (!(tell.json.actions ?? []).some((a) => a.id === act.id) && tell.json.status === "done") fail("the ask did not report its action");
+  actionCwd = act.args.cwd;
+  if ((await api("GET", "/agents")).json.agents.length !== 0) fail("an agent exists before the confirm");
+  const reqFrames = ((await api("GET", "/messages?sessionId=dur-overseer&after=0")).json?.messages ?? [])
+    .map((m) => m.message ?? m)
+    .filter((f) => f?.type === "permission_request" && f.toolUseId === act.id);
+  if (reqFrames.length !== 1) fail(`dur-overseer has ${reqFrames.length} permission requests for it`);
+  say("no agent before the confirm; the phone has its permission request");
+
+  // 2. The confirm runs it once; a repeated confirm returns the same result.
+  t = Date.now();
+  const c1 = await api("POST", `/overseer/actions/${act.id}/confirm`, { confirmFrameId: "smoke-1" }, 60_000);
+  if (c1.status !== 200) fail(`confirm ${c1.status}: ${JSON.stringify(c1.json)}`);
+  const sid = c1.json.result?.sessionId;
+  say(`confirmed in ${((Date.now() - t) / 1000).toFixed(1)}s: ${sid}`);
+  const c2 = await api("POST", `/overseer/actions/${act.id}/confirm`, { confirmFrameId: "smoke-2" });
+  if (JSON.stringify(c2.json) !== JSON.stringify(c1.json)) fail(`a second confirm differs: ${JSON.stringify(c2.json)}`);
+  const agents = (await api("GET", "/agents")).json.agents;
+  if (agents.length !== 1 || agents[0].sid !== sid || agents[0].origin !== "overseer") fail(`agents: ${JSON.stringify(agents)}`);
+  say(`one agent ${agents[0].name} (origin ${agents[0].origin}, engine ${agents[0].engine}, ttlS ${agents[0].ttlS})`);
+  const hi = join(actionCwd, "hi.txt");
+  await waitFor(async () => {
+    try {
+      return readFileSync(hi, "utf8");
+    } catch {
+      return null;
+    }
+  }, TIMEOUT_MS, `${hi}`);
+  say(`hi.txt exists: ${JSON.stringify(short(readFileSync(hi, "utf8"), 40))}`);
+  await waitFor(async () => (await api("GET", `/status?sessionId=${encodeURIComponent(sid)}`)).json?.state === "idle", TIMEOUT_MS, "the agent to finish");
+
+  // 3. Expiry: a fresh proposal (Even AI's one gate, no model) confirmed after 91 s is 410.
+  const p2 = await api("POST", "/overseer/actions", { kind: "session_stop", args: { id: sid }, origin: "evenai", requestId: randomUUID() });
+  if (p2.status !== 200) fail(`propose ${p2.status}: ${JSON.stringify(p2.json)}`);
+  say(`proposed ${p2.json.id}: ${p2.json.summary}; waiting 91 s`);
+  await sleep(91_000);
+  const late = await api("POST", `/overseer/actions/${p2.json.id}/confirm`, { confirmFrameId: "smoke-late" });
+  if (late.status !== 410) fail(`a late confirm answered ${late.status}: ${JSON.stringify(late.json)}`);
+  say(`late confirm: 410 ${late.json.error}`);
+  if ((await api("GET", "/agents")).json.agents.length !== 1) fail("the expired stop ran");
+
+  // 4. The phone says no: /api/permission-response on dur-overseer denies the oldest pending action.
+  const p3 = await api("POST", "/overseer/actions", { kind: "session_stop", args: { id: sid }, origin: "evenai", requestId: randomUUID() });
+  const deny = await api("POST", "/permission-response", { sessionId: "dur-overseer", decision: "deny" });
+  if (deny.status !== 200) fail(`permission-response ${deny.status}: ${JSON.stringify(deny.json)}`);
+  const after = await api("POST", `/overseer/actions/${p3.json.id}/confirm`, {});
+  if (after.status !== 409) fail(`confirm after the phone's no answered ${after.status}`);
+  say(`phone deny: ${p3.json.id} denied (confirm then 409 ${after.json.error})`);
+  if ((await api("GET", "/agents")).json.agents.length !== 1) fail("the denied stop ran");
+
+  // 5. Audit trail and cleanup.
+  const lines = readFileSync(AUDIT, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const events = (id) => lines.filter((l) => l.id === id).map((l) => l.event).join(",");
+  say(`audit: ${act.id}=${events(act.id)} ${p2.json.id}=${events(p2.json.id)} ${p3.json.id}=${events(p3.json.id)}`);
+  if (events(act.id) !== "propose,confirm,execute") fail("the start is not audited as propose,confirm,execute");
+  const live = await fetch(`http://127.0.0.1:${LIVE_PORT}/api/sessions`, { headers: { authorization: `Bearer ${TOKEN}` }, signal: AbortSignal.timeout(15_000) })
+    .then((r) => r.text())
+    .catch((err) => `error: ${err.message}`);
+  if (live.includes(sid)) fail("the live bridge lists the throwaway session");
+  say(`live bridge untouched (does not list ${sid})`);
+  const stop = await api("POST", `/agents/${encodeURIComponent(sid)}/stop`);
+  if (stop.status !== 200) fail(`stop ${stop.status}: ${JSON.stringify(stop.json)}`);
+  say("agent stopped");
+}
+
 let code = 0;
 try {
   await main();
@@ -252,6 +345,7 @@ try {
   if (!KEEP) {
     rmSync(ROOT, { recursive: true, force: true });
     rmSync(WORK, { recursive: true, force: true });
+    if (actionCwd && actionCwd.startsWith(join(homedir(), "sandbox", "agents") + "/")) rmSync(actionCwd, { recursive: true, force: true });
   } else say(`kept ${ROOT} (bridge.log mode 0600 holds the token)`);
 }
 process.exit(code);

@@ -235,6 +235,8 @@ export async function startServer({ flags = {}, cwd } = {}) {
           overseer: o,
           emit,
           onOutbox: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+          // A throwaway instance (smoke) keeps its audit next to its store; the live one uses ~/.even-terminal.
+          ...(process.env.EVEN_BRIDGE_OVERSEER_AUDIT ? { auditPath: process.env.EVEN_BRIDGE_OVERSEER_AUDIT } : {}),
         });
         await actions.ready;
         overseerHost.actions = actions;
