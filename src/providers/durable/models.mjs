@@ -13,7 +13,7 @@ const SUPPORTED_API = "openai-completions";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const CLAUDE_ALIASES = ["haiku", "sonnet", "opus", "fable"];
 
-const expandHome = (p) => (p === "~" ? homedir() : p.startsWith("~/") ? homedir() + p.slice(1) : p);
+export const expandHome = (p) => (p === "~" ? homedir() : p.startsWith("~/") ? homedir() + p.slice(1) : p);
 
 // "$VAR" keys are read from env on every request (rotation-safe, never cached);
 // anything else is a literal key. Empty/unset yields undefined.

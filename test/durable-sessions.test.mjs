@@ -134,3 +134,32 @@ test("openDurable on a SQLite file keeps the session map in a separate file", as
   map.close();
   assert.ok(existsSync(storePath) && existsSync(storePath + ".sessions.sqlite"));
 });
+
+test("create defaults the name to the cwd's basename", () => {
+  const { map } = freshMap();
+  assert.equal(map.get(map.create({ cwd: "/home/ay/github/even-bridge", modelRef: QWEN, origin: "evenai" })).name, "even-bridge");
+  assert.equal(map.get(map.create({ name: "", cwd: "/", modelRef: QWEN, origin: "evenai" })).name, "agent");
+  map.close();
+});
+
+test("~ paths expand and missing parent directories are created", async () => {
+  const { createRegistry } = await import("@earendil-works/pi-durable");
+  const { createModels } = await import("@earendil-works/pi-ai");
+  const { openDurable } = await import("../src/providers/durable/harness.mjs");
+  const home = mkdtempSync(join(tmpdir(), "dur-home-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const storePath = "~/.even-terminal/nested/durable.sqlite";
+    const d = await openDurable({ storePath, models: createModels(), registry: createRegistry() });
+    const map = new SessionMap(storePath);
+    assert.equal(map.path, join(home, ".even-terminal/nested/durable.sqlite.sessions.sqlite"));
+    await d.close();
+    map.close();
+    assert.ok(existsSync(join(home, ".even-terminal/nested/durable.sqlite")));
+    assert.ok(existsSync(join(home, ".even-terminal/nested/durable.sqlite.sessions.sqlite")));
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});

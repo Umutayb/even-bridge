@@ -4,11 +4,14 @@
 // (`<storePath>.sessions.sqlite`) — Durable's store is never written by us.
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { basename, dirname } from "node:path";
+import { expandHome } from "./models.mjs";
 
 const ORIGINS = new Set(["evenai", "phone"]);
 const COLUMNS = "sid, conversation_id, name, cwd, model_provider, model_id, created_at, last_seen, origin, archived";
 
-export const sessionMapPath = (storePath) => storePath + ".sessions.sqlite";
+export const sessionMapPath = (storePath) => expandHome(storePath) + ".sessions.sqlite";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
 
@@ -20,6 +23,7 @@ export class SessionMap {
   constructor(storePath, { now = nowSeconds } = {}) {
     this.now = now;
     this.path = sessionMapPath(storePath);
+    mkdirSync(dirname(this.path), { recursive: true });
     this.db = new DatabaseSync(this.path);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA busy_timeout = 5000");
@@ -53,6 +57,7 @@ export class SessionMap {
   create({ name, cwd, modelRef, origin, conversationId = null }) {
     if (!ORIGINS.has(origin)) throw new Error(`invalid origin ${JSON.stringify(origin)}: expected evenai|phone`);
     const sid = "dur-" + randomUUID();
+    if (!name) name = (cwd && basename(cwd)) || "agent";
     const t = this.now();
     this.stmt.insert.run(sid, conversationId, name, cwd, modelRef?.provider ?? null, modelRef?.modelId ?? null, t, t, origin);
     return sid;

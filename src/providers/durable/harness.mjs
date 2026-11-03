@@ -11,10 +11,13 @@
 import { Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { expandHome } from "./models.mjs";
 
 /**
  * @param {object} o
- * @param {string} [o.storePath] Durable SQLite file (ignored when `storage` is given).
+ * @param {string} [o.storePath] Durable SQLite file, `~` expanded, parent created (ignored when `storage` is given).
  * @param {object} [o.storage] a ready Storage (tests: `new MemoryStorage()`).
  * @param {import("@earendil-works/pi-ai").Models} o.models
  * @param {object} o.registry `createRegistry()` with the extensions installed.
@@ -27,7 +30,9 @@ export async function openDurable({ storePath, storage, models, registry, envFor
   if (telemetryOff) process.env.PI_TELEMETRY = "0";
   if (!storage) {
     if (!storePath) throw new Error("openDurable: storePath or storage is required");
-    storage = await openNodeSqliteStorage(storePath, { busyTimeoutMs: 5000 });
+    const file = expandHome(storePath);
+    mkdirSync(dirname(file), { recursive: true });
+    storage = await openNodeSqliteStorage(file, { busyTimeoutMs: 5000 });
   }
   const ctx = BACKGROUND_CONTEXT;
   const harness = await Harness.open(

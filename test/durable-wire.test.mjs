@@ -212,3 +212,126 @@ test("user content arrays are flattened to text", () => {
   tr.apply(view([u], { run: RUN }));
   assert.equal(frames[0].text, "a\nb");
 });
+
+// ---- fix round 1 ----
+const usageOf = (input, output) => ({ models: { "lets-code/qwen3.8-27b": { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output, cost: {} } }, tools: {} });
+const between = (frames, a, b) => frames.slice(a + 1, b);
+const promptIdx = (frames) => frames.map((f, i) => (f.type === "user_prompt" ? i : -1)).filter((i) => i >= 0);
+
+test("each run reports only its own tokens", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([], {}, usageOf(0, 0)));
+  const u1 = user(1, "one"), a1 = assistant(2, [{ type: "text", text: "1" }]);
+  tr.apply(view([u1], { run: { taskId: 10, inputs: [], turns: 0, first: 1 } }, usageOf(0, 0)));
+  tr.apply(view([u1, a1], {}, usageOf(100, 10)));
+  const u2 = user(3, "two"), a2 = assistant(4, [{ type: "text", text: "2" }]);
+  // second run folded into a single view: its usage is already in that view
+  tr.apply(view([u1, a1, u2, a2], {}, usageOf(250, 25)));
+  const results = frames.filter((f) => f.type === "result");
+  assert.deepEqual(results.map((r) => [r.inputTokens, r.outputTokens]), [[100, 10], [150, 15]]);
+  const stats = frames.filter((f) => f.type === "running_stats");
+  assert.deepEqual(stats.map((r) => [r.inputTokens, r.outputTokens]), [[100, 10], [150, 15]]);
+});
+
+test("priming starts the usage baseline at the first view", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([user(1, "old"), assistant(2, [{ type: "text", text: "x" }])], {}, usageOf(500, 50)));
+  tr.apply(view([user(3, "new"), assistant(4, [{ type: "text", text: "y" }])], {}, usageOf(530, 53)));
+  const r = frames.find((f) => f.type === "result");
+  assert.deepEqual([r.inputTokens, r.outputTokens], [30, 3]);
+});
+
+test("queued input in the ending commit ends the first run before the second prompt", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([]));
+  const u1 = user(1, "first"), a1 = assistant(2, [{ type: "text", text: "Answer one." }]), u2 = user(3, "second");
+  tr.apply(view([u1], { run: { taskId: 10, inputs: [5], turns: 0, first: 1 } }));
+  tr.apply(view([u1, a1, u2], { run: { taskId: 20, inputs: [6], turns: 0, first: 3 } }));
+  const [p1, p2] = promptIdx(frames);
+  assert.equal(frames[p2].text, "second");
+  const mid = between(frames, p1, p2).map(shape);
+  assert.equal(mid.filter((s) => s === "result").length, 1);
+  assert.equal(mid.filter((s) => s === "status idle").length, 1);
+  assert.equal(mid.at(-1), "status idle");
+  assert.ok(mid.includes("text_delta"), "the first run's answer lands in the first run");
+  assert.equal(frames.find((f) => f.type === "result").success, true);
+  assert.deepEqual(frames.slice(p2).map(shape), ["user_prompt", "status busy"]);
+});
+
+test("continue after a failed run reports the failure, then a new busy run", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([]));
+  const u1 = user(1, "go");
+  tr.apply(view([u1], { run: { taskId: 10, inputs: [5], turns: 0, first: 1 } }));
+  const failure = { taskId: 10, inputs: [5], reason: "model_error", detail: "boom", first: 1 };
+  // afterFailedRun: "continue" — the same commit ends the run and starts its continuation (same first)
+  tr.apply(view([u1], { run: { taskId: 11, inputs: [], turns: 0, first: 1 }, runFailure: failure }));
+  tr.apply(view([u1], { run: { taskId: 11, inputs: [], turns: 0, first: 1 }, runFailure: failure }));
+  const a = assistant(2, [{ type: "text", text: "Recovered." }]);
+  tr.apply(view([u1, a], { runFailure: failure })); // the failure doc is kept by the continuation
+  const u2 = user(3, "next");
+  tr.apply(view([u1, a, u2], { run: { taskId: 12, inputs: [7], turns: 0, first: 3 } }));
+  assert.deepEqual(frames.map(shape), [
+    "user_prompt", "status busy", "running_stats", "error", "result", "status idle",
+    "status busy", "status text_start", "text_delta", "status text_end", "running_stats", "result", "status idle",
+    "user_prompt", "status busy",
+  ]);
+  const results = frames.filter((f) => f.type === "result");
+  assert.deepEqual(results.map((r) => r.success), [false, true]);
+  assert.equal(frames.filter((f) => f.type === "error").length, 1);
+  const [p1, p2] = promptIdx(frames);
+  assert.equal(between(frames, p1, p2).at(-1).state, "idle");
+});
+
+test("steer mid-run does not end the run", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([]));
+  const u1 = user(1, "first"), u2 = user(3, "steer");
+  const a1 = assistant(2, [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } }], "toolUse");
+  tr.apply(view([u1], { run: { taskId: 10, inputs: [5], turns: 0, first: 1 } }));
+  tr.apply(view([u1, a1, u2], { run: { taskId: 11, inputs: [5, 6], turns: 1, first: 1 } }));
+  assert.ok(!frames.some((f) => f.type === "result"));
+  assert.deepEqual(frames.map(shape), ["user_prompt", "status busy", "user_prompt"]);
+  tr.apply(view([u1, a1, u2, assistant(4, [{ type: "text", text: "ok" }])], {}));
+  assert.equal(frames.filter((f) => f.type === "result").length, 1);
+});
+
+test("priming mid-run emits the run's prompt before busy", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([user(1, "old"), assistant(2, [{ type: "text", text: "x" }]), user(3, "current")], { run: { taskId: 10, inputs: [5], turns: 0, first: 3 } }));
+  assert.deepEqual(frames.map(shape), ["user_prompt", "status busy"]);
+  assert.equal(frames[0].text, "current");
+});
+
+test("committed text that rewrites the streamed text is resent in full", () => {
+  const warnings = [];
+  const { tr, frames } = translator({ log: { warn: (m) => warnings.push(m) } });
+  tr.apply(view([]));
+  const u = user(1, "x");
+  tr.apply(view([u], { run: RUN, generation: { attempt: 1, message: partial([{ type: "text", text: "Hello wrld" }]) } }));
+  tr.apply(view([u, assistant(2, [{ type: "text", text: "Hello world." }])], {}));
+  assert.deepEqual(frames.slice(2).map(shape), [
+    "status text_start", "text_delta", "status text_end", "status text_start", "text_delta", "status text_end",
+    "running_stats", "result", "status idle",
+  ]);
+  assert.equal(frames.filter((f) => f.type === "text_delta").at(-1).text, "Hello world.");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /\[durable:wire\]/);
+});
+
+test("a later text block starts on a new line", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([]));
+  const u = user(1, "x");
+  tr.apply(view([u], { run: RUN, generation: { attempt: 1, message: partial([{ type: "text", text: "A" }]) } }));
+  tr.apply(view([u, assistant(2, [{ type: "text", text: "A" }, { type: "thinking", thinking: "t" }, { type: "text", text: "B" }])], {}));
+  assert.deepEqual(frames.filter((f) => f.type === "text_delta").map((f) => f.text), ["A", "\nB"]);
+});
+
+test("stray assistant or tool-result entries outside a run emit nothing", () => {
+  const { tr, frames } = translator();
+  tr.apply(view([]));
+  tr.apply(view([assistant(2, [{ type: "text", text: "summary" }])], {}));
+  tr.apply(view([assistant(2, [{ type: "text", text: "summary" }]), toolResult(3, "c9", "bash", "out")], {}));
+  assert.deepEqual(frames, []);
+});
