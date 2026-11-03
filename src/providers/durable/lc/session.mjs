@@ -29,6 +29,7 @@ export const expertsQuestion = (title) => {
   const t = String(title ?? "").trim();
   return t === FACTORY_EXPERTS_TITLE || /^Enable the [\w.-]+ expert\?$/.test(t);
 };
+const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 const ACTIVITY_EVENTS = new Set(["agent_start", "turn_start", "message_start", "message_update", "tool_execution_start", "tool_execution_end", "agent_end"]);
 /** The prompt-response wait of a command that may run long (a factory run answers its prompt only when it ends). */
 export const LC_LONG_MS = 2 ** 31 - 1;
@@ -182,7 +183,9 @@ export class LcSession extends PiSession {
   }
 
   onUiRequest(req) {
-    if (!(req.method === "notify" && /^mode: /.test(String(req.message ?? "")))) this.activity();
+    // A dialog shows lets-code works on the prompt; a notify or a status/widget update may come from a
+    // timer (memory guard, footer) and proves nothing.
+    if (DIALOG_METHODS.has(req.method)) this.activity();
     if (req.method === "confirm" && expertsQuestion(req.title)) {
       // Experts are host-wide lets-code state: a glasses Yes must never enable them (R-C2).
       this.client?.respondUi({ type: "extension_ui_response", id: req.id, confirmed: false });

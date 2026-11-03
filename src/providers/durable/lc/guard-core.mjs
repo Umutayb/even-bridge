@@ -11,8 +11,12 @@
 //   mandate (mode `ask` asks before leaving the project), so a glasses user is
 //   asked instead of being refused.
 // The project's own `.pi/` dir holds the project-local copy of this guard
-// (launch.mjs installProjectGuard: lets-code's subagents load only that one), so
-// writes there and any bash mention of a `.pi` path are refused.
+// (launch.mjs installProjectGuard: lets-code's subagents load only that one), and
+// pi loads every extension of a trusted project's `.pi/`: so write/edit of ANY
+// path with a `.pi` segment (the project's, a nested `sub/.pi`, an own factory
+// worktree's) and any bash mention of a `.pi` path are refused. The bridge also
+// re-checks those dirs itself (launch.mjs sealProjectPi), for plants that do not
+// name `.pi` (tar, git checkout, cp -r).
 // One exception inside ~/.pi (plan ruling 19): the worktree of a factory run,
 // `<factoryRoot>/<id>/work`, counts as the project when that run's ledger repo
 // is the session cwd or below it.
@@ -60,15 +64,32 @@ function realish(abs) {
   }
 }
 
-/** Is `abs` inside the worktree of a factory run of `cwd` (also after resolving symlinks)? */
-function inOwnWorktree(abs, { cwd, factoryRoot, readLedger }) {
-  if (!within(abs, factoryRoot)) return false;
+/** The own factory worktree `abs` is inside (also after resolving symlinks), else null. */
+function ownWorktree(abs, { cwd, factoryRoot, readLedger }) {
+  if (!within(abs, factoryRoot)) return null;
   const [id, work] = relative(factoryRoot, abs).split(sep);
-  if (!id || work !== "work") return false;
+  if (!id || work !== "work") return null;
   const L = readLedger(factoryRoot, id);
-  if (!(L && typeof L.repo === "string" && cwd && within(resolve(L.repo), resolve(cwd)))) return false;
+  if (!(L && typeof L.repo === "string" && cwd && within(resolve(L.repo), resolve(cwd)))) return null;
   const worktree = join(factoryRoot, id, "work");
-  return within(realish(abs), realish(worktree)); // a symlink out of the worktree is judged normally
+  return within(realish(abs), realish(worktree)) ? worktree : null; // a symlink out of the worktree is judged normally
+}
+const inOwnWorktree = (abs, ctx) => ownWorktree(abs, ctx) !== null;
+
+/**
+ * Does a write to `abs` touch a `.pi` dir inside the project or an own worktree? Segments are counted below
+ * that base (the factory root itself lives under ~/.pi).
+ * Both the path as given and its resolved form are checked (a symlink into a `.pi` dir counts).
+ */
+function writesDotPi(abs, ctx) {
+  const wt = ownWorktree(abs, ctx);
+  const bases = [wt, ctx.cwd ? resolve(ctx.cwd) : null].filter(Boolean);
+  // outside the project and its worktrees the usual rules apply (~/.pi is off limits anyway)
+  const segs = (p, real) => {
+    const base = bases.map((b) => (real ? realish(b) : b)).find((b) => within(p, b));
+    return base ? relative(base, p).split(sep) : [];
+  };
+  return segs(abs, false).includes(".pi") || segs(realish(abs), true).includes(".pi");
 }
 
 /**
@@ -95,7 +116,8 @@ export function guardDecision(toolName, input, { cwd = process.cwd(), home = hom
     const p = String(args.path);
     const abs = resolve(cwd, expand(p, home));
     const writes = toolName === "write" || toolName === "edit";
-    if (writes && cwd && within(realish(abs), realish(join(resolve(cwd), ".pi")))) return { block: true, reason: GUARD_PREFIX + PROJECT_PI_WHY };
+    // before the own-worktree allow: a worktree's .pi is as off limits as the project's (pi trusts both)
+    if (writes && writesDotPi(abs, ctx)) return { block: true, reason: GUARD_PREFIX + PROJECT_PI_WHY };
     if (inOwnWorktree(abs, ctx)) return undefined;
     const res = confinePath(p, cwd, home, { mode: toolName === "write" || toolName === "edit" ? "write" : "read" });
     if (!res.ok && HARD_WHY.test(res.why ?? "")) why = res.why;

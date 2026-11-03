@@ -191,8 +191,15 @@ OOM kill left failed never blocks the next spawn's unit name).
   Live probe 2026-11-03: before this a subagent's `wc -c ~/.ssh/id_ed25519.pub` ran;
   after it, the subagent got `even-guard: ~/.ssh is off limits`. The guard file is added
   to the repo's `.git/info/exclude` (`/.pi/extensions/even-guard.ts`), so `git add -A`
-  never commits it. **Known limit:** the `.pi` block is text-based for bash (a command that
-  builds the path some other way is not caught); write/edit to `.pi/` are refused.
+  never commits it. write/edit of any path with a `.pi` segment in the project or an own
+  factory worktree (nested `sub/.pi` included) are refused, and bash commands naming `.pi`.
+  **Known limit:** the bash block is text-based. So the bridge also seals `<cwd>/.pi` and each
+  guarded worktree's `.pi` itself (at every spawn, after every tool call, on every factory
+  watch tick): the guard file is rewritten when changed, and every other entry of `.pi` or
+  `.pi/extensions` is moved to `<store dir>/lc-quarantine/<sid>/` with an error frame
+  `even-guard: removed …`. Nested `sub/.pi` dirs planted without naming `.pi` are not
+  scanned (pi loads them only for a pi started in that subdir). A repo whose own `.pi/` is
+  tracked loses it in a factory worktree (the quarantine shows as a deletion in the diff).
 - **Forget.** `forgetSession` removes the session cwd's entry from `~/.pi/agent/trust.json`
   (unless another live lets-code session has the same cwd) and the entries of the factory
   worktrees it trusted (`record.trusted`).
@@ -203,7 +210,9 @@ OOM kill left failed never blocks the next spawn's unit name).
   The run's stage subagents are plain pi processes in that worktree: while a factory run
   may create one (after `/factory start`, at a checkpoint, on `/factory resume`), the
   engine gives each new worktree of this session's running/waiting runs the project guard,
-  the git exclude and a pi trust entry (written under pi's own lock `trust.json.lock`).
+  the git exclude and a pi trust entry (written under pi's own lock `trust.json.lock`, waited
+  for asynchronously). A ledger whose `work` is not its own `<root>/<id>/work` is ignored.
+  When the run leaves running/waiting (or its worktree is gone) the trust entry is dropped.
 - **Experts are the operator's.** lets-code's "Enable the factory's experts?" confirm is
   answered No by the bridge with the error frame `factory experts must be enabled by the
   operator` (a glasses Yes must never change host-wide lets-code state), and
@@ -220,8 +229,9 @@ OOM kill left failed never blocks the next spawn's unit name).
   acknowledged in this call (`null`: no live child, applied at the next spawn). Without the
   ack: 504 and the flag stays as it was. A ticket goes to `<cwd>/.factory/ticket-<ms>.md`
   and starts `/factory start <file>[ <howToRun>]` (how-to-run unquoted: one line, no
-  quotes). The 200 comes before lets-code accepts the run: a refusal (a warning/error
-  notify, or "The factory needs these experts enabled…") becomes an error frame
+  quotes). The 200 comes before lets-code accepts the run: a refusal (only lets-code's own
+  replies: "No ticket file …", "factory: …", the experts messages; other warnings such as
+  the memory guard's are not) becomes an error frame
   `lets-code refused the factory start: …` and `lastError {text, at}` on the agent's
   `GET /api/agents` row (cleared by the next toggle). `factory` on a prompt to an existing
   agent is a 400 (use the toggle). The factory smoke (`scripts/durable-smoke.mjs --engine

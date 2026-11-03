@@ -27,6 +27,7 @@
 //   with the warning "The user did not enable the factory's experts.".
 // FAKE_PI_FACTORY_WORK=<factory root>: `/factory start` creates the run's ledger and worktree
 //   (`<root>/20261103-093221-c129/{ledger.json,work}`, repo = cwd, status waiting) before its checkpoint.
+// FAKE_PI_FACTORY_WARN=1: `/factory start` first sends an unrelated warning notify (memory guard).
 // FAKE_PI_START_DELAY_MS=<ms>: the first get_state is answered that late (a slow start).
 // EXPERT1 (prompt): lets-code's single-expert confirm "Enable the developer expert?".
 // FAKE_PI_CRASH=1: exit 137 on every prompt (a crash mid-turn).
@@ -149,6 +150,7 @@ function onPrompt(cmd) {
         notify("The factory needs these experts enabled: developer, tester (/experts enable <name>).", "warning");
         return handled();
       }
+      if (process.env.FAKE_PI_FACTORY_WARN === "1") notify("RAM 90% used; the memory guard is on.", "warning");
       const go = () => {
         const root = process.env.FAKE_PI_FACTORY_WORK;
         if (root) {

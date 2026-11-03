@@ -15,7 +15,7 @@
 // check of findExternalPi and the memory cap would all miss it.
 
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -194,8 +194,11 @@ const canonical = (p) => {
   }
 };
 
-/** pi's lock on the trust store: the directory `<file>.lock` (proper-lockfile; stale after 10 s). */
-function withTrustLock(file, fn, { tries = 100, staleMs = 10_000 } = {}) {
+/**
+ * pi's lock on the trust store: the directory `<file>.lock` (proper-lockfile; stale after 10 s). Waits
+ * asynchronously (never blocks the bridge's event loop), `tries` x `delayMs`.
+ */
+async function withTrustLock(file, fn, { tries = 100, delayMs = 20, staleMs = 10_000 } = {}) {
   const lock = `${file}.lock`;
   mkdirSync(dirname(file), { recursive: true });
   for (let i = 0; ; i++) {
@@ -213,7 +216,7 @@ function withTrustLock(file, fn, { tries = 100, staleMs = 10_000 } = {}) {
         /* gone meanwhile */
       }
       if (i >= tries) throw new Error(`trust store ${file} is locked`);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
   try {
@@ -230,9 +233,9 @@ function withTrustLock(file, fn, { tries = 100, staleMs = 10_000 } = {}) {
 /**
  * Set (`trusted: true`) or remove (`trusted: null`) pi project-trust entries for `paths`
  * (canonical paths, as pi stores them). The file keeps pi's format (sorted keys, 2-space JSON).
- * @returns {string[]} the keys changed
+ * @returns {Promise<string[]>} the keys changed
  */
-export function updateTrust(paths, trusted, { file = LC_TRUST_FILE } = {}) {
+export async function updateTrust(paths, trusted, { file = LC_TRUST_FILE, tries, delayMs } = {}) {
   const f = expandHome(file);
   const keys = [...new Set(paths.filter(Boolean).map(canonical))];
   if (!keys.length) return [];
@@ -255,7 +258,61 @@ export function updateTrust(paths, trusted, { file = LC_TRUST_FILE } = {}) {
       renameSync(tmp, f);
     }
     return changed;
-  });
+  }, { ...(tries != null ? { tries } : {}), ...(delayMs != null ? { delayMs } : {}) });
+}
+
+const lstatOrNull = (p) => {
+  try {
+    return lstatSync(p);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Keep `<dir>/.pi` to exactly the bridge's guard: `extensions/even-guard.ts` (a regular file with the
+ * current source, rewritten when missing or changed) and nothing else. Every other entry of `.pi` and of
+ * `.pi/extensions` (pi loads all of them in a trusted project), and a `.pi` or `extensions` that is not a
+ * plain dir, is moved to `quarantine` (removed when that fails). Never follows symlinks.
+ * @returns {{ restored: boolean, removed: string[] }} restored: an existing guard file was replaced
+ */
+export function sealProjectPi(dir, { quarantine, source = projectGuardSource(), now = Date.now } = {}) {
+  const removed = [];
+  let n = 0;
+  const away = (p, name) => {
+    try {
+      if (!quarantine) throw new Error("no quarantine dir");
+      mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+      renameSync(p, join(quarantine, `${now()}-${++n}-${name.replace(/[/\\]/g, "_")}`));
+    } catch {
+      rmSync(p, { recursive: true, force: true });
+    }
+    removed.push(name);
+  };
+  const pi = join(dir, ".pi");
+  let st = lstatOrNull(pi);
+  if (st && !st.isDirectory()) away(pi, ".pi");
+  if (lstatOrNull(pi)?.isDirectory()) for (const e of readdirSync(pi)) if (e !== "extensions") away(join(pi, e), `.pi/${e}`);
+  const ext = join(pi, "extensions");
+  st = lstatOrNull(ext);
+  if (st && !st.isDirectory()) away(ext, ".pi/extensions");
+  if (lstatOrNull(ext)?.isDirectory()) for (const e of readdirSync(ext)) if (e !== "even-guard.ts") away(join(ext, e), `.pi/extensions/${e}`);
+  const g = join(ext, "even-guard.ts");
+  st = lstatOrNull(g);
+  let restored = false;
+  if (st && !st.isFile()) away(g, ".pi/extensions/even-guard.ts");
+  else if (st) {
+    let cur = null;
+    try {
+      cur = readFileSync(g, "utf8");
+    } catch {
+      /* unreadable: rewrite */
+    }
+    if (cur === source) return { restored, removed };
+    restored = true;
+  }
+  installProjectGuard(dir, { source });
+  return { restored, removed };
 }
 
 /** Worktrees of this cwd's running/waiting factory runs (ledger `work`, existing): `[{ id, work }]`. */
@@ -274,7 +331,9 @@ export function factoryWorktrees(cwd, root = FACTORY_ROOT) {
     const L = readLedger(id, dir);
     if (!L || typeof L.repo !== "string" || (L.status !== "running" && L.status !== "waiting")) continue;
     if (!within(resolve(L.repo), want)) continue;
-    const work = typeof L.work === "string" && L.work ? L.work : join(dir, id, "work");
+    // only the run's own `<root>/<id>/work` (the bridge writes a guard there and trusts it)
+    const work = join(dir, id, "work");
+    if (typeof L.work === "string" && L.work && resolve(L.work) !== work) continue;
     if (existsSync(work)) out.push({ id: L.id ?? id, work });
   }
   return out;

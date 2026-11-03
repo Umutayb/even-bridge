@@ -165,23 +165,28 @@ import { excludeProjectGuard, factoryWorktrees, updateTrust } from "../src/provi
 import { execFileSync } from "node:child_process";
 import { realpathSync as realpath3 } from "node:fs";
 
-test("updateTrust sets and removes entries in pi's format and releases its lock", () => {
+test("updateTrust sets and removes entries in pi's format and releases its lock", async () => {
   const dir = mkdtempSync(join(tmpdir(), "lc-trust-"));
   try {
     const file = join(dir, "trust.json");
     writeFileSync(file, JSON.stringify({ "/z": true, "/a": false }));
     const w = join(dir, "work");
     mkdirSync(w);
-    assert.deepEqual(updateTrust([w], true, { file }), [realpath3(w)]);
-    assert.deepEqual(updateTrust([w], true, { file }), [], "idempotent");
+    assert.deepEqual(await updateTrust([w], true, { file }), [realpath3(w)]);
+    assert.deepEqual(await updateTrust([w], true, { file }), [], "idempotent");
     const text = readFileSync(file, "utf8");
     assert.equal(text, JSON.stringify({ "/a": false, [realpath3(w)]: true, "/z": true }, null, 2) + "\n");
     assert.ok(!existsSync(`${file}.lock`));
-    assert.deepEqual(updateTrust([w, "/nope"], null, { file }), [realpath3(w)]);
+    assert.deepEqual(await updateTrust([w, "/nope"], null, { file }), [realpath3(w)]);
     assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { "/a": false, "/z": true });
     // a lock held by pi (fresh) makes it wait and give up; a stale one is taken over
     mkdirSync(`${file}.lock`);
-    assert.throws(() => updateTrust([w], true, { file }), /locked/);
+    // the wait is asynchronous: a timer keeps firing meanwhile (the event loop is not blocked)
+    let ticks = 0;
+    const iv = setInterval(() => ticks++, 5);
+    await assert.rejects(updateTrust([w], true, { file, tries: 10, delayMs: 20 }), /locked/);
+    clearInterval(iv);
+    assert.ok(ticks >= 5, `timers ran during the wait (${ticks})`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -228,6 +233,60 @@ test("factoryWorktrees lists running/waiting runs of this cwd with an existing w
     mk("e", "/w/proj", "running", false);
     assert.deepEqual(factoryWorktrees("/w/proj", root).map((x) => x.id).sort(), ["a", "d"]);
     assert.deepEqual(factoryWorktrees("", root), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+import { sealProjectPi } from "../src/providers/durable/lc/launch.mjs";
+import { lstatSync as lstat3, readdirSync as readdir3, symlinkSync as symlink3 } from "node:fs";
+
+test("sealProjectPi keeps .pi to the bridge's guard: restores it, quarantines everything else", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lc-seal-"));
+  try {
+    const proj = join(dir, "proj");
+    const q = join(dir, "quarantine");
+    mkdirSync(join(proj, ".pi", "extensions"), { recursive: true });
+    // first seal: installs the guard
+    assert.deepEqual(sealProjectPi(proj, { quarantine: q }), { restored: false, removed: [] });
+    const g = join(proj, ".pi", "extensions", "even-guard.ts");
+    assert.equal(readFileSync(g, "utf8"), projectGuardSource());
+    assert.deepEqual(sealProjectPi(proj, { quarantine: q }), { restored: false, removed: [] }, "unchanged: nothing to do");
+    // plants and a tampered guard
+    writeFileSync(join(proj, ".pi", "extensions", "evil.ts"), "export default () => {}");
+    writeFileSync(join(proj, ".pi", "settings.json"), "{}");
+    mkdirSync(join(proj, ".pi", "skills"));
+    writeFileSync(g, "// nothing");
+    const r = sealProjectPi(proj, { quarantine: q });
+    assert.equal(r.restored, true);
+    assert.deepEqual(r.removed.sort(), [".pi/extensions/evil.ts", ".pi/settings.json", ".pi/skills"]);
+    assert.equal(readFileSync(g, "utf8"), projectGuardSource());
+    assert.deepEqual(readdir3(join(proj, ".pi")), ["extensions"]);
+    assert.deepEqual(readdir3(join(proj, ".pi", "extensions")), ["even-guard.ts"]);
+    assert.equal(readdir3(q).length, 3, "moved to the quarantine, not deleted");
+    // a symlinked guard and a symlinked extensions dir are replaced, never followed
+    const outside = join(dir, "outside.ts");
+    writeFileSync(outside, "keep me");
+    rmSync(g);
+    symlink3(outside, g);
+    const r2 = sealProjectPi(proj, { quarantine: q });
+    assert.deepEqual(r2.removed, [".pi/extensions/even-guard.ts"]);
+    assert.ok(lstat3(g).isFile() && !lstat3(g).isSymbolicLink());
+    assert.equal(readFileSync(outside, "utf8"), "keep me");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("factoryWorktrees ignores a ledger whose work is not its own <root>/<id>/work", () => {
+  const root = mkdtempSync(join(tmpdir(), "lc-fwt2-"));
+  try {
+    mkdirSync(join(root, "x", "work"), { recursive: true });
+    writeFileSync(join(root, "x", "ledger.json"), JSON.stringify({ v: 1, id: "x", repo: "/w/p", status: "running", work: "/home/ay/elsewhere" }));
+    mkdirSync(join(root, "y", "work"), { recursive: true });
+    writeFileSync(join(root, "y", "ledger.json"), JSON.stringify({ v: 1, id: "y", repo: "/w/p", status: "running" }));
+    assert.deepEqual(factoryWorktrees("/w/p", root).map((x) => x.id), ["y"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

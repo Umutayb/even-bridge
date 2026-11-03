@@ -46,6 +46,7 @@ import {
   lcSandboxAvailable,
   removeStaleRegistry,
   resetFailedScope,
+  sealProjectPi,
   stopLcScopes,
   updateTrust,
 } from "./launch.mjs";
@@ -292,6 +293,7 @@ export function createLcEngine({
     if (s.session !== session) return; // an older child (stopped while idle) exiting late
     s.session = null;
     s.factoryStart = null;
+    if (s.factoryWatch) guardFactory(sid).catch(() => {}); // a last pass: drops the trust of ended runs
     stopFactoryWatch(sid);
     clearTimeout(s.idleTimer);
     s.idleTimer = null;
@@ -311,21 +313,27 @@ export function createLcEngine({
   function factoryRefused(sid, text) {
     const s = S(sid);
     s.factoryStart = null;
-    emitTo(sid, { type: "error", message: `lets-code refused the factory start: ${text}` });
+    // The session already sent its own error frame when it answered the experts question No: one frame,
+    // and the record says why in the bridge's words (lets-code says "the user" did not enable them).
+    const expertsNo = /^The user did not enable the factory's experts/.test(text);
+    const why = expertsNo ? LC_EXPERTS_DISABLED : text;
+    if (!expertsNo) emitTo(sid, { type: "error", message: `lets-code refused the factory start: ${text}` });
     writeEntry(sid, LC_ANSWER, text);
     return updateRecord(sid, (d) => {
-      d.lastError = { text, at: now() };
+      d.lastError = { text: why, at: now() };
     });
   }
 
   function onNotify(sid, text, type = "info") {
     const t = String(text).trim();
     const s = S(sid);
-    if (s.factoryStart && (type === "error" || type === "warning" || LC_FACTORY_REFUSAL_RE.test(t))) {
+    // Only lets-code's own replies to /factory start: other warnings (memory guard, core memory, mandate,
+    // subagents) also come while a start is pending and are no refusal.
+    if (s.factoryStart && LC_FACTORY_REFUSAL_RE.test(t)) {
       factoryRefused(sid, t);
       return;
     }
-    if (s.factoryWatch) guardFactory(sid);
+    if (s.factoryWatch) guardFactory(sid).catch(() => {});
     // The record follows every mode notify, also lets-code's own switch ("mode: orchestration (<why>): …",
     // mandate.ts) — so record.mode may say orchestration while record.factory (the user's wish) is false.
     // Only the exact ack of our `/mode <m>` resolves a waiter.
@@ -348,36 +356,81 @@ export function createLcEngine({
    * session cwd: give each new worktree of this session's runs the project guard, keep it out of git,
    * and trust it in pi's store so pi loads the guard there (ruling (a) of the Task 2 round).
    */
-  function guardFactory(sid) {
+  /** Keep `<dir>/.pi` to the bridge's guard (C-new-1): restore it, quarantine anything else, say so. */
+  function seal(sid, dir) {
+    if (!dir) return;
+    try {
+      const r = sealProjectPi(dir, { quarantine: join(storeDir, "lc-quarantine", sid), now });
+      if (r.restored) emitTo(sid, { type: "error", message: `even-guard: the guard in ${dir}/.pi was changed; restored` });
+      for (const name of r.removed) emitTo(sid, { type: "error", message: `even-guard: removed ${name} from ${dir} (only the bridge's guard may be in .pi)` });
+      if (r.restored || r.removed.length) log.warn?.(`[durable:lc] ${sid}: ${dir}/.pi sealed (restored=${r.restored}, removed=${r.removed.join(", ") || "-"})`);
+    } catch (err) {
+      log.warn?.(`[durable:lc] ${sid}: ${dir}/.pi not sealed (${err.message})`);
+    }
+  }
+
+  /** The session cwd and every guarded worktree, sealed (cheap: two readdirs each). */
+  function sealAll(sid) {
+    const row = map.get(sid);
+    if (!row) return;
+    seal(sid, row.cwd);
+    for (const w of S(sid).guarded) seal(sid, w);
+  }
+
+  /**
+   * Factory stages run as plain pi processes in the run's worktree (`<factory>/<id>/work`), not in the
+   * session cwd: each worktree of this session's running/waiting runs is sealed (guard restored, plants
+   * quarantined) on every call, kept out of git and trusted in pi's store once; worktrees whose run ended
+   * (or that are gone) lose their trust entry. Never overlaps itself.
+   */
+  async function guardFactory(sid) {
     const row = map.get(sid);
     if (!row) return [];
     const s = S(sid);
+    if (s.guarding) return [];
+    s.guarding = true;
     const added = [];
-    for (const { work } of factoryWorktrees(row.cwd, factoryRoot)) {
-      if (s.guarded.has(work)) continue;
-      try {
-        installProjectGuard(work);
-        excludeProjectGuard(work);
-        updateTrust([work], true, { file: trustFile });
-        s.guarded.add(work);
-        added.push(work);
-      } catch (err) {
-        log.warn?.(`[durable:lc] ${sid}: factory worktree ${work} not guarded (${err.message})`);
+    try {
+      seal(sid, row.cwd);
+      const live = factoryWorktrees(row.cwd, factoryRoot).map((x) => x.work);
+      for (const work of live) {
+        seal(sid, work);
+        if (s.guarded.has(work)) continue;
+        try {
+          excludeProjectGuard(work);
+          await updateTrust([work], true, { file: trustFile });
+          s.guarded.add(work);
+          added.push(work);
+        } catch (err) {
+          log.warn?.(`[durable:lc] ${sid}: factory worktree ${work} not trusted (${err.message})`);
+        }
       }
-    }
-    if (added.length) {
-      updateRecord(sid, (d) => {
-        d.trusted = [...new Set([...(d.trusted ?? []), ...added])];
-      });
+      const rec = await readRecord(sid).catch(() => ({ trusted: [] }));
+      const gone = [...new Set([...(rec.trusted ?? []), ...s.guarded])].filter((w) => !live.includes(w));
+      if (gone.length) {
+        try {
+          await updateTrust(gone, null, { file: trustFile });
+          for (const w of gone) s.guarded.delete(w);
+        } catch (err) {
+          log.warn?.(`[durable:lc] ${sid}: trust of ended runs not removed (${err.message})`);
+        }
+      }
+      if (added.length || gone.length) {
+        await updateRecord(sid, (d) => {
+          d.trusted = [...new Set([...(d.trusted ?? []), ...added])].filter((w) => !gone.includes(w));
+        });
+      }
+    } finally {
+      s.guarding = false;
     }
     return added;
   }
 
   function startFactoryWatch(sid) {
     const s = S(sid);
-    guardFactory(sid);
+    guardFactory(sid).catch(() => {});
     if (s.factoryWatch) return;
-    s.factoryWatch = setInterval(() => guardFactory(sid), factoryWatchMs);
+    s.factoryWatch = setInterval(() => guardFactory(sid).catch(() => {}), factoryWatchMs);
     s.factoryWatch.unref?.();
   }
 
@@ -429,7 +482,8 @@ export function createLcEngine({
       // lets-code's subagents are plain pi processes in this cwd without our `-e`: they get the guard
       // from the project-local copy (trusted by the parent's even-guard.ts, see there).
       try {
-        installProjectGuard(row.cwd);
+        seal(sid, row.cwd); // the guard rewritten, anything else in .pi quarantined
+        for (const w of s.guarded) seal(sid, w);
         excludeProjectGuard(row.cwd);
       } catch (err) {
         log.warn?.(`[durable:lc] ${sid}: project guard not written (${err.message}); subagents run without the even guard`);
@@ -460,6 +514,7 @@ export function createLcEngine({
         onToolEnd: (name, args) => {
           if (++s.tools <= LC_TOOL_ENTRIES_MAX) writeEntry(sid, LC_TOOL, summarizePiToolCall(name, args));
           else s.toolsDropped += 1;
+          sealAll(sid); // a plant that does not name .pi (tar, git checkout) is caught before the next subagent
         },
         onActivity: () => markSent(sid),
         onExit: (sess, info) => onChildExit(sid, sess, info),
@@ -498,6 +553,7 @@ export function createLcEngine({
     const s = S(sid);
     if (session && s.session !== session) return;
     s.factoryStart = null; // the run ended: a refusal came before its end
+    if (s.factoryWatch || s.guarded.size) guardFactory(sid).catch(() => {}); // drop the trust of a run that ended
     const text = String(session?.answerText ?? "").trim().slice(0, LC_ANSWER_MAX);
     const lastLine = lastLineOf(text);
     if (s.toolsDropped) writeEntry(sid, LC_TOOL, `(+${s.toolsDropped} more tool calls)`);
@@ -739,7 +795,7 @@ export function createLcEngine({
       // worktrees the engine trusted; a cwd another live lets-code session still uses keeps its entry.
       const shared = cwd && [...map.rows({ seenSince: 0 })].some((r) => r.sid !== sid && !r.archived && r.engine === "lets-code" && r.cwd === cwd);
       try {
-        updateTrust([...(shared ? [] : [cwd]), ...(rec.trusted ?? [])], null, { file: trustFile });
+        await updateTrust([...(shared ? [] : [cwd]), ...(rec.trusted ?? [])], null, { file: trustFile });
       } catch (err) {
         log.warn?.(`[durable:lc] ${sid}: trust entries not removed (${err.message})`);
       }
@@ -845,7 +901,12 @@ export function createLcEngine({
         writeFileSync(file, String(ticket));
         const text = `/factory start ${name}${howToRun ? ` ${String(howToRun).trim()}` : ""}`;
         s.factoryStart = { at: now(), file: name };
-        await engine.prompt(sid, text);
+        try {
+          await engine.prompt(sid, text);
+        } catch (err) {
+          s.factoryStart = null; // not started (429, 503, gone): later notifies are no refusal
+          throw err;
+        }
         startFactoryWatch(sid);
       }
       return { factory: Boolean(on), mode };

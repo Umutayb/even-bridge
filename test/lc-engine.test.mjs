@@ -3,7 +3,7 @@
 // as the child, no scope wrapper, a recording fake for systemctl.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -682,14 +682,27 @@ test("the factory never enables experts: lets-code's experts question is answere
   const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
   await idleAfter(c, sid);
   await p.setFactory(sid, true, { ticket: "Fix the CI", howToRun: "npm test" });
-  await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && /^lets-code refused the factory start: /.test(f.message)), 5000, "refusal");
+  await until(async () => (await recordOf(p, sid)).lastError?.text === "factory experts must be enabled by the operator", 5000, "lastError");
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
   assert.ok(!c.frames.some((f) => f.sid === sid && f.type === "permission_request"), "the experts question never reaches the phone");
+  const errors = c.frames.filter((f) => f.sid === sid && f.type === "error");
+  assert.deepEqual(errors.map((f) => f.message), ["factory experts must be enabled by the operator"], "one error frame");
   const answers = c.log().filter((l) => l.type === "extension_ui_response");
   assert.equal(answers.length, 1);
   assert.equal(answers[0].confirmed, false);
   assert.ok(!c.prompts().some((x) => x.message.startsWith("/experts")));
-  await until(async () => (await recordOf(p, sid)).lastError?.text === "The user did not enable the factory's experts.", 5000, "lastError");
-  await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
+});
+
+test("an unrelated warning while a factory start is pending is no refusal", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_FACTORY_WARN: "1" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI" });
+  await confirmCheckpoint(c, p, sid); // the run reached its checkpoint
+  assert.ok(!c.frames.some((f) => f.sid === sid && f.type === "error"), "no error frame");
+  assert.equal((await recordOf(p, sid)).lastError, null);
 });
 
 test("a single-expert question is answered No too", async (t) => {
@@ -805,6 +818,14 @@ test("factory worktrees get the project guard, a git exclude and pi trust; forge
   await until(() => JSON.parse(readFileSync(trust, "utf8"))[realpathSync(work)] === true, 5000, "trust entry");
   assert.ok(!existsSync(`${trust}.lock`), "the trust lock is released");
   await until(async () => (await recordOf(p, sid)).trusted?.includes(work), 5000, "record.trusted");
+  // a plant in the worktree's .pi and a tampered guard are undone on the next watch tick
+  const ext = join(work, ".pi", "extensions");
+  writeFileSync(join(ext, "evil.ts"), "export default () => {}");
+  writeFileSync(join(ext, "even-guard.ts"), "// gone");
+  await until(() => !existsSync(join(ext, "evil.ts")) && /guardDecision/.test(readFileSync(join(ext, "even-guard.ts"), "utf8")), 5000, "sealed");
+  await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && /removed \.pi\/extensions\/evil\.ts/.test(f.message)), 5000, "removal frame");
+  assert.ok(c.frames.some((f) => f.sid === sid && f.type === "error" && /was changed; restored/.test(f.message)));
+  assert.ok(readdirSync(join(c.dir, "lc-quarantine", sid)).some((n) => n.endsWith("evil.ts")));
   await confirmCheckpoint(c, p, sid);
   await p.forgetSession(sid);
   await until(() => !(realpathSync(work) in JSON.parse(readFileSync(trust, "utf8"))), 5000, "trust removed");
@@ -964,4 +985,36 @@ test("setFactory with a ticket is refused 409 experts_disabled while the experts
   // Orchestration without the stage experts is refused too (Task 3 fix round); off always works.
   await assert.rejects(p.setFactory(sid, true), (e) => e.statusCode === 409 && e.reason === "experts_disabled");
   assert.deepEqual(await p.setFactory(sid, false), { factory: false, mode: "ask" });
+});
+
+
+test("a plant in the session cwd's .pi is quarantined after the next tool call", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  writeFileSync(join(c.work, ".pi", "settings.json"), "{}"); // e.g. unpacked by a bash command
+  await p.prompt(sid, "TOOL");
+  await idleAfter(c, sid, 2);
+  assert.ok(!existsSync(join(c.work, ".pi", "settings.json")));
+  assert.ok(c.frames.some((f) => f.sid === sid && f.type === "error" && /removed \.pi\/settings\.json/.test(f.message)));
+});
+
+test("the trust of a factory run that ended is dropped", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_FACTORY_WORK: c.factoryRoot } } });
+  t.after(c.closeAll);
+  const trust = join(c.dir, "trust.json");
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI" });
+  const id = "20261103-093221-c129";
+  const work = join(c.factoryRoot, id, "work");
+  await until(() => existsSync(trust) && JSON.parse(readFileSync(trust, "utf8"))[realpathSync(work)] === true, 5000, "trusted");
+  const L = JSON.parse(readFileSync(join(c.factoryRoot, id, "ledger.json"), "utf8"));
+  writeFileSync(join(c.factoryRoot, id, "ledger.json"), JSON.stringify({ ...L, status: "done" }));
+  await until(() => !(realpathSync(work) in JSON.parse(readFileSync(trust, "utf8"))), 5000, "trust dropped");
+  await until(async () => ((await recordOf(p, sid)).trusted ?? []).length === 0, 5000, "record.trusted empty");
+  await confirmCheckpoint(c, p, sid);
 });

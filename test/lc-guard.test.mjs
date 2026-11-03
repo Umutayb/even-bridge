@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { guardDecision, trustsProject } from "../src/providers/durable/lc/guard-core.mjs";
@@ -113,4 +113,33 @@ test("even-guard.ts answers project_trust through trustsProject", () => {
   assert.match(src, /trustsProject\(/);
   assert.match(src, /remember: true/);
   assert.match(src, /trusted: "undecided"/);
+});
+
+// -- Task 3 fix round 2: no .pi plant in an own worktree or a nested dir (C-new-1) --
+test("a factory worktree's .pi cannot be written: a planted extension or an edit of its guard", (t) => {
+  const s = sandbox(t);
+  for (const [tool, path] of [
+    ["write", join(s.work, ".pi", "extensions", "evil.ts")],
+    ["edit", join(s.work, ".pi", "extensions", "even-guard.ts")],
+    ["write", join(s.work, ".pi", "settings.json")],
+    ["write", join(s.work, "sub", ".pi", "extensions", "evil.ts")],
+  ]) {
+    const d = guardDecision(tool, { path, content: "x" }, s);
+    assert.equal(d?.block, true, path);
+    assert.match(d.reason, /the project's \.pi dir/);
+  }
+  // the rest of the worktree stays the project
+  assert.equal(guardDecision("write", { path: join(s.work, "src", "a.js"), content: "x" }, s), undefined);
+  assert.equal(guardDecision("write", { path: join(s.work, "pi", "a.js"), content: "x" }, s), undefined);
+});
+
+test("a nested .pi in the project (sub/.pi) cannot be written, also through a symlink", (t) => {
+  const s = sandbox(t);
+  assert.equal(guardDecision("write", { path: "sub/.pi/extensions/evil.ts", content: "x" }, s)?.block, true);
+  assert.equal(guardDecision("edit", { path: join(s.cwd, "a", "b", ".pi", "x.ts") }, s)?.block, true);
+  mkdirSync(join(s.cwd, ".pi", "extensions"), { recursive: true });
+  symlinkSync(join(s.cwd, ".pi", "extensions"), join(s.cwd, "ext"));
+  assert.equal(guardDecision("write", { path: join(s.cwd, "ext", "evil.ts"), content: "x" }, s)?.block, true);
+  assert.equal(guardDecision("write", { path: join(s.cwd, "src", "pi.ts"), content: "x" }, s), undefined);
+  assert.equal(guardDecision("read", { path: join(s.cwd, "sub", ".pi", "x") }, s), undefined, "reads are not the risk");
 });
