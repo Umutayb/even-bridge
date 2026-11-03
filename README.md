@@ -206,6 +206,7 @@ Operator deploy checklist: `docs/deploy-overseer.md`.
 | `EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE` | off | `1` adds the lets-code engine: `engine: "lets-code"` on `POST /api/prompt` runs the agent in an owned `lets-code --mode rpc` child (`--mandate ask --subagents --sandbox`, even-guard) inside the scope `even-lc-<sid>`; `GET /api/agents` then advertises `engines` |
 | `EVEN_BRIDGE_LC_BIN` | `EVEN_BRIDGE_PI_BIN`, else `lets-code` | the lets-code launcher |
 | `EVEN_BRIDGE_LC_MAX_LIVE` | `1` | live lets-code children at once (else 429) |
+| `EVEN_BRIDGE_LC_MAX_TURNS` | `40` | turns per lets-code run, at most `200` (larger is clamped, an invalid value keeps 40); an agent's own lower `maxTurns` wins. A run also stops at 8 identical tool calls in a row. At either cap the turn is aborted (a child that does not end it within 10 s is stopped) |
 | `EVEN_BRIDGE_LC_MEMORY_MAX` | `500M` | `MemoryMax` (with `MemorySwapMax=0`) of each child's scope, when the kernel has a memory controller |
 | `EVEN_BRIDGE_LC_SANDBOX` | on | `0` drops lets-code's `--sandbox` (tests only); without `bwrap` and `socat` every lets-code start is a 503 |
 | `EVEN_BRIDGE_OVERSEER_ENABLE` | off | `1` adds the overseer: the root conversation `dur-overseer` (qwen, no coding tools), `/api/overseer/*` (ask, outbox, sessions, gated actions with confirm/deny), `overseer: true` on `GET /api/agents` |

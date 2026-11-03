@@ -21,6 +21,7 @@ import {
   LC_MAX_TURNS_DEFAULT,
   LC_MODE_ACK_MS,
   LC_REPEAT_MAX,
+  lcCapDroppedMessage,
   lcRepeatCapMessage,
   lcTurnCap,
   lcTurnCapMessage,
@@ -1277,4 +1278,39 @@ test("session_read of an agent without a last error is unchanged; native rows ha
   const read = await host.sessionRead(sid, 5);
   assert.doesNotMatch(read, /last error/);
   assert.match(read, /\nstatus: idle\n/);
+});
+
+test("a child that ignores the cap's abort is stopped after capAbortMs; the queued inputs it drops are reported in one error frame", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { maxTurns: "30", capAbortMs: 300, childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_IGNORE_ABORT: "1" } } });
+  const caps = [];
+  p.onLcCap = (ev) => caps.push(ev);
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "LOOPVARY", c.work, { engine: "lets-code", name: "stubborn" });
+  // Two inputs waiting for this run (as queued while its child (re)started), before the cap fires.
+  await until(() => c.log().some((l) => l.loopTurn === 1), 5000, "loop running");
+  const s = p._lc._states.get(sid);
+  assert.equal(s.capped, null, "not capped yet");
+  s.queued.push("and add tests", "then commit");
+  const capMsg = lcTurnCapMessage(30);
+  await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && f.message === capMsg), 8000, "cap frame");
+  await until(() => c.log().some((l) => l.abortIgnored), 5000, "abort ignored");
+  assert.equal(p.getStatus(sid).state, "busy", "the child did not end the turn");
+  // The fallback: the run ends, the child is stopped, one frame says what was dropped.
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle after the fallback");
+  await until(() => !p._lc._states.get(sid).session?.running, 5000, "child stopped");
+  const errors = c.frames.filter((f) => f.sid === sid && f.type === "error").map((f) => f.message);
+  assert.deepEqual(errors, [capMsg, lcCapDroppedMessage(2)]);
+  assert.equal(lcCapDroppedMessage(2), "2 queued inputs were dropped when the capped run was stopped; send them again");
+  assert.equal(lcCapDroppedMessage(1), "1 queued input was dropped when the capped run was stopped; send it again");
+  assert.deepEqual(p._lc._states.get(sid).queued, []);
+  assert.equal(c.log().filter((l) => l.type === "abort").length, 1, "one abort, then the stop");
+  assert.equal(caps.length, 1);
+  await until(async () => (await lcTasks(p)).length === 0, 5000, "task terminal");
+  assert.equal((await recordOf(p, sid)).lastError?.text, capMsg);
+  // The agent takes the next prompt on a fresh child.
+  const results = c.frames.filter((f) => f.sid === sid && f.type === "result").length;
+  await p.prompt(sid, "hello again");
+  await idleAfter(c, sid, results + 1);
+  assert.equal(c.spawns().length, 2);
 });

@@ -19,7 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { defineDoc } from "@earendil-works/pi-durable";
 import { HANDOFF_MODEL, OVERSEER_SID, OverseerHandoffs, OverseerOutbox, pushOutbox, ROOT_CONVERSATION_ID } from "./docs.mjs";
 import { hhmm } from "./checkins.mjs";
-import { cannotMessage, defuse, draftText, KIND_WORD, SESSION_TEXT_MAX, startsWithCommand, textProblem, waitingText } from "./host.mjs";
+import { cannotMessage, defuse, draftText, KIND_WORD, SESSION_TEXT_MAX, taskProblem, textProblem, waitingText } from "./host.mjs";
 
 export const ACTION_TTL_MS = 90000;
 export const ACTION_KINDS = Object.freeze(["session_start", "session_message", "session_interrupt", "session_stop", "model_switch", "standing_order"]);
@@ -48,10 +48,16 @@ export const TASK_MAX = 400;
 /** What the summary shows of a task (Even AI's one gate may send up to TASK_MAX). */
 export const SUMMARY_TASK_MAX = 140;
 /** Proposal text never starts a command (lets-code reads "/mode", "/factory", "!cmd" from the prompt RPC). */
-/** A leading "/" or "!" (after whitespace): kept for callers; the gate uses host.mjs textProblem / startsWithCommand. */
+/** A leading "/" or "!" (after whitespace): kept for callers; the gate uses host.mjs textProblem / taskProblem. */
 export const COMMAND_RE = /^\s*[\/!]/;
 export const NO_COMMANDS = "the overseer cannot send commands";
 export const ONE_PENDING = "another action is waiting for your answer";
+/**
+ * The phone's permission answer carries no action id. It is taken for the pending proposal only when that
+ * proposal's own prompt was the last one sent to the phone, at least this long before the answer: a Yes left on
+ * the screen from an expired proposal, arriving right as a newer one is proposed, is ignored (audited).
+ */
+export const PHONE_ANSWER_MIN_MS = 500;
 export const QUESTION_MAX = 2000;
 export const LABEL_MAX = 24;
 const LABEL_RE = /^[\w .-]+$/;
@@ -211,6 +217,7 @@ export function createOverseerActions({
   replyPollMs = REPLY_POLL_MS,
   replyMaxMs = REPLY_MAX_MS,
   replyQuietMs = REPLY_QUIET_MS,
+  phoneAnswerMinMs = PHONE_ANSWER_MIN_MS,
 } = {}) {
   let harness;
   let ctx;
@@ -222,6 +229,8 @@ export function createOverseerActions({
   const refusals = new Map();
   /** id → in-flight confirm (concurrent confirms share it). */
   const inflight = new Map();
+  /** The last permission_request sent to the phone: `{ id, summary, at }` (a restart expires every pending one). */
+  let phonePrompt = null;
 
   const note = (event, item, by) =>
     audit.write({ event, id: item.id, kind: item.kind, origin: item.origin, summary: item.summary, by: by ?? item.origin });
@@ -272,7 +281,9 @@ export function createOverseerActions({
       const label = strArg(args.label, "label", { max: LABEL_MAX });
       if (!LABEL_RE.test(label)) throw httpError(400, "'label' may hold letters, digits, space, '_', '.' or '-'");
       const task = strArg(args.task, "task", { max: origin === "overseer" ? OVERSEER_TASK_MAX : TASK_MAX });
-      if (startsWithCommand(task)) throw httpError(400, NO_COMMANDS);
+      // A leading command, or an invisible character anywhere: the summary on the phone must read as the agent gets it.
+      const badTask = taskProblem(task);
+      if (badTask) throw httpError(400, badTask);
       const engines = Array.isArray(durable.engines) ? durable.engines : ["native"];
       const engine = args.engine ?? (engines.includes("lets-code") ? "lets-code" : "native");
       if (!engines.includes(engine)) throw httpError(400, `the ${oneLine(engine, 20)} engine is not available`);
@@ -461,6 +472,7 @@ export function createOverseerActions({
     // The phone's prompt is for the overseer's proposals; Even AI's own one-gate actions were already
     // confirmed by the user's spoken yes, and the phone never answers them.
     if (origin === "overseer") {
+      phonePrompt = { id: item.id, summary: item.summary, at: now() };
       frame({
         type: "permission_request",
         toolName: "overseer",
@@ -792,14 +804,30 @@ export function createOverseerActions({
 
   /**
    * The phone's answer to the permission_request on dur-overseer: the overseer's oldest pending action
-   * (Even AI's own one-gate actions never reach the phone, so the phone never answers them).
+   * (Even AI's own one-gate actions never reach the phone, so the phone never answers them). The answer
+   * carries no action id, so it counts only when that action's prompt is the last one the phone was sent
+   * (same id and summary) and arrived at least `phoneAnswerMinMs` before it; otherwise it is ignored, with an
+   * audit line, and false is returned (the phone gets "no permission request is pending").
    */
   async function respond(decision) {
     await ready;
     const t = now();
     const oldest = (await snapshot()).items.find((i) => waitsForUser(i, t));
     if (!oldest) return false;
-    if (String(decision ?? "").startsWith("allow")) {
+    const allow = String(decision ?? "").startsWith("allow");
+    const shown = phonePrompt;
+    const stale =
+      !shown || shown.id !== oldest.id || shown.summary !== oldest.summary
+        ? "not the proposal the phone was last shown"
+        : t - shown.at < phoneAnswerMinMs
+          ? `${t - shown.at} ms after its prompt (under ${phoneAnswerMinMs} ms)`
+          : null;
+    if (stale) {
+      audit.write({ event: "ignore", id: oldest.id, kind: oldest.kind, origin: oldest.origin, summary: oldest.summary, by: "phone", decision: allow ? "allow" : "deny", reason: stale });
+      log.warn?.(`[overseer] phone answer ignored for ${oldest.id}: ${stale}`);
+      return false;
+    }
+    if (allow) {
       try {
         await confirm(oldest.id, { confirmFrameId: "phone", by: "phone" });
       } catch (err) {

@@ -92,6 +92,9 @@ export const LC_CAP_ABORT_MS = 10_000;
 export const LC_CAP_REASON = "cap";
 export const lcTurnCapMessage = (n) => `lets-code run stopped after ${n} turns (cap)`;
 export const lcRepeatCapMessage = (tool, n) => `lets-code run stopped: repeated tool call (${tool}, ${n} times in a row)`;
+/** The error frame of the cap's abort fallback when it dropped inputs queued for the stopped run. */
+export const lcCapDroppedMessage = (n) =>
+  `${n} queued input${n === 1 ? " was" : "s were"} dropped when the capped run was stopped; send ${n === 1 ? "it" : "them"} again`;
 
 /**
  * EVEN_BRIDGE_LC_MAX_TURNS as the engine's turn cap: unset → the default; not a positive integer → the
@@ -713,8 +716,11 @@ export function createLcEngine({
       const w = s.waiter;
       s.waiter = null;
       s.busy = false;
+      // Inputs queued for this run are not carried into a later one; the user is told how many were dropped.
+      const dropped = s.queued.length;
       s.queued = [];
       w?.reject(capError(info.message));
+      if (dropped) emitTo(sid, { type: "error", message: lcCapDroppedMessage(dropped) });
       emitTo(sid, { type: "status", state: "idle", sessionId: sid });
       log.warn?.(`[durable:lc] ${sid}: no turn end ${capAbortMs} ms after the cap abort; stopping the child`);
       stopChild(sid).catch(() => {});

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIVE_WINDOW_MS, createOverseerHost, messageRoute, normalizeState, publicRow, rowLine, safeLabel, textProblem, uniqueLabels } from "../src/overseer/host.mjs";
+import { ACTIVE_WINDOW_MS, createOverseerHost, hasInvisible, messageRoute, normalizeState, publicRow, rowLine, safeLabel, taskProblem, textProblem, uniqueLabels } from "../src/overseer/host.mjs";
 import { createPiProvider } from "../src/providers/pi/provider.mjs";
 import { findExternalPi } from "../src/providers/pi/detect.mjs";
 import { encodeCwdDir } from "../src/providers/pi/session-files.mjs";
@@ -336,6 +336,21 @@ test("state words, labels, routes and the text gate", () => {
   for (const t of ["run \u202etests", "a\u200bb", "ok\ufeff", "x\u180ey", "\u3164!id", "\u2800/exit", "go\u2066x\u2069"]) assert.equal(textProblem(t), "a message can't hold invisible characters", JSON.stringify(t));
   // n1: only punctuation or spaces
   for (const t of [";", " ;; ", "...", "!?", "-"]) assert.ok(["a message needs words", "the overseer cannot send commands"].includes(textProblem(t)), JSON.stringify(t));
+});
+
+test("taskProblem: a task is refused for a leading command or an invisible character anywhere (the 6b text rule)", () => {
+  const INVISIBLE = ["run \u202etests", "a\u200bb", "ok\ufeff", "x\u180ey", "write \u3164hi", "go\u2066x\u2069", "hi\u2800", "x\uffa0y", "\u115f\u1160"];
+  for (const t of INVISIBLE) {
+    assert.equal(hasInvisible(t), true, JSON.stringify(t));
+    assert.equal(taskProblem(t), "a task can't hold invisible characters", JSON.stringify(t));
+    assert.equal(textProblem(t), "a message can't hold invisible characters", `the same rule for messages: ${JSON.stringify(t)}`);
+  }
+  for (const t of ["/factory start t.md", "  !id", "\u200b/compact", "\ufeff!ls"]) assert.equal(taskProblem(t), "the overseer cannot send commands", JSON.stringify(t));
+  // Plain tasks, a task over lines, and the emoji zero-width joiner pass.
+  for (const t of ["write hi to hi.txt", "fix the tests\nthen run them", "a/b and !x later", "family 👨\u200d👩\u200d👧 ok"]) {
+    assert.equal(taskProblem(t), null, JSON.stringify(t));
+    assert.equal(hasInvisible(t), false, JSON.stringify(t));
+  }
 });
 
 test("a failed driver probe gives no route, and an old RC row is not active (m4, m10)", async () => {

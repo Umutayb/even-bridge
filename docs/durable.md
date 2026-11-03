@@ -207,7 +207,9 @@ five factory experts stay off in `~/.pi/agent/lets-code-state.json`, so every fa
   repeats, summary, by: "bridge"}`, no tool args; only with the overseer on, otherwise the bridge log
   has the warning), then the turn is aborted (open dialogs cancelled, RPC `abort`). The child stays
   (idle-kept); the task ends `failed`; a prompt while the turn is still ending gets a 409. A child
-  that does not end the turn within 10 s is stopped. The next prompt starts a new run with fresh
+  that does not end the turn within 10 s is stopped; inputs still queued for that run are dropped and
+  one error frame says how many (`N queued inputs were dropped when the capped run was stopped; send
+  them again`). The next prompt starts a new run with fresh
   counters and clears the cap's `lastError` (a refused factory start's `lastError` is left alone).
   The counters are in memory: a bridge restart mid-run starts them again.
 - **Dialog policy.** What lets-code asks reaches the phone and glasses as frames on the agent's
@@ -337,7 +339,11 @@ Smoke: `scripts/overseer-smoke.mjs [--actions]`.
     ~/sandbox/agents/fix-ci on qwen to: "<task ≤ 140>"?`, `Send pi session 'notes-0a1b2c': "…"?`,
     `Stop agent 'fix-ci'?`, `Let the overseer tell agent 'x' "…" up to 2 times until 18:30?`.
   - `POST /api/overseer/actions/:id/confirm {confirmFrameId, by?}` (the shim's spoken or HUD yes) or
-    the phone's permission answer on `dur-overseer` executes it. Confirm is idempotent by action id
+    the phone's permission answer on `dur-overseer` executes it. The phone's answer carries no action
+    id: it counts for the pending overseer proposal only when that proposal's prompt is the last one
+    sent to the phone and the answer arrives at least 500 ms after it; otherwise it is ignored (an
+    `ignore` audit line, and 400 to the phone), so a Yes left from an expired proposal that lands as a
+    newer one is proposed does not confirm the newer one. Confirm is idempotent by action id
     (both racers get the same result); expired → 410 `action expired`; denied → 409; the kill switch
     `~/.even-terminal/agents.disabled` → 423 `agents are switched off`. `…/deny` denies.
   - Pending actions expire after 90 s (sweep every 10 s) and at every restart (outbox `system` item
@@ -553,7 +559,9 @@ asks, and whether a `session_message` cut off mid-execute reached its target.
   guarded and sealed. Irrelevant while the factory stays disabled.
 - The window between the seal at spawn and pi loading its extensions (a few hundred ms).
 - The phone's permission answer on `dur-overseer` carries no action id; it answers the only pending
-  overseer proposal (one may wait at a time).
+  overseer proposal (one may wait at a time), and only when it arrives at least 500 ms after that
+  proposal's own prompt (an earlier one is ignored and audited). A stale Yes that arrives later than
+  that still confirms the newer proposal the phone was sent.
 - The tmux allowlist (`inputReady`) is rebuilt from sources, not captured; it fails closed. Claude
   Code's placeholder is ASSUMED dim (SGR 2): if it is not, every message to a Claude Code terminal is
   refused ("has unsent text") until the fixtures are corrected from real captures.

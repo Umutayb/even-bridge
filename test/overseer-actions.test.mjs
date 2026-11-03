@@ -13,7 +13,7 @@ import { createDurableProvider } from "../src/providers/durable/provider.mjs";
 import { createOverseerHost } from "../src/overseer/host.mjs";
 import { createOverseerExtension } from "../src/overseer/extension.mjs";
 import { createOverseer, overseerProviderOptions, OverseerAsks, OverseerHandoffs, OverseerOutbox, ROOT_CONVERSATION_ID } from "../src/overseer/overseer.mjs";
-import { ACTION_TTL_MS, claudeFreeSlots, createOverseerActions, lcCapAuditEvent, OverseerActions, summarize, tildePath } from "../src/overseer/actions.mjs";
+import { ACTION_TTL_MS, claudeFreeSlots, createOverseerActions, lcCapAuditEvent, OverseerActions, PHONE_ANSWER_MIN_MS, summarize, tildePath } from "../src/overseer/actions.mjs";
 import { startFakeOpenAI } from "./helpers/fake-openai.mjs";
 
 const quiet = { warn() {}, error() {}, log() {} };
@@ -46,9 +46,10 @@ const newDir = () => {
 
 /**
  * One bridge process: provider + overseer + actions, as server.mjs wires them. `extra`: pi/cc/rc stubs,
- * `clock` (an object whose `t` is now), `slots` (Claude free slots), `failSetup`.
+ * `clock` (an object whose `t` is now), `slots` (Claude free slots), `failSetup`, `phoneMinMs` (the phone answer's
+ * minimum delay after its prompt; 0 here, PHONE_ANSWER_MIN_MS in the tests of that rule and in the server).
  */
-async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup, handoffs = false, reply = {} } = {}) {
+async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup, handoffs = false, reply = {}, phoneMinMs = 0 } = {}) {
   const frames = [];
   const host = {};
   const extension = createOverseerExtension({ host });
@@ -81,6 +82,7 @@ async function open(dir, { pi, cc, rc, clock, slots = () => 8, failSetup, handof
     disableFile: join(dir, "agents.disabled"),
     claudeSlots: async () => slots(),
     ...(clock ? { now: () => clock.t } : {}),
+    phoneAnswerMinMs: phoneMinMs,
     ...reply,
   });
   await actions.ready;
@@ -380,6 +382,19 @@ test("C1: a message is one plain line for every origin; non-durable targets take
     const { sessionId } = await s.provider.prompt(undefined, "first", s.work, { name: "docs", origin: "evenai" });
     await rejectsWith(s.actions.propose("session_message", { id: sessionId, text: "a\nb" }, { origin: "evenai", requestId: "d1" }), 400, /one line/);
     await rejectsWith(s.actions.propose("session_start", { label: "x", task: "​/factory start t.md" }, { origin: "evenai", requestId: "st" }), 400, /cannot send commands/);
+    // 5a: a task with an invisible or bidi character anywhere is refused from both origins (the phone's summary
+    // would read differently from what the agent gets), and a message with one too.
+    for (const [i, task] of ["write \u202etxt.ih to hi.txt", "write hi\u200b", "go\u2066x\u2069", "hi \u3164 there"].entries()) {
+      for (const origin of ["overseer", "evenai"]) {
+        await rejectsWith(s.actions.propose("session_start", { label: "inv", task }, { origin, requestId: `inv-${i}-${origin}` }), 400, /^a task can't hold invisible characters$/);
+      }
+    }
+    await rejectsWith(s.actions.propose("session_message", { id: "p1", text: "run \u202etests" }, { origin: "overseer" }), 400, /^a message can't hold invisible characters$/);
+    assert.equal(permissionFrames(s).length, 0, "nothing reached the phone");
+    // And at execute (defense in depth), whatever the stored args.
+    const exec = createOverseerHost({ durable: s.provider, log: quiet }).execute({ id: "x", kind: "session_start", origin: "overseer", args: { label: "inv", task: "a\u202eb", cwd: s.work, engine: "native", model: "qwen" } });
+    await assert.rejects(exec, (err) => err.statusCode === 400 && /invisible/.test(err.message));
+    assert.equal((await s.provider.listAgents()).filter((a) => a.name === "inv").length, 0);
   } finally {
     await s.close();
   }
@@ -634,6 +649,71 @@ test("Claude starts need two free slots and at most one", async () => {
     server.close();
   }
   assert.equal(await claudeFreeSlots({ url: "http://127.0.0.1:1/status", timeoutMs: 200 }), null);
+});
+
+test("5b: a phone answer within 500 ms of the pending proposal's prompt is ignored (a stale Yes); after it, it answers", async () => {
+  assert.equal(PHONE_ANSWER_MIN_MS, 500);
+  const clock = { t: Date.now() };
+  const s = await open(newDir(), { clock, phoneMinMs: PHONE_ANSWER_MIN_MS });
+  try {
+    // A is shown on the phone and expires unanswered; B is proposed.
+    const a = await s.actions.propose("session_start", { label: "aa", task: "x" }, { origin: "overseer" });
+    clock.t += ACTION_TTL_MS + 1;
+    await s.actions.sweep();
+    assert.equal((await items(s)).find((i) => i.id === a.id).state, "expired");
+    const b = await s.actions.propose("session_start", { label: "bb", task: "y" }, { origin: "overseer" });
+    assert.deepEqual(permissionFrames(s).map((f) => f.toolUseId), [a.id, b.id]);
+    // The Yes still on screen from A lands 100 ms after B's prompt: ignored, B stays pending, nothing starts.
+    clock.t += 100;
+    assert.equal(await s.provider.respondPermission("dur-overseer", "allow"), false);
+    clock.t += 399;
+    assert.equal(await s.provider.respondPermission("dur-overseer", "deny"), false, "a stale No is ignored too");
+    assert.equal((await items(s)).find((i) => i.id === b.id).state, "pending");
+    assert.equal((await s.provider.listAgents()).length, 0);
+    const lines = readFileSync(join(s.dir, "overseer-actions.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const ignored = lines.filter((l) => l.event === "ignore");
+    assert.deepEqual(ignored.map((l) => [l.id, l.by, l.decision]), [[b.id, "phone", "allow"], [b.id, "phone", "deny"]]);
+    assert.match(ignored[0].reason, /^100 ms after its prompt \(under 500 ms\)$/);
+    assert.equal(ignored[0].summary, b.summary);
+    // The prompt, then a Yes 500 ms after it: B is confirmed from the phone.
+    clock.t += 1;
+    assert.equal(await s.provider.respondPermission("dur-overseer", "allow"), true);
+    const one = (await items(s)).find((i) => i.id === b.id);
+    assert.equal(one.state, "confirmed");
+    assert.equal(one.confirmFrameId, "phone");
+    assert.deepEqual((await s.provider.listAgents()).map((a) => a.name), ["bb"]);
+  } finally {
+    await s.close();
+  }
+});
+
+test("5b: a phone answer is ignored when the pending proposal is not the one the phone was last shown", async () => {
+  const clock = { t: Date.now() };
+  const dir = newDir();
+  const one = await open(dir, { clock, phoneMinMs: PHONE_ANSWER_MIN_MS });
+  const p = await one.actions.propose("session_start", { label: "cc", task: "x" }, { origin: "overseer" });
+  // A second actions instance on the same store never sent this prompt (as after a reload of the module).
+  const actions = createOverseerActions({
+    durable: one.provider,
+    host: {},
+    emit: () => {},
+    log: quiet,
+    auditPath: join(dir, "overseer-actions-2.log"),
+    disableFile: join(dir, "agents.disabled"),
+    claudeSlots: async () => 8,
+    now: () => clock.t - 1000, // "started" before p was proposed: p stays pending here
+  });
+  try {
+    await actions.ready;
+    assert.equal((await actions.pending()).map((i) => i.id).includes(p.id), true);
+    assert.equal(await actions.respond("allow"), false);
+    const lines = readFileSync(join(dir, "overseer-actions-2.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(lines.map((l) => [l.event, l.id, l.reason]), [["ignore", p.id, "not the proposal the phone was last shown"]]);
+    assert.equal((await actions.pending()).length, 1, "still pending");
+  } finally {
+    actions.close();
+    await one.close();
+  }
 });
 
 test("the kill switch blocks confirms", async () => {

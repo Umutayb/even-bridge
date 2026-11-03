@@ -48,13 +48,30 @@ gh pr create --repo Umutayb/even-cloud-shim --base main --head overseer \
 Before merging:
 
 - **Shim:** the branch `overseer` was cut from `main` 50f7af8; `main` is 15 commits ahead (AI backend,
-  sessions-tool, …). Merge `main` into the branch (or rebase), resolve conflicts (likely in
-  `shim/ai.py`, `tools/qa_runner.py`, `docs/QA.md`, `docs/PREFS.md`), and run the full suite again
-  (`.venv/bin/python -m pytest -q`, exit 0) before the merge.
+  sessions-tool, …). Merge `main` into the branch (or rebase) and run the full suite again
+  (`.venv/bin/python -m pytest -q`, exit 0) before the merge. What to resolve:
+  - Textual conflicts against `main`: `docs/PREFS.md` and `shim/ai.py` (`README.md`, `docs/QA.md` and
+    `tools/qa_runner.py` merge cleanly). When `ideate` is merged into `main` first, `tools/qa_runner.py`
+    conflicts too: keep the overseer's `sessions` and `overseer` categories, the refusal of the live
+    port `:8810` and `--live` for every agent category next to ideate's categories.
+  - A semantic clash no textual merge shows: `main`'s Conversate "sessions" routing (`_SESS_STRONG_RE`,
+    `session_shape` → `("sessions", True)`, the forced `fetch_conversations` call) claims every
+    coding-session utterance of the overseer ("list my sessions", "tell the notes session to say hi").
+    Let the overseer's session intents (`list_sessions`, `message_session`) win when the bridge
+    advertises the overseer and the utterance names a coding session ("coding session", pi, claude,
+    terminal, "tell the <label> session", or a label in the inventory); restrict
+    `_honest_session_answer` to turns where those tools were offered for a coding-session request, so a
+    Conversate recap is never rewritten; add merged-tree tests for both directions.
+  - `UNTRUSTED_TOOLS`: take the UNION of both sides (`main`: `fetch_conversations`,
+    `read_conversation`; the overseer: `overseer_ask`, `overseer_tell`). Either side alone silently
+    drops an injection guard.
+  - Keep the flag-off tool list equal to `main`'s `TOOLS` + `AGENT_TOOLS` and re-pin
+    `test_flag_off_tool_list_is_unchanged` against the merged `TOOLS`.
 - **Bridge:** `main` is 2 docs commits ahead (an amended overseer plan and the Even AI agent design);
-  `docs/superpowers/plans/2026-11-03-overseer.md` differs on both sides: keep main's version and add
-  the Task 6b accepted-limit line to its Global Constraints (pi RPC messages to existing pi sessions are
-  not confined to `~/sandbox/agents`). Full suite before the merge:
+  the merge is clean (`git merge-tree main feat/overseer`: the branch does not touch
+  `docs/superpowers/plans/2026-11-03-overseer.md`). After the merge, add the Task 6b accepted-limit line
+  to main's plan's Global Constraints (pi RPC messages to existing pi sessions are not confined to
+  `~/sandbox/agents`). Full suite before the merge:
   `TMPDIR=~/tmp/ovs-tmp node --test --test-timeout=180000 "test/*.test.mjs"` (exit 0; plain `npm test`
   can hang on the known `upstream-pump` flake).
 
@@ -108,15 +125,20 @@ the same for the shim with `~/github/even-cloud-shim-overseer` and `overseer`).
   `developer`, `expert-reviewer`, `design-reviewer`, `tester` or `acceptance-judge` set to true (today:
   only `researcher`).
 - [ ] No agent is running on the live bridge (`/api/agents` empty or all idle). Stop running ones first.
-- [ ] **Backup** (the session map migrates to schema v2 on the first start of the new code; copy the
-  store only while the bridge is stopped):
+- [ ] **Backup** (the session map migrates to schema v2 on the first start of the new code; copy each
+  SQLite store only while its service is stopped: a copy of a live WAL database can be torn):
   ```sh
   B=~/backups/overseer-$(date +%Y%m%d-%H%M); mkdir -p -m 700 $B
   sudo systemctl stop even-bridge
+  systemctl --user stop even-cloud-shim
   cp -p ~/.even-terminal/durable.sqlite* $B/
   cp -p ~/even-app/shim-data/agents.db* $B/     # the shim's registry (pending_dispatch/kv migrate too)
   ls -l $B
+  systemctl --user start even-cloud-shim        # the shim's new code is deployed later (stage 2)
   ```
+  (Without stopping the shim, use SQLite's online backup instead of `cp`, e.g.
+  `~/github/even-cloud-shim/.venv/bin/python -c 'import sqlite3,os,sys; s=sqlite3.connect(os.path.expanduser("~/even-app/shim-data/agents.db")); d=sqlite3.connect(sys.argv[1]); s.backup(d); d.close()' $B/agents.db`;
+  the `sqlite3` CLI is not installed on borealis.)
 - [ ] Update the live checkouts to the merged code (bridge stays stopped until stage 1 is written):
   ```sh
   git -C ~/github/even-bridge pull --ff-only && git -C ~/github/even-bridge log --oneline -1
@@ -210,7 +232,8 @@ The live shim (old code) ignores `engines`; nothing changes for the glasses unti
   glass-ph that writes hi to hi.txt"; when the question is spoken, answer on the PHONE instead: the
   Overseer session shows a permission prompt with the same summary; tap Yes → the agent starts. Repeat
   with No → the action is denied, nothing starts. (The phone's answer carries no action id; only one
-  overseer proposal can wait at a time.)
+  overseer proposal can wait at a time, and a phone answer within 500 ms of its prompt is ignored
+  with an `ignore` line in the audit log.)
 - [ ] **[GLASSES] G8, expiry.** Let an overseer question ("… Say yes to confirm." after "tell the overseer …") go unanswered for more than 90 s, then say "yes":
   "That confirmation expired — ask the overseer again."
 - [ ] **Capture real terminal screens** (the tmux allowlist is rebuilt from sources; it fails closed).

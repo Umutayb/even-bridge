@@ -50,6 +50,9 @@ const INVISIBLE_RE = /(?!\u200d)\p{Cf}|[\u115f\u1160\u3164\u2800\uffa0]/u;
 /** Only punctuation, symbols and spaces: nothing to say (";" alone would even type nothing and submit a draft). */
 const NO_WORDS_RE = /^[\p{P}\p{S}\s]*$/u;
 export const INVISIBLE = "a message can't hold invisible characters";
+export const INVISIBLE_TASK = "a task can't hold invisible characters";
+/** Any invisible character (INVISIBLE_RE) anywhere in the text: the one rule for messages and tasks alike. */
+export const hasInvisible = (text) => INVISIBLE_RE.test(String(text ?? ""));
 export const NO_WORDS = "a message needs words";
 
 /**
@@ -61,13 +64,23 @@ export function textProblem(text) {
   const t = String(text ?? "");
   if (CONTROL_CHARS_RE.test(t)) return NOT_ONE_LINE;
   if (/^[\/!]/.test(t.replace(LEAD_RE, ""))) return NO_COMMANDS;
-  if (INVISIBLE_RE.test(t)) return INVISIBLE;
+  if (hasInvisible(t)) return INVISIBLE;
   if (NO_WORDS_RE.test(t)) return NO_WORDS;
   return null;
 }
 
 /** A task's leading command check (a task goes to a durable agent's prompt, never typed into a terminal). */
 export const startsWithCommand = (text) => /^[\/!]/.test(String(text ?? "").replace(LEAD_RE, ""));
+
+/**
+ * Why a task may not start an agent (null when it may): a leading command, or an invisible character anywhere
+ * (the summary the user confirms must read exactly as what the agent receives). A task may span lines.
+ */
+export function taskProblem(text) {
+  if (startsWithCommand(text)) return NO_COMMANDS;
+  if (hasInvisible(text)) return INVISIBLE_TASK;
+  return null;
+}
 
 export const WHY_NOT = Object.freeze({
   "terminal-no-tmux": "it runs in a terminal outside tmux, so nothing can type into it",
@@ -412,7 +425,10 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       const { id, kind, args, origin } = action;
       const requestId = "ovs-act:" + id;
       // Defense in depth (actions.mjs refuses it at propose): no command, no control character, one line.
-      if (typeof args?.task === "string" && startsWithCommand(args.task)) throw Object.assign(new Error(NO_COMMANDS), { statusCode: 400 });
+      if (typeof args?.task === "string") {
+        const bad = taskProblem(args.task);
+        if (bad) throw Object.assign(new Error(bad), { statusCode: 400 });
+      }
       if (typeof args?.text === "string") {
         const bad = textProblem(args.text);
         if (bad) throw Object.assign(new Error(bad), { statusCode: 400 });

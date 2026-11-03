@@ -42,6 +42,7 @@
 //   LOOP     a write loop: every 10 ms one turn with the same `write hi.txt` call, until `abort`
 //   LOOPVARY the same, each call with other args (only the turn cap stops it)
 //   Each loop turn is logged as `{loopTurn: n}`; `abort` logs `{aborted: true, loopTurns: n}`.
+// FAKE_PI_IGNORE_ABORT=1: `abort` is answered but the run goes on (logged `{abortIgnored: true}`).
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -289,6 +290,10 @@ process.stdin.on("data", (chunk) => {
         break;
       case "abort":
         out({ type: "response", id: cmd.id, command: "abort", success: true });
+        if (process.env.FAKE_PI_IGNORE_ABORT === "1") {
+          log({ abortIgnored: true, loopTurns: run?.loopTurns ?? null });
+          break;
+        }
         if (run?.loopTurns != null) log({ aborted: true, loopTurns: run.loopTurns });
         if (run) {
           for (const [id] of dialogs) dialogs.delete(id);
