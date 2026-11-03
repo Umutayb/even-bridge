@@ -162,6 +162,23 @@ Bridge flags:
 | `--no-pi-all-cwds` | `EVEN_BRIDGE_PI_ALL_CWDS=0` | all cwds | scope pi list to project dir |
 | `--pi-agent-dir <d>` | `EVEN_BRIDGE_PI_AGENT_DIR` | `~/.pi/agent` | pi agent dir |
 
+### Durable agents (opt-in, read at restart)
+
+Glasses-started agents run as Pi Durable conversations inside the bridge
+(`src/providers/durable/`). Off unless the flag is set; with it unset the
+bridge never loads pi-durable and every route behaves as before.
+
+| env | default | meaning |
+| --- | --- | --- |
+| `EVEN_BRIDGE_DURABLE_ENABLE` | off | `1` enables the `durable` provider and the `/api/agents` endpoints |
+| `EVEN_BRIDGE_DURABLE_STORE` | `~/.even-terminal/durable.sqlite` | Durable's SQLite store (the bridge's session index sits next to it as `<store>.sessions.sqlite`); one bridge process per store |
+| `EVEN_BRIDGE_DURABLE_MODELS` | `~/.pi/agent/models.json` | lets-code's models.json (default model = the private vLLM) |
+| `EVEN_BRIDGE_DURABLE_CWDS` | empty = any existing dir except `~` and `/` | colon-separated roots, e.g. `~/github:~/sandbox/agents`; a new agent's cwd must lie **strictly below** a root (a bare root is refused; a missing dir below a root is created). A prompt without `cwd` uses the project dir (`PROJECT_DIR`/`--cwd`), so that dir must itself sit below a root or such prompts get a 400 |
+| `BWRAP` | off | `1` runs agent bash commands under `bwrap` when installed, instead of `systemd-run --user --scope` resource caps |
+
+A bridge shutdown does not abort running agents: their runs stay pending in
+the store and resume on the next start. Rollback = unset the flag and restart.
+
 ## Live settings (`~/.even-terminal/bridge.env`)
 
 `KEY=VALUE` lines, loaded before anything else at startup and re-read within
@@ -171,7 +188,7 @@ value. Override the path with `EVEN_BRIDGE_ENV_FILE`.
 
 | key | live? | meaning |
 | --- | --- | --- |
-| `EVEN_BRIDGE_NEW_SESSION_PROVIDER` | yes | what a new glasses session runs: `claude` (stock Claude Code), `pi`, `claude-remote` |
+| `EVEN_BRIDGE_NEW_SESSION_PROVIDER` | yes | what a new glasses session runs: `claude` (stock Claude Code), `pi`, `claude-remote`, `durable` (only when enabled) |
 | `EVEN_BRIDGE_CC_MODEL` | yes | model for glasses-spawned Claude Code (`claude-opus-5-5`, `sonnet`, ...); unset = `~/.claude/settings.json` |
 | `EVEN_TERMINAL_CLAUDE_CODE_EXECUTABLE` | restart | Claude Code CLI to launch; the SDK-bundled one lags and rejects new models |
 
@@ -183,12 +200,13 @@ The extension router (`src/ext-router.mjs`) intercepts `/api/*` before the
 official routers and claims a request when:
 
 1. an **explicit** `provider` param is an extended name
-   (`claude-remote`, `pi`) — CLI/test path, the phone never does this, or
+   (`claude-remote`, `pi`, `durable`) — CLI/test path, the phone never does this, or
 2. the `sessionId` is **claimed** or **probed** to an extended provider:
    - the ownership registry (`src/ownership.mjs`) maps session IDs to
      providers, claimed as sessions are listed/created;
    - pi probes from disk (`~/.pi/agent/sessions/**/<id>` file lookup);
    - RC probes the upstream (`/api/status`) and caches the answer;
+   - durable probes its session index (`dur-…` ids);
    - cc-local probes from disk (`~/.claude/projects/*/<id>.jsonl` file
      lookup) — local Claude Code sessions the official SDK list would skip
      while they are live.
@@ -411,6 +429,13 @@ src/providers/pi/            vendored pi provider (MIT — see NOTICE.md)
   summarize.mjs              tool-call summaries (ASCII, official style)
   provider.mjs               pi provider (owns sessions, probes from disk)
   detect.mjs                 /proc + tmux detection (pi & local CC)
+src/providers/durable/       Pi Durable agents (EVEN_BRIDGE_DURABLE_ENABLE=1)
+  models.mjs                 lets-code models.json → pi-ai providers
+  harness.mjs                the one SQLite-backed Durable harness (open/resume)
+  sessions.mjs               dur-<uuid> → conversation index (own SQLite file)
+  wire.mjs                   conversation views → the bridge's wire frames
+  guard.mjs                  path confinement, command vetting, resource caps
+  provider.mjs               durable provider (pi provider contract + agents)
 test/                        node:test suites (hermetic, no real provider state)
 scripts/onboard.sh           first-time onboarding flow (run as the user)
 scripts/setup-claude-wrap.sh install/switch/remove the claude shell wrapper
@@ -426,6 +451,17 @@ The wire protocol is the official even-terminal one (`/api/sessions`,
 `/api/sessions/:id/history`, `/api/permission-response`,
 `/api/question-response`, `/api/interrupt`, `/api/info`, …). Extended sessions
 flow through the same endpoints; the phone needs no changes.
+
+Bridge-only additions (durable; 404 unless `EVEN_BRIDGE_DURABLE_ENABLE=1`):
+
+- `POST /api/prompt` also accepts `name`, `model`, `maxTurns`, `requestId`
+  and `origin`; they are passed to the provider (pi, RC and cc-local ignore
+  them). A durable reply also carries `submissionId`; a repeated `requestId`
+  returns the same session and submission instead of starting a second run.
+- `GET /api/agents` → `{ agents: [{ sid, name, cwd, model, state, origin,
+  createdAt, lastSeen, lastLine }] }`.
+- `POST /api/agents/:sid/stop` → aborts the run and archives the session
+  (`{ ok: true, sessionId }`; 404 for an unknown or archived sid).
 
 ## Development
 

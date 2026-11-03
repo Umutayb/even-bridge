@@ -3,7 +3,7 @@
 // The Even phone app drives a bridge like the official even-terminal: session
 // entries from /api/sessions carry a `provider` field, but the app only knows
 // "claude"/"codex" and filters its list to those. So extended providers
-// (claude-remote, pi) present every session as provider "claude" on the wire,
+// (claude-remote, pi, durable) present every session as provider "claude" on the wire,
 // and per-session calls are routed by OWNERSHIP: which backend actually owns
 // this session id. This module is that registry.
 //
@@ -14,7 +14,7 @@
 
 const owners = new Map(); // sid -> { provider, at }
 
-export const EXTENDED_PROVIDERS = Object.freeze(["claude-remote", "pi"]);
+export const EXTENDED_PROVIDERS = Object.freeze(["claude-remote", "pi", "durable"]);
 
 export function isExtendedProvider(name) {
   return EXTENDED_PROVIDERS.includes(name);

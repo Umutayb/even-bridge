@@ -4,7 +4,7 @@
 // auth, hook endpoint, transport attach, pidfile, expose, logging, shutdown)
 // and inserts the extension router BEFORE the official events/core routers:
 //
-//   app.use("/api", auth, extRouter);     // extended sessions (claude-remote, pi)
+//   app.use("/api", auth, extRouter);     // extended sessions (claude-remote, pi, durable)
 //   app.use("/api", auth, eventsRouter);  // official SSE (local claude/codex)
 //   app.use("/api", auth, coreRouter);    // official routes
 //
@@ -44,6 +44,32 @@ import { resolvePiConfig, createPiProvider } from "./providers/pi/provider.mjs";
 import { createCcLocalProvider } from "./cc-local.mjs";
 import { getProvider } from "@evenrealities/even-terminal/dist/routes/core.js";
 import { getDefaultProvider } from "@evenrealities/even-terminal/dist/session.js";
+
+/** True when the durable (Pi Durable) provider is switched on: EVEN_BRIDGE_DURABLE_ENABLE=1. */
+export function durableEnabled(env = process.env) {
+  return String(env.EVEN_BRIDGE_DURABLE_ENABLE ?? "").trim() === "1";
+}
+
+/**
+ * createDurableProvider options from the environment, or null when the flag is
+ * off. EVEN_BRIDGE_DURABLE_CWDS is a colon-separated list of roots; a new
+ * agent's cwd — including the PROJECT_DIR default — must lie strictly below one.
+ * @param {object} env
+ * @param {{ cwd?: string }} o cwd = the bridge's project dir (default agent cwd)
+ */
+export function durableOptions(env = process.env, { cwd } = {}) {
+  if (!durableEnabled(env)) return null;
+  const opts = {
+    defaultCwd: cwd,
+    allowedCwds: String(env.EVEN_BRIDGE_DURABLE_CWDS ?? "")
+      .split(":")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  };
+  if (env.EVEN_BRIDGE_DURABLE_STORE) opts.storePath = env.EVEN_BRIDGE_DURABLE_STORE;
+  if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
+  return opts;
+}
 
 /**
  * @param {{ flags?: object, cwd?: string }} opts flags = CLI flags (rcUrl, rcToken,
@@ -98,6 +124,19 @@ export async function startServer({ flags = {}, cwd } = {}) {
     process.env.EVEN_BRIDGE_CC_DISABLED === "1"
       ? null
       : createCcLocalProvider(emit, { hub, official: () => getProvider("claude") });
+  // Pi Durable conversations (glasses-started agents), only with
+  // EVEN_BRIDGE_DURABLE_ENABLE=1. Imported lazily so a flag-off bridge never
+  // loads pi-durable; a store/models failure leaves the rest of the bridge up.
+  let durableProvider = null;
+  const durableOpts = durableOptions(process.env, { cwd });
+  if (durableOpts) {
+    try {
+      const { createDurableProvider } = await import("./providers/durable/provider.mjs");
+      durableProvider = createDurableProvider(emit, { hub, ...durableOpts });
+    } catch (err) {
+      console.error(`[bridge] durable provider failed to start: ${err.message}`);
+    }
+  }
 
   // Self-heal the dist patch (CC permission-mode env override) on every start.
   // Idempotent + no-op when already applied, so a reboot or an `npm update` that
@@ -116,12 +155,12 @@ export async function startServer({ flags = {}, cwd } = {}) {
   }
 
   console.log(
-    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}`
+    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}, durable=${durableProvider ? "on" : "off"}`
   );
 
   const extRouter = createExtRouter({
     hub,
-    providers: [rcProvider, piProvider, ccProvider],
+    providers: [rcProvider, piProvider, durableProvider, ccProvider],
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
   });
 
@@ -209,6 +248,8 @@ export async function startServer({ flags = {}, cwd } = {}) {
   function shutdown() {
     stopCodexAppServer();
     piProvider?.stopAll().catch(() => {});
+    // No abort: unfinished durable runs stay pending and resume on the next start.
+    durableProvider?.stopAll().catch(() => {});
     rcProvider?._pumps &&
       [...rcProvider._pumps.pumps.keys()].forEach((sid) => rcProvider.stopPump(sid).catch(() => {}));
     removeInstancePidfile();

@@ -196,7 +196,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
   // ── POST /api/prompt ───────────────────────────────────────────────────────
   router.post("/prompt", async (req, res, next) => {
-    const { text, sessionId, provider, cwd } = req.body ?? {};
+    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin } = req.body ?? {};
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing 'text' field" });
     }
@@ -210,7 +210,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
         // default (from the pairing URL), not a user choice — so it can't be
         // honored here. New sessions get stock Claude Code by default;
         // EVEN_BRIDGE_NEW_SESSION_PROVIDER picks an extended provider instead:
-        // "official"/"claude" (default), "pi", or "claude-remote".
+        // "official"/"claude" (default), "pi", "durable", or "claude-remote".
         const want = String(process.env.EVEN_BRIDGE_NEW_SESSION_PROVIDER ?? "official").trim().toLowerCase();
         if (want !== "official" && want !== "claude") p = byName(want);
       }
@@ -219,11 +219,19 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     console.log(`[bridge] prompt -> ${p.name} session=${sessionId ?? "(new)"}`);
     try {
       const effectiveCwd = sessionId ? undefined : cwd ?? process.env.PROJECT_DIR;
-      const result = await p.prompt(sessionId, text, effectiveCwd);
+      // Agent fields (durable): only the ones the caller sent. pi/rc/cc-local
+      // take three arguments and ignore the fourth.
+      const opts = {};
+      for (const [k, v] of Object.entries({ name, model, maxTurns, requestId, origin })) {
+        if (v !== undefined && v !== null) opts[k] = v;
+      }
+      const result = await p.prompt(sessionId, text, effectiveCwd, opts);
       // cc-local: session not externally driven -> the official router is
       // the single writer (spawn/resume) for this session.
       if (result?.passThrough) return next();
-      res.status(202).json({ ok: true, sessionId: result.sessionId, provider: result.provider });
+      const body = { ok: true, sessionId: result.sessionId, provider: result.provider };
+      if (result.submissionId !== undefined) body.submissionId = result.submissionId; // durable only
+      res.status(202).json(body);
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
       res.status(statusCode).json({ error: err.message });
@@ -340,6 +348,31 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     hub.streamFor(sessionId).handleEvents(req, res);
     p.watchTranscript?.(sessionId); // pi: tail the transcript for external (terminal) writers
     res.on("close", () => p.unwatchTranscript?.(sessionId));
+  });
+
+  // ── /api/agents — durable agents (the shim's registry/reaper) ─────────────
+  // Bridge-only endpoints: 404 unless the durable provider is enabled.
+  const durable = byName("durable");
+  const noDurable = (res) => res.status(404).json({ error: "Durable agents are not enabled" });
+
+  router.get("/agents", async (req, res) => {
+    if (!durable) return noDurable(res);
+    try {
+      res.json({ agents: await durable.listAgents() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post("/agents/:sid/stop", async (req, res) => {
+    if (!durable) return noDurable(res);
+    try {
+      await durable.stopSession(req.params.sid);
+      res.json({ ok: true, sessionId: req.params.sid });
+    } catch (err) {
+      const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
+      res.status(statusCode).json({ error: err.message });
+    }
   });
 
   return router;
