@@ -5,6 +5,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDurableProvider } from "../src/providers/durable/provider.mjs";
@@ -1017,4 +1018,64 @@ test("the trust of a factory run that ended is dropped", async (t) => {
   await until(() => !(realpathSync(work) in JSON.parse(readFileSync(trust, "utf8"))), 5000, "trust dropped");
   await until(async () => ((await recordOf(p, sid)).trusted ?? []).length === 0, 5000, "record.trusted empty");
   await confirmCheckpoint(c, p, sid);
+});
+
+
+// ── fix round 3 ──────────────────────────────────────────────────────────────
+
+test("the cwd's .pi is sealed on a timer while a child lives, outside any factory run", async (t) => {
+  const c = makeCase({ lc: { sealMs: 50 } });
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.equal(p._lc.liveCount(), 1, "the child is idle-kept");
+  writeFileSync(join(c.work, ".pi", "extensions", "evil.ts"), "export default () => {}");
+  await until(() => !existsSync(join(c.work, ".pi", "extensions", "evil.ts")), 3000, "timer seal");
+  assert.ok(c.frames.some((f) => f.sid === sid && f.type === "error" && /removed \.pi\/extensions\/evil\.ts/.test(f.message)));
+  const spawn = c.spawns()[0];
+  assert.ok(spawn, "spawned");
+});
+
+test("the child gets EVEN_GUARD_QUARANTINE for its own seal", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.equal(c.spawns()[0].env.EVEN_GUARD_QUARANTINE, join(c.dir, "lc-quarantine", sid));
+});
+
+test("a repo that tracks a .pi dir gets no lets-code agent (409 repo_tracks_pi, no row, no spawn)", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const git = (args) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: c.work, stdio: ["ignore", "pipe", "ignore"] });
+  mkdirSync(join(c.work, ".pi"), { recursive: true });
+  writeFileSync(join(c.work, ".pi", "settings.json"), "{}");
+  git(["init", "-q"]);
+  git(["add", ".pi/settings.json"]);
+  git(["commit", "-q", "-m", "tracks .pi"]);
+  const rows = () => [...p._map.rows({ seenSince: 0 })].length;
+  const before = rows();
+  await assert.rejects(p.prompt(undefined, "hello", c.work, { engine: "lets-code" }), (e) => e.statusCode === 409 && e.reason === "repo_tracks_pi" && /tracks a \.pi dir/.test(e.message));
+  assert.equal(rows(), before);
+  assert.equal(c.spawns().length, 0);
+  assert.ok(existsSync(join(c.work, ".pi", "settings.json")), "the tracked file is left alone");
+});
+
+test("a cwd whose .pi cannot be sealed gets no child: error frame, failed run", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(async () => {
+    chmodSync(join(c.work, ".pi", "extensions"), 0o755);
+    await c.closeAll();
+  });
+  mkdirSync(join(c.work, ".pi", "extensions"), { recursive: true });
+  writeFileSync(join(c.work, ".pi", "extensions", "evil.ts"), "export default () => {}");
+  chmodSync(join(c.work, ".pi", "extensions"), 0o555); // neither movable nor removable
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && /could not seal .*lets-code was not started/.test(f.message)), 5000, "seal error");
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
+  assert.equal(c.spawns().length, 0, "no child");
 });

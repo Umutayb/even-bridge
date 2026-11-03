@@ -34,9 +34,9 @@ export const LC_STATE_FILE = "~/.pi/agent/lets-code-state.json";
 export const FACTORY_EXPERTS = Object.freeze(["developer", "expert-reviewer", "design-reviewer", "tester", "acceptance-judge"]);
 /** pi's project trust store (`{ <canonical path>: true|false|null }`, lock dir `<file>.lock`; pi trust-manager.js). */
 export const LC_TRUST_FILE = "~/.pi/agent/trust.json";
-/** The project-local copy of the guard (pi loads `<cwd>/.pi/extensions/*` in every pi it starts there, subagents included). */
-export const LC_PROJECT_GUARD = join(".pi", "extensions", "even-guard.ts");
-const GUARD_CORE = fileURLToPath(new URL("./guard-core.mjs", import.meta.url));
+// The project-local guard and the `.pi` seal live in seal-core.mjs (loaded inside every pi of a project too).
+export { LC_PROJECT_GUARD, installProjectGuard, projectGuardSource, sealAfterTool, sealDirs, sealProjectPi } from "./seal-core.mjs";
+import { LC_PROJECT_GUARD } from "./seal-core.mjs";
 
 export const expandHome = (p, home = homedir()) => (p === "~" ? home : String(p).startsWith("~/") ? home + String(p).slice(1) : p);
 
@@ -126,38 +126,6 @@ export function expertsEnabled({ stateFile = LC_STATE_FILE, names = FACTORY_EXPE
   }
   const missing = names.filter((n) => experts[n] !== true);
   return { ok: missing.length === 0, missing };
-}
-
-/**
- * The guard source for `<cwd>/.pi/extensions/even-guard.ts`: lets-code starts its subagents as
- * plain `pi --mode rpc` processes in the same cwd, without the parent's `-e` flags, so only a
- * project-local extension reaches them (live probe 2026-11-03: a subagent's bash read under
- * ~/.ssh ran unguarded before this). It imports guard-core.mjs from this checkout by absolute URL.
- */
-export function projectGuardSource(guardCore = GUARD_CORE) {
-  return [
-    "// Written by even-bridge (durable lets-code engine) at every spawn; edits are overwritten.",
-    "// The even guard for this project's pi processes, subagents included (see guard-core.mjs).",
-    `import { guardDecision } from ${JSON.stringify(pathToFileURL(guardCore).href)};`,
-    "",
-    "export default function (pi: any) {",
-    '  pi.on("tool_call", async (event: any) => {',
-    '    const decision = guardDecision(String(event?.toolName ?? ""), event?.input ?? {}, { cwd: process.env.EVEN_GUARD_CWD || process.cwd() });',
-    "    return decision ?? undefined;",
-    "  });",
-    "}",
-    "",
-  ].join("\n");
-}
-
-/** (Re)write the project-local guard of `cwd` (atomically, 0644). @returns the file path */
-export function installProjectGuard(cwd, { source = projectGuardSource() } = {}) {
-  const file = join(cwd, LC_PROJECT_GUARD);
-  mkdirSync(dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, source, { mode: 0o644 });
-  renameSync(tmp, file);
-  return file;
 }
 
 /**
@@ -261,60 +229,6 @@ export async function updateTrust(paths, trusted, { file = LC_TRUST_FILE, tries,
   }, { ...(tries != null ? { tries } : {}), ...(delayMs != null ? { delayMs } : {}) });
 }
 
-const lstatOrNull = (p) => {
-  try {
-    return lstatSync(p);
-  } catch {
-    return null;
-  }
-};
-
-/**
- * Keep `<dir>/.pi` to exactly the bridge's guard: `extensions/even-guard.ts` (a regular file with the
- * current source, rewritten when missing or changed) and nothing else. Every other entry of `.pi` and of
- * `.pi/extensions` (pi loads all of them in a trusted project), and a `.pi` or `extensions` that is not a
- * plain dir, is moved to `quarantine` (removed when that fails). Never follows symlinks.
- * @returns {{ restored: boolean, removed: string[] }} restored: an existing guard file was replaced
- */
-export function sealProjectPi(dir, { quarantine, source = projectGuardSource(), now = Date.now } = {}) {
-  const removed = [];
-  let n = 0;
-  const away = (p, name) => {
-    try {
-      if (!quarantine) throw new Error("no quarantine dir");
-      mkdirSync(quarantine, { recursive: true, mode: 0o700 });
-      renameSync(p, join(quarantine, `${now()}-${++n}-${name.replace(/[/\\]/g, "_")}`));
-    } catch {
-      rmSync(p, { recursive: true, force: true });
-    }
-    removed.push(name);
-  };
-  const pi = join(dir, ".pi");
-  let st = lstatOrNull(pi);
-  if (st && !st.isDirectory()) away(pi, ".pi");
-  if (lstatOrNull(pi)?.isDirectory()) for (const e of readdirSync(pi)) if (e !== "extensions") away(join(pi, e), `.pi/${e}`);
-  const ext = join(pi, "extensions");
-  st = lstatOrNull(ext);
-  if (st && !st.isDirectory()) away(ext, ".pi/extensions");
-  if (lstatOrNull(ext)?.isDirectory()) for (const e of readdirSync(ext)) if (e !== "even-guard.ts") away(join(ext, e), `.pi/extensions/${e}`);
-  const g = join(ext, "even-guard.ts");
-  st = lstatOrNull(g);
-  let restored = false;
-  if (st && !st.isFile()) away(g, ".pi/extensions/even-guard.ts");
-  else if (st) {
-    let cur = null;
-    try {
-      cur = readFileSync(g, "utf8");
-    } catch {
-      /* unreadable: rewrite */
-    }
-    if (cur === source) return { restored, removed };
-    restored = true;
-  }
-  installProjectGuard(dir, { source });
-  return { restored, removed };
-}
-
 /** Worktrees of this cwd's running/waiting factory runs (ledger `work`, existing): `[{ id, work }]`. */
 export function factoryWorktrees(cwd, root = FACTORY_ROOT) {
   if (!cwd) return [];
@@ -400,6 +314,19 @@ export function removeStaleRegistry(pid, { root = LC_REGISTRY_ROOT, alive = pidA
   try {
     unlinkSync(f);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Does the git repo of `dir` track a `.pi` dir anywhere? Such a repo cannot host a lets-code agent:
+ * sealing would quarantine tracked files (a deletion an agent or the factory then commits). Not a repo,
+ * or git failing: false.
+ */
+export function tracksDotPi(dir, { git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }) } = {}) {
+  try {
+    return String(git(["ls-files", "--", ":(glob).pi/**", ":(glob)**/.pi/**"], dir)).trim() !== "";
   } catch {
     return false;
   }

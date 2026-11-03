@@ -47,6 +47,7 @@ import {
   removeStaleRegistry,
   resetFailedScope,
   sealProjectPi,
+  tracksDotPi,
   stopLcScopes,
   updateTrust,
 } from "./launch.mjs";
@@ -74,6 +75,9 @@ export const LC_EXPERTS_DISABLED = "factory experts must be enabled by the opera
 export const LC_FACTORY_REFUSAL_RE = /^(The user did not enable the factory's experts|The factory needs these experts enabled|No ticket file |factory: )/;
 /** How often a session with a factory run looks for new run worktrees to guard. */
 export const LC_FACTORY_WATCH_MS = 1000;
+/** How often the `.pi` dirs of a session with a live child are sealed (besides every pi's own tool_result seal). */
+export const LC_SEAL_MS = 1000;
+export const LC_REPO_TRACKS_PI = "this repo tracks a .pi dir; lets-code agents can't run here";
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 const lastLineOf = (text) => String(text ?? "").split("\n").filter((l) => l.trim()).at(-1)?.trim() ?? "";
@@ -131,6 +135,7 @@ export function createLcEngine({
   stateFile = LC_STATE_FILE,
   trustFile = LC_TRUST_FILE,
   factoryWatchMs = LC_FACTORY_WATCH_MS,
+  sealMs = LC_SEAL_MS,
 } = {}) {
   const mem = memoryController ?? lcMemoryControllerAvailable();
   if (!mem) log.warn?.(LC_NO_MEMORY_WARNING);
@@ -293,7 +298,9 @@ export function createLcEngine({
     if (s.session !== session) return; // an older child (stopped while idle) exiting late
     s.session = null;
     s.factoryStart = null;
-    if (s.factoryWatch) guardFactory(sid).catch(() => {}); // a last pass: drops the trust of ended runs
+    clearInterval(s.sealTimer);
+    s.sealTimer = null;
+    if (s.factoryWatch || s.guarded.size) guardFactory(sid).catch(() => {}); // a last pass: drops the trust of ended runs
     stopFactoryWatch(sid);
     clearTimeout(s.idleTimer);
     s.idleTimer = null;
@@ -358,14 +365,16 @@ export function createLcEngine({
    */
   /** Keep `<dir>/.pi` to the bridge's guard (C-new-1): restore it, quarantine anything else, say so. */
   function seal(sid, dir) {
-    if (!dir) return;
+    if (!dir) return true;
     try {
       const r = sealProjectPi(dir, { quarantine: join(storeDir, "lc-quarantine", sid), now });
       if (r.restored) emitTo(sid, { type: "error", message: `even-guard: the guard in ${dir}/.pi was changed; restored` });
       for (const name of r.removed) emitTo(sid, { type: "error", message: `even-guard: removed ${name} from ${dir} (only the bridge's guard may be in .pi)` });
       if (r.restored || r.removed.length) log.warn?.(`[durable:lc] ${sid}: ${dir}/.pi sealed (restored=${r.restored}, removed=${r.removed.join(", ") || "-"})`);
+      return true;
     } catch (err) {
       log.warn?.(`[durable:lc] ${sid}: ${dir}/.pi not sealed (${err.message})`);
+      return false;
     }
   }
 
@@ -387,8 +396,12 @@ export function createLcEngine({
     const row = map.get(sid);
     if (!row) return [];
     const s = S(sid);
-    if (s.guarding) return [];
+    if (s.guarding) {
+      s.guardAgain = true; // one more pass after the one in flight (the last pass at exit must not be lost)
+      return [];
+    }
     s.guarding = true;
+    s.guardAgain = false;
     const added = [];
     try {
       seal(sid, row.cwd);
@@ -422,6 +435,10 @@ export function createLcEngine({
       }
     } finally {
       s.guarding = false;
+      if (s.guardAgain) {
+        s.guardAgain = false;
+        guardFactory(sid).catch(() => {});
+      }
     }
     return added;
   }
@@ -481,16 +498,18 @@ export function createLcEngine({
       const resume = rec.piSessionFile && existsSync(rec.piSessionFile) ? rec.piSessionFile : undefined;
       // lets-code's subagents are plain pi processes in this cwd without our `-e`: they get the guard
       // from the project-local copy (trusted by the parent's even-guard.ts, see there).
-      try {
-        seal(sid, row.cwd); // the guard rewritten, anything else in .pi quarantined
-        for (const w of s.guarded) seal(sid, w);
-        excludeProjectGuard(row.cwd);
-      } catch (err) {
-        log.warn?.(`[durable:lc] ${sid}: project guard not written (${err.message}); subagents run without the even guard`);
+      // The guard rewritten, anything else in .pi quarantined: a project that cannot be sealed gets no child
+      // (its subagents would run without the guard, or load a plant).
+      if (!seal(sid, row.cwd)) {
+        const msg = `even-guard: could not seal ${row.cwd}/.pi; lets-code was not started`;
+        emitTo(sid, { type: "error", message: msg });
+        throw new Error(msg);
       }
+      for (const w of s.guarded) seal(sid, w);
+      excludeProjectGuard(row.cwd); // never throws
       // A failed scope of the same name (left by an OOM kill) would block the unit name.
       if (wrapper === "systemd-run") resetFailedScope(sid, { env: scopeEnv, run });
-      const launch = lcLaunch({ sid, cwd: row.cwd, sessionDir, model: modelArg(row), bin, guardExt, caps: effectiveCaps, wrapper, sandbox, baseEnv, extraEnv: childEnv });
+      const launch = lcLaunch({ sid, cwd: row.cwd, sessionDir, model: modelArg(row), bin, guardExt, caps: effectiveCaps, wrapper, sandbox, baseEnv, extraEnv: { ...childEnv, EVEN_GUARD_QUARANTINE: join(storeDir, "lc-quarantine", sid) } });
       launches.set(sid, launch);
       const session = new LcSession(emitTo, {
         sid,
@@ -527,6 +546,11 @@ export function createLcEngine({
         throw err;
       }
       if (session.sessionId) claim(session.sessionId, "durable");
+      clearInterval(s.sealTimer);
+      s.sealTimer = setInterval(() => {
+        if (s.session === session && session.running) sealAll(sid);
+      }, sealMs);
+      s.sealTimer.unref?.();
       await updateRecord(sid, (d) => {
         d.piSessionId = session.sessionId ?? d.piSessionId;
         d.piSessionFile = session.sessionFile ?? d.piSessionFile;
@@ -868,6 +892,7 @@ export function createLcEngine({
     async setFactory(sid, on, { ticket, howToRun } = {}) {
       const row = map.get(sid);
       if (!row || row.archived) throw httpError(404, "Session not found");
+      if (on && ticket && tracksDotPi(row.cwd)) throw Object.assign(httpError(409, LC_REPO_TRACKS_PI), { reason: "repo_tracks_pi" });
       if (on) {
         // Experts are host-wide lets-code state: only the operator enables them (ruling 4, R-C2). Orchestration
         // without them only raises expert dialogs the session answers No, so "on" needs them too.
@@ -912,6 +937,11 @@ export function createLcEngine({
       return { factory: Boolean(on), mode };
     },
 
+    /** A new lets-code session's cwd: a repo that tracks a `.pi` dir is refused (409 repo_tracks_pi). */
+    checkCwd(cwd) {
+      if (tracksDotPi(cwd)) throw Object.assign(httpError(409, LC_REPO_TRACKS_PI), { reason: "repo_tracks_pi" });
+    },
+
     /** Experts check for a new session started with the factory on (before any row exists). */
     checkFactoryExperts() {
       const ex = expertsEnabled({ stateFile });
@@ -938,6 +968,8 @@ export function createLcEngine({
         clearTimeout(s.idleTimer);
         s.idleTimer = null;
         stopFactoryWatch(s.sid);
+        clearInterval(s.sealTimer);
+        s.sealTimer = null;
         if (s.session) {
           sids.push(s.sid);
           s.session.expectedExit = true;

@@ -10,6 +10,7 @@
 // remember that (~/.pi/agent/trust.json), so the subagents started there later
 // load the guard too.
 import { guardDecision, trustsProject } from "./guard-core.mjs";
+import { sealAfterTool } from "./seal-core.mjs";
 
 export default function (pi: any) {
   pi.on("project_trust", async (event: any) =>
@@ -22,4 +23,7 @@ export default function (pi: any) {
     if (decision) return decision;
     return undefined;
   });
+  // After every tool (a subagent's bash may plant into .pi without naming it): undo it before this pi
+  // returns, so the next pi of the chain never loads it (seal-core.mjs).
+  pi.on("tool_result", async (event: any) => sealAfterTool(event));
 }

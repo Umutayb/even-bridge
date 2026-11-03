@@ -32,7 +32,7 @@ export const GUARD_PREFIX = "even-guard: ";
 const PATH_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
 const HARD_WHY = /off limits|too many symlinks|cannot tell where/;
 const DOT_PI = /(?:^|[\s;&|()<>'"`=\/])\.pi(?=$|[\s/;&|()<>'"`])/;
-const PROJECT_PI_WHY = "the project's .pi dir (it holds the even guard) is off limits";
+const PROJECT_PI_WHY = "the project's .pi dir (it holds the even guard) is off limits, as is any other .pi dir";
 
 const within = (p, root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
 const expand = (p, home) => (p === "~" ? home : p.startsWith("~/") ? home + p.slice(1) : p.replace(/^\$\{?HOME\}?(?=\/|$)/, home));
@@ -77,19 +77,24 @@ function ownWorktree(abs, { cwd, factoryRoot, readLedger }) {
 const inOwnWorktree = (abs, ctx) => ownWorktree(abs, ctx) !== null;
 
 /**
- * Does a write to `abs` touch a `.pi` dir inside the project or an own worktree? Segments are counted below
- * that base (the factory root itself lives under ~/.pi).
+ * Does a write to `abs` touch a `.pi` dir ANYWHERE (this project, a nested dir, a sibling session's
+ * project, an absolute path)? pi loads code from every trusted project's `.pi`, and no agent needs to
+ * write one. Inside an own factory worktree the segments are counted below the worktree (the factory
+ * root itself lives under ~/.pi); `~/.pi` itself is left to confinePath, which refuses it as off limits.
  * Both the path as given and its resolved form are checked (a symlink into a `.pi` dir counts).
  */
-function writesDotPi(abs, ctx) {
-  const wt = ownWorktree(abs, ctx);
-  const bases = [wt, ctx.cwd ? resolve(ctx.cwd) : null].filter(Boolean);
-  // outside the project and its worktrees the usual rules apply (~/.pi is off limits anyway)
-  const segs = (p, real) => {
-    const base = bases.map((b) => (real ? realish(b) : b)).find((b) => within(p, b));
-    return base ? relative(base, p).split(sep) : [];
+function writesDotPi(abs, ctx, home) {
+  const userPi = join(home, ".pi");
+  const check = (p, real) => {
+    const wt = ownWorktree(p, ctx);
+    if (wt) {
+      const base = real ? realish(wt) : wt;
+      if (within(p, base)) return relative(base, p).split(sep).includes(".pi");
+    }
+    if (within(p, real ? realish(userPi) : userPi)) return false;
+    return p.split(sep).includes(".pi");
   };
-  return segs(abs, false).includes(".pi") || segs(realish(abs), true).includes(".pi");
+  return check(abs, false) || check(realish(abs), true);
 }
 
 /**
@@ -117,7 +122,7 @@ export function guardDecision(toolName, input, { cwd = process.cwd(), home = hom
     const abs = resolve(cwd, expand(p, home));
     const writes = toolName === "write" || toolName === "edit";
     // before the own-worktree allow: a worktree's .pi is as off limits as the project's (pi trusts both)
-    if (writes && writesDotPi(abs, ctx)) return { block: true, reason: GUARD_PREFIX + PROJECT_PI_WHY };
+    if (writes && writesDotPi(abs, ctx, home)) return { block: true, reason: GUARD_PREFIX + PROJECT_PI_WHY };
     if (inOwnWorktree(abs, ctx)) return undefined;
     const res = confinePath(p, cwd, home, { mode: toolName === "write" || toolName === "edit" ? "write" : "read" });
     if (!res.ok && HARD_WHY.test(res.why ?? "")) why = res.why;

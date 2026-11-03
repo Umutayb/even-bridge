@@ -689,6 +689,7 @@ export function createDurableProvider(
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
+    if (engine === "lets-code") lcEngine.checkCwd(cwd); // 409 for a repo that tracks a .pi dir, before any row
     const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns, ...(engine === "lets-code" ? { engine } : {}) });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;

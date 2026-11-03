@@ -143,3 +143,31 @@ test("a nested .pi in the project (sub/.pi) cannot be written, also through a sy
   assert.equal(guardDecision("write", { path: join(s.cwd, "src", "pi.ts"), content: "x" }, s), undefined);
   assert.equal(guardDecision("read", { path: join(s.cwd, "sub", ".pi", "x") }, s), undefined, "reads are not the risk");
 });
+
+// -- Task 3 fix round 3: a .pi dir anywhere (a sibling session's project, an absolute path) --
+test("a .pi dir outside the project is refused too: a sibling project, an absolute path, a tmp dir", (t) => {
+  const s = sandbox(t);
+  const sibling = join(s.home, "sandbox", "agents", "other");
+  mkdirSync(sibling, { recursive: true });
+  for (const path of ["../other/.pi/extensions/evil.ts", join(sibling, ".pi", "extensions", "evil.ts"), "/tmp/x/.pi/settings.json"]) {
+    const d = guardDecision("write", { path, content: "x" }, s);
+    assert.equal(d?.block, true, path);
+    assert.match(d.reason, /\.pi dir/);
+  }
+  assert.equal(guardDecision("edit", { path: join(sibling, ".pi", "extensions", "even-guard.ts") }, s)?.block, true);
+  // ~/.pi keeps its own reason; a sibling file without .pi stays the mandate's
+  assert.match(guardDecision("write", { path: join(s.home, ".pi", "agent", "settings.json"), content: "{}" }, s).reason, /\.pi is off limits/);
+  assert.equal(guardDecision("write", { path: join(sibling, "a.txt"), content: "x" }, s), undefined);
+});
+
+test("even-guard.ts seals .pi after every tool result (seal-core.mjs)", () => {
+  const src = readFileSync(new URL("../src/providers/durable/lc/even-guard.ts", import.meta.url), "utf8");
+  assert.match(src, /from "\.\/seal-core\.mjs"/);
+  assert.match(src, /pi\.on\("tool_result", async \(event: any\) => sealAfterTool\(event\)\)/);
+});
+
+test("seal-core loads only node builtins (it runs inside every pi of a project)", () => {
+  const src = readFileSync(new URL("../src/providers/durable/lc/seal-core.mjs", import.meta.url), "utf8");
+  const froms = [...src.matchAll(/from "([^"]+)"/g)].map((m) => m[1]);
+  assert.ok(froms.length > 0 && froms.every((f) => f.startsWith("node:")), froms.join(", "));
+});

@@ -291,3 +291,31 @@ test("factoryWorktrees ignores a ledger whose work is not its own <root>/<id>/wo
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+
+import { tracksDotPi } from "../src/providers/durable/lc/launch.mjs";
+
+test("tracksDotPi: a repo tracking .pi (top or nested) is found; untracked or no repo is not", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lc-tracks-"));
+  const git = (args, cwd) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString();
+  try {
+    const repo = join(dir, "repo");
+    mkdirSync(join(repo, ".pi"), { recursive: true });
+    git(["init", "-q"], repo);
+    writeFileSync(join(repo, "a.txt"), "x");
+    writeFileSync(join(repo, ".pi", "x.ts"), "x"); // untracked
+    git(["add", "a.txt"], repo);
+    git(["commit", "-q", "-m", "a"], repo);
+    assert.equal(tracksDotPi(repo), false);
+    mkdirSync(join(repo, "sub", ".pi"), { recursive: true });
+    writeFileSync(join(repo, "sub", ".pi", "s.json"), "{}");
+    git(["add", "sub"], repo);
+    git(["commit", "-q", "-m", "nested"], repo);
+    assert.equal(tracksDotPi(repo), true);
+    const plain = join(dir, "plain");
+    mkdirSync(plain);
+    assert.equal(tracksDotPi(plain), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -57,7 +57,7 @@ log({
   spawn: true,
   argv,
   pid: process.pid,
-  env: pick(["LETS_CODE_EXPERTS_ON", "LETS_CODE_MEM_WATCH", "LETS_CODE_MEM_GUARD", "BRIDGE_TOKEN", "LETS_CODE_TOKEN", "EVEN_GUARD_CWD", "LETS_CODE_SUBAGENT_CONCURRENCY", "PI_TELEMETRY", "HOME"]),
+  env: pick(["LETS_CODE_EXPERTS_ON", "LETS_CODE_MEM_WATCH", "LETS_CODE_MEM_GUARD", "BRIDGE_TOKEN", "LETS_CODE_TOKEN", "EVEN_GUARD_CWD", "LETS_CODE_SUBAGENT_CONCURRENCY", "PI_TELEMETRY", "HOME", "EVEN_GUARD_QUARANTINE"]),
 });
 
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");

@@ -191,15 +191,30 @@ OOM kill left failed never blocks the next spawn's unit name).
   Live probe 2026-11-03: before this a subagent's `wc -c ~/.ssh/id_ed25519.pub` ran;
   after it, the subagent got `even-guard: ~/.ssh is off limits`. The guard file is added
   to the repo's `.git/info/exclude` (`/.pi/extensions/even-guard.ts`), so `git add -A`
-  never commits it. write/edit of any path with a `.pi` segment in the project or an own
-  factory worktree (nested `sub/.pi` included) are refused, and bash commands naming `.pi`.
-  **Known limit:** the bash block is text-based. So the bridge also seals `<cwd>/.pi` and each
-  guarded worktree's `.pi` itself (at every spawn, after every tool call, on every factory
-  watch tick): the guard file is rewritten when changed, and every other entry of `.pi` or
-  `.pi/extensions` is moved to `<store dir>/lc-quarantine/<sid>/` with an error frame
-  `even-guard: removed …`. Nested `sub/.pi` dirs planted without naming `.pi` are not
-  scanned (pi loads them only for a pi started in that subdir). A repo whose own `.pi/` is
-  tracked loses it in a factory worktree (the quarantine shows as a deletion in the diff).
+  never commits it. write/edit of any path with a `.pi` segment ANYWHERE are refused (this
+  project, a nested `sub/.pi`, a sibling session's project, an absolute path; inside an own
+  factory worktree the segments are counted below the worktree, and `~/.pi` keeps its "off
+  limits" reason), and bash commands naming `.pi`.
+  **Known limit:** the bash block is text-based (`tar xf`, `git checkout`, `d=.p; …${d}i/…`
+  pass it). So the `.pi` dirs are sealed (`lc/seal-core.mjs`, node builtins only): the guard
+  file is rewritten when changed, and every other entry of `.pi` or `.pi/extensions` is moved
+  to `<store dir>/lc-quarantine/<sid>/` (env `EVEN_GUARD_QUARANTINE` in the child). The seal runs
+  **inside every pi of the project** (the `-e even-guard.ts` and the project-local guard both
+  seal after each `tool_result`, for the project and, in a factory stage, its worktree), so a
+  plant made by one subagent is undone before that subagent returns, i.e. before the next pi of
+  a chain loads `.pi/extensions`; the model sees an `even-guard: removed …` note in that tool
+  result. The bridge also seals at every spawn (a project it cannot seal gets no child: error
+  frame `even-guard: could not seal …; lets-code was not started`), after every parent tool
+  call, every second while a child lives, and on every factory watch tick (error frames
+  `even-guard: removed …` / `…restored`).
+  **Accepted window:** between the seal at spawn and pi loading its extensions a few hundred
+  ms pass; a writer then exists only if another session shares the cwd or a factory stage of
+  the same session still runs in a worktree. Nested `sub/.pi` dirs planted without naming
+  `.pi` are not scanned (pi loads them only for a pi started in that subdir).
+- **Repos that track `.pi`.** A new lets-code agent in a repo whose git tracks a `.pi` dir
+  (top or nested) and a factory ticket there are refused 409 `{reason: "repo_tracks_pi",
+  error: "this repo tracks a .pi dir; lets-code agents can't run here"}`: sealing would
+  quarantine tracked files, which an agent or the factory then commits as deletions.
 - **Forget.** `forgetSession` removes the session cwd's entry from `~/.pi/agent/trust.json`
   (unless another live lets-code session has the same cwd) and the entries of the factory
   worktrees it trusted (`record.trusted`).
