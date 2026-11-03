@@ -18,7 +18,8 @@
 // shutdown path (durable stopAll = harness close, runs left pending).
 //
 // Secrets: BRIDGE_TOKEN comes from ~/.even-terminal/config.json, LETS_CODE_TOKEN
-// from the systemd drop-in of the live service. Neither is ever printed.
+// from the environment (export it before running), falling back to the systemd
+// drop-in of the live service only when that file is readable. Neither is ever printed.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -72,7 +73,7 @@ function letsCodeToken() {
   try {
     text = readFileSync(DROP_IN, "utf8");
   } catch (err) {
-    fail(`cannot read ${DROP_IN}: ${err.code ?? err.message}`);
+    fail(`LETS_CODE_TOKEN is not set and ${DROP_IN} is not readable (${err.code ?? err.message}); export LETS_CODE_TOKEN first`);
   }
   for (const raw of text.split("\n")) {
     const line = raw.trim();

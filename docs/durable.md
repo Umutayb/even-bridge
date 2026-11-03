@@ -44,10 +44,11 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_DURABLE_ENABLE` | off | `1` enables the provider and `/api/agents` |
 | `EVEN_BRIDGE_DURABLE_STORE` | `~/.even-terminal/durable.sqlite` | Durable store; the session map is `<store>.sessions.sqlite` |
 | `EVEN_BRIDGE_DURABLE_MODELS` | `~/.pi/agent/models.json` | models file |
-| `EVEN_BRIDGE_DURABLE_CWDS` | `~/sandbox/agents` | colon-separated roots; a new agent's cwd must lie strictly below one |
+| `EVEN_BRIDGE_DURABLE_CWDS` | `~/sandbox/agents` | colon-separated roots; a new agent's cwd must lie strictly below one. Keep it at `~/sandbox/agents`: a root inside or covering the bridge checkout, `~/.local`, `~/.nvm`, `~/.even-terminal`, `~/.pi` or a `PATH` dir is dropped with a warning |
+| `EVEN_BRIDGE_DURABLE_DEFAULT_CWD` | `<first root>/glasses` | cwd of a prompt that names none (created on demand); never `PROJECT_DIR` |
 | `EVEN_BRIDGE_DURABLE_AGENTS` | `scout,general,worker,reviewer,researcher,tester` | comma-separated lets-code agents (`~/.pi/agent/agents/*.md`) the `subagent` tool offers. Agent files and this list are read **once at bridge start**; edits apply after a restart |
 | `BWRAP` | off | `1` runs agent bash under `bwrap` when installed (it is not on borealis) |
-| `LETS_CODE_TOKEN` | — | vLLM key (`$LETS_CODE_TOKEN` in models.json); the live unit sets it in `even-bridge.service.d/pi-lets-code.conf` |
+| `LETS_CODE_TOKEN` | — | vLLM key (`$LETS_CODE_TOKEN` in models.json); the live unit sets it in `even-bridge.service.d/pi-lets-code.conf` (keep that drop-in mode 0600, root-owned) |
 
 All of them are read at startup only.
 
@@ -55,11 +56,21 @@ All of them are read at startup only.
 
 - `maxTurns` 1–60 per run (default 60); `name` ≤ 24 chars; `model` ≤ 32 chars.
 - The cwd must be strictly below a configured root; `~` and `/` are always
-  refused; symlinks are resolved before the check; a missing dir below a root
-  is created.
-- Every bash command runs under `systemd-run --user --scope -q -p MemoryMax=600M
-  -p CPUQuota=200%` (or `bwrap` with `BWRAP=1`), with an allowlisted
-  environment (no tokens, keys or secrets).
+  refused; symlinks are resolved (on the deepest existing ancestor) and checked
+  before anything is created; a missing dir below a root is created. A cwd
+  inside or containing the bridge checkout, `~/.local`, `~/.nvm`,
+  `~/.even-terminal`, `~/.pi` or a `PATH` dir is refused.
+- Every bash command runs under `systemd-run --user --scope -q
+  --unit=even-durable-<sid>-<n> -p MemoryMax=600M -p CPUQuota=200%` (or `bwrap`
+  with `BWRAP=1`). Under the system unit there is no login session, so the
+  provider defaults `XDG_RUNTIME_DIR=/run/user/<uid>` (and the user bus) when
+  that dir exists and probes `systemd-run --user --scope -q true` once at
+  start; if the probe fails, bash runs **without caps** (`wrapper=none` in the
+  startup line, plus a warning). Scopes outlive the bridge unit, so every
+  `even-durable-*.scope` is stopped before resume and at shutdown.
+- The shell's environment is an allowlist (PATH, HOME, LANG, …): the bridge's
+  `LETS_CODE_TOKEN`/`BRIDGE_TOKEN` are not in it. That is **not** the same as
+  "agents cannot read tokens" — see *Residual exposure* below.
 - `MAX_AGENTS=2` running and `AGENT_TTL_S=7200` are enforced by the shim's
   registry and reaper, not by the bridge.
 
@@ -77,8 +88,26 @@ Every conversation runs `CodingTools` behind the `even-guard` extension. Its
   `/` or `~`, `mkfs`, `dd` to devices, …) plus a small lexer that follows `cd`,
   removals, write targets and path-like tokens (`cd .. && rm -rf x`, absolute
   paths, `$HOME/…`, symlinks out of the cwd).
+- **Secrets.** `/etc/systemd` (unit drop-ins hold `Environment=` tokens),
+  `/etc/even-terminal.env` and `/run/user` are refused for reading and
+  writing, and `/proc/self/environ`/`cmdline` are no longer readable.
+- **Host control.** `systemctl` start/stop/…, `systemctl --user`,
+  `systemd-run`, `loginctl`, `crontab`, `pkill`/`killall`, `tmux`, `screen`,
+  `busctl`, `dbus-send`, `gdbus`, and `ps` with process environments (`ps e`,
+  `ps eww`, `ps auxe`, `ps -E`) are refused.
 - A refused call never runs. The model gets `Tool call blocked: guard: <why>`
   and the bridge logs `[durable:guard] blocked <tool> (<command>): <why>`.
+
+**Residual exposure (same uid).** Agent bash runs as the bridge's user, so
+anything that user can read, a determined agent can read: the bridge's own
+`/proc/<pid>/environ` (it holds `LETS_CODE_TOKEN`) through an interpreter
+(`python3 -c 'open("/proc/…/environ")'`) or a path the lexer cannot resolve,
+`ps eww` spelled in a way the pattern misses, and so on. The guard refuses the
+obvious spellings; only `bwrap --unshare-pid` (not installed) or running agents
+as a separate uid closes this. Read-only agents still get through with
+`curl -o`, `tar x`, `chmod`, `npm i` and other programs that write on their
+own. `NoNewPrivileges=yes` in the unit breaks a setuid `bwrap`, so enabling
+`BWRAP=1` later needs a non-setuid (user-namespace) `bwrap`.
 
 **Known limits of the guard.** It is a lexer/regex guard over shell text, not
 a sandbox: it stops the obvious and the common evasions, and a determined model
@@ -110,9 +139,13 @@ up edits.
 
 A bridge shutdown does **not** abort running agents. On SIGTERM/SIGINT the
 bridge closes the store (waiting up to 3 s); unfinished runs stay pending.
-On the next start the harness calls `resume()`, the provider re-attaches a
-watcher to every busy conversation seen in the last 7 days, and the run
-continues. Until that re-attachment is done, `/api/status` reports a session
+On the next start, before `resume()`, the provider stops leftover
+`even-durable-*` scopes, loads the subagent child edges, and lists the live
+tasks (`harness.inspect`): a run of a session seen in the last 7 days resumes
+(watcher re-attached, state `busy`); any other live task (older session,
+unknown conversation) is abort-marked before `resume()`, so it never runs
+again, and its tools find no cwd until the abort lands. Rows older than 7 days
+are not read at all and report `idle`. Until that re-attachment is done, `/api/status` reports a session
 whose state is not yet known as `busy`. Submissions are deduplicated, so a
 resumed run never re-submits the prompt (verified by
 `node scripts/durable-smoke.mjs --kill-mid-turn`, below).
@@ -143,8 +176,9 @@ over, stop the bridge and move both files away (all durable sessions are lost).
 ## Rollback
 
 Unset `EVEN_BRIDGE_DURABLE_ENABLE` (or set it to anything but `1`) and restart
-the bridge. pi-durable is then never imported, `/api/agents` returns 404, and
-every other route behaves as before. The store is left on disk untouched; set
+the bridge. pi-durable is then never imported, `/api/agents` falls through to
+the official router (its 404) exactly as before, and every other route behaves
+as before. The store is left on disk untouched; set
 the flag again to get the sessions back.
 
 ## Smoke run
@@ -167,9 +201,11 @@ Environment of the instance: `PORT=3466`, `EVEN_BRIDGE_DURABLE_ENABLE=1`,
 `EVEN_BRIDGE_RC_ENABLE=0`, `EVEN_BRIDGE_CC_DISABLED=1`,
 `PROJECT_DIR=/tmp/durable-smoke/work`, `EVEN_HOST_MODE=interface`
 `EVEN_HOST_INTERFACE=lo` (loopback only). `BRIDGE_TOKEN` comes from
-`~/.even-terminal/config.json`, `LETS_CODE_TOKEN` from the live unit's drop-in
-(or the environment); neither is printed. The script needs read access to the
-drop-in (it is world-readable on borealis).
+`~/.even-terminal/config.json`, `LETS_CODE_TOKEN` from the environment
+(`export LETS_CODE_TOKEN=…` first); only if it is unset does the script try
+the live unit's drop-in, which should **not** be readable (make it 0600,
+root-owned) — then the script stops and asks for the variable. Neither token
+is printed.
 
 What it checks: the file task creates `hello.txt` containing `hi`; the second
 prompt makes the model call `cat ~/.ssh/id_ed25519 | wc -c`, which the guard

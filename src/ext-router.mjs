@@ -266,7 +266,9 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!p) return next();
     console.log(`[bridge] prompt -> ${p.name} session=${sessionId ?? "(new)"}`);
     try {
-      const effectiveCwd = sessionId ? undefined : cwd ?? process.env.PROJECT_DIR;
+      // A durable prompt without a cwd uses the provider's default cwd (below an agent root),
+      // never PROJECT_DIR (the bridge's own project dir).
+      const effectiveCwd = sessionId ? undefined : p.name === "durable" ? cwd : cwd ?? process.env.PROJECT_DIR;
       let result;
       if (p.name === "durable") {
         // Agent fields: validated, and only the ones the caller sent.
@@ -401,12 +403,12 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
   });
 
   // ── /api/agents — durable agents (the shim's registry/reaper) ─────────────
-  // Bridge-only endpoints: 404 unless the durable provider is enabled.
+  // Bridge-only endpoints. Without the durable provider they fall through
+  // (next()), exactly as before they existed.
   const durable = byName("durable");
-  const noDurable = (res) => res.status(404).json({ error: "Durable agents are not enabled" });
 
-  router.get("/agents", async (req, res) => {
-    if (!durable) return noDurable(res);
+  router.get("/agents", async (req, res, next) => {
+    if (!durable) return next();
     try {
       res.json({ agents: await durable.listAgents() });
     } catch (err) {
@@ -414,8 +416,8 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     }
   });
 
-  router.post("/agents/:sid/stop", async (req, res) => {
-    if (!durable) return noDurable(res);
+  router.post("/agents/:sid/stop", async (req, res, next) => {
+    if (!durable) return next();
     try {
       await durable.stopSession(req.params.sid);
       res.json({ ok: true, sessionId: req.params.sid });

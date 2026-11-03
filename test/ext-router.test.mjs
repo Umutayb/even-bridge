@@ -519,12 +519,22 @@ test("POST /agents/:sid/stop calls stopSession; unknown sid is 404", async (t) =
   assert.deepEqual(durable.calls.stop, ["dur-1"]);
 });
 
-test("/agents routes are 404 without the durable provider", async (t) => {
+test("/agents routes fall through (next()) without the durable provider, as before they existed", async (t) => {
   const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi() });
   const base = await listen(t, app);
-  let r = await fetch(`${base}/api/agents`);
-  assert.equal(r.status, 404);
-  r = await postJson(`${base}/api/agents/dur-1/stop`, {});
-  assert.equal(r.status, 404);
-  assert.equal(fellThrough.length, 0);
+  await fetch(`${base}/api/agents`);
+  await postJson(`${base}/api/agents/dur-1/stop`, {});
+  assert.equal(fellThrough.length, 2);
+});
+
+test("a durable prompt without a cwd reaches the provider with no cwd (never PROJECT_DIR)", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const prev = process.env.PROJECT_DIR;
+  process.env.PROJECT_DIR = "/home/u/github/even-bridge";
+  t.after(() => (prev === undefined ? delete process.env.PROJECT_DIR : (process.env.PROJECT_DIR = prev)));
+  const r = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go" });
+  assert.equal(r.status, 202);
+  assert.equal(durable.calls.prompt[0].cwd, undefined);
 });

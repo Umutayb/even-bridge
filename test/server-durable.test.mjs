@@ -17,7 +17,7 @@ test("durable is off unless EVEN_BRIDGE_DURABLE_ENABLE=1", () => {
   assert.equal(durableEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "0" }), false);
   assert.equal(durableEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "true" }), false);
   assert.equal(durableEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "1" }), true);
-  assert.equal(durableOptions({}, { cwd: "/p" }), null, "flag unset: no durable provider is built");
+  assert.equal(durableOptions({}), null, "flag unset: no durable provider is built");
 });
 
 test("durable options come from the env; CWDS is colon-separated", () => {
@@ -27,22 +27,26 @@ test("durable options come from the env; CWDS is colon-separated", () => {
         EVEN_BRIDGE_DURABLE_ENABLE: "1",
         EVEN_BRIDGE_DURABLE_STORE: "/tmp/d/durable.sqlite",
         EVEN_BRIDGE_DURABLE_MODELS: "/tmp/d/models.json",
-        EVEN_BRIDGE_DURABLE_CWDS: "~/github: ~/sandbox/agents::",
+        EVEN_BRIDGE_DURABLE_CWDS: "~/sandbox/agents: ~/scratch::",
       },
-      { cwd: "/home/u/github/proj" },
     ),
     {
-      defaultCwd: "/home/u/github/proj",
-      allowedCwds: ["~/github", "~/sandbox/agents"],
+      defaultCwd: "~/sandbox/agents/glasses",
+      allowedCwds: ["~/sandbox/agents", "~/scratch"],
       storePath: "/tmp/d/durable.sqlite",
       modelsPath: "/tmp/d/models.json",
     },
   );
   // Unset store/models: the provider's own defaults apply (keys absent, not undefined).
-  assert.deepEqual(durableOptions({ EVEN_BRIDGE_DURABLE_ENABLE: "1" }, { cwd: "/p" }), {
-    defaultCwd: "/p",
+  assert.deepEqual(durableOptions({ EVEN_BRIDGE_DURABLE_ENABLE: "1" }), {
+    defaultCwd: "~/sandbox/agents/glasses",
     allowedCwds: [],
   });
+  // An explicit default cwd wins; PROJECT_DIR is never used.
+  assert.equal(
+    durableOptions({ EVEN_BRIDGE_DURABLE_ENABLE: "1", EVEN_BRIDGE_DURABLE_DEFAULT_CWD: "/w/x", PROJECT_DIR: "/p" }).defaultCwd,
+    "/w/x",
+  );
 });
 
 test("cwdAllowed: strictly below a root, never ~ or /, ~ roots expand", (t) => {
@@ -104,6 +108,7 @@ async function startChild(t, extraEnv) {
     EVEN_BRIDGE_PI_ENABLE: "0",
     EVEN_BRIDGE_RC_ENABLE: "0",
     EVEN_BRIDGE_CC_DISABLED: "1",
+    EVEN_BRIDGE_SKIP_PATCH_DIST: "1", // never touch the shared node_modules from a test child
     PROJECT_DIR: home,
     ...(typeof extraEnv === "function" ? extraEnv(home) : extraEnv),
   };
@@ -138,13 +143,13 @@ async function startChild(t, extraEnv) {
 
 const authed = { headers: { Authorization: `Bearer ${TOKEN}` } };
 
-test("server, flag unset: durable never imported, durable=off, /api/agents is auth-gated then JSON 404", async (t) => {
+test("server, flag unset: durable never imported, durable=off, /api/agents is auth-gated then falls through to the old 404", async (t) => {
   const s = await startChild(t, {});
   let r = await fetch(`${s.base}/api/agents`);
   assert.equal(r.status, 401, "no token");
   r = await fetch(`${s.base}/api/agents`, authed);
   assert.equal(r.status, 404);
-  assert.deepEqual(await r.json(), { error: "Durable agents are not enabled" });
+  assert.doesNotMatch(await r.text(), /Durable agents are not enabled/, "not the bridge's JSON: the official router answers");
   r = await fetch(`${s.base}/api/agents/dur-1/stop`, { method: "POST", ...authed });
   assert.equal(r.status, 404);
   const { code, out } = await s.stop();
@@ -153,7 +158,7 @@ test("server, flag unset: durable never imported, durable=off, /api/agents is au
   assert.doesNotMatch(out, /LOADED-DURABLE/, "src/providers/durable/* was imported with the flag off");
 });
 
-test("server, flag on: durable=on after ready, ~ root accepts the default cwd, SIGTERM waits for the store to close", async (t) => {
+test("server, flag on: durable=on after ready, the default cwd is <root>/glasses, SIGTERM waits for the store to close", async (t) => {
   const s = await startChild(t, (home) => {
     mkdirSync(join(home, "x", "y"), { recursive: true });
     writeFileSync(join(home, "models.json"), JSON.stringify(fakeModelsJson("http://127.0.0.1:9/v1")));
@@ -172,7 +177,7 @@ test("server, flag on: durable=on after ready, ~ root accepts the default cwd, S
   assert.deepEqual(await r.json(), { agents: [] });
   const { code, out } = await s.stop();
   assert.equal(code, 0);
-  assert.match(out, /\[bridge\] extensions: .*durable=on/);
+  assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none)/);
   assert.doesNotMatch(out, /default cwd .* is not under EVEN_BRIDGE_DURABLE_CWDS/);
   assert.match(out, /\[bridge\] durable store closed/);
 });
@@ -187,7 +192,7 @@ test("server, flag on: warns when the default cwd is outside the roots", async (
       EVEN_BRIDGE_DURABLE_STORE: join(home, "durable.sqlite"),
       EVEN_BRIDGE_DURABLE_MODELS: join(home, "models.json"),
       EVEN_BRIDGE_DURABLE_CWDS: "~/x",
-      PROJECT_DIR: join(home, "elsewhere"),
+      EVEN_BRIDGE_DURABLE_DEFAULT_CWD: join(home, "elsewhere"),
     };
   });
   const { out } = await s.stop();

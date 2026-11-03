@@ -173,14 +173,22 @@ bridge never loads pi-durable and every route behaves as before.
 | `EVEN_BRIDGE_DURABLE_ENABLE` | off | `1` enables the `durable` provider and the `/api/agents` endpoints |
 | `EVEN_BRIDGE_DURABLE_STORE` | `~/.even-terminal/durable.sqlite` | Durable's SQLite store (the bridge's session index sits next to it as `<store>.sessions.sqlite`); one bridge process per store |
 | `EVEN_BRIDGE_DURABLE_MODELS` | `~/.pi/agent/models.json` | lets-code's models.json (default model = the private vLLM) |
-| `EVEN_BRIDGE_DURABLE_CWDS` | `~/sandbox/agents` | colon-separated roots, e.g. `~/github:~/sandbox/agents`; a new agent's cwd must lie **strictly below** a root (a bare root is refused; a missing dir below a root is created). A prompt without `cwd` uses the project dir (`PROJECT_DIR`/`--cwd`), so that dir must itself sit below a root or such prompts get a 400 |
+| `EVEN_BRIDGE_DURABLE_CWDS` | `~/sandbox/agents` | colon-separated roots, e.g. `~/sandbox/agents`; a new agent's cwd must lie **strictly below** a root (a bare root is refused; a missing dir below a root is created). A cwd (or root) inside or containing the bridge checkout, `~/.local`, `~/.nvm`, `~/.even-terminal`, `~/.pi` or any `PATH` directory is refused; such a root is dropped with a startup warning, so `~/github` (which holds the bridge) cannot be a root |
+| `EVEN_BRIDGE_DURABLE_DEFAULT_CWD` | `<first root>/glasses` | cwd of a durable prompt that names none (created on demand). The bridge's `PROJECT_DIR` is never used for durable agents |
 | `EVEN_BRIDGE_DURABLE_AGENTS` | `scout,general,worker,reviewer,researcher,tester` | comma-separated lets-code agents (`~/.pi/agent/agents/*.md`) the `subagent` tool offers. Agent files and this list are read **once at bridge start**; edits apply after a restart |
 | `BWRAP` | off | `1` runs agent bash commands under `bwrap` when installed, instead of `systemd-run --user --scope` resource caps |
 
-The startup line reads `durable=on` once the store is open and resumed,
-`durable=failed: <reason>` if it could not start (the bridge then runs
-without it), and the bridge warns at startup when the project dir is not
-below an `EVEN_BRIDGE_DURABLE_CWDS` root.
+The startup line reads `durable=on wrapper=systemd-run|bwrap|none` once the
+store is open and resumed (`wrapper` is what agent bash really runs under:
+`systemd-run` is probed once at start and falls back to `none` with a loud
+warning when the user manager is unreachable), `durable=failed: <reason>` if
+it could not start (the bridge then runs without it), and the bridge warns
+at startup when the default cwd is not below an `EVEN_BRIDGE_DURABLE_CWDS` root.
+
+Do **not** set `EVEN_BRIDGE_NEW_SESSION_PROVIDER=durable` yet: what cwd the
+phone's Terminal sends for a new session has not been verified against the
+closed cwd policy. Durable agents are started explicitly (`provider:"durable"`,
+the shim's Even AI tools).
 
 A bridge shutdown does not abort running agents: their runs stay pending in
 the store and resume on the next start. On SIGTERM/SIGINT the bridge waits
@@ -459,7 +467,7 @@ The wire protocol is the official even-terminal one (`/api/sessions`,
 `/api/question-response`, `/api/interrupt`, `/api/info`, …). Extended sessions
 flow through the same endpoints; the phone needs no changes.
 
-Bridge-only additions (durable; 404 unless `EVEN_BRIDGE_DURABLE_ENABLE=1`):
+Bridge-only additions (durable; only with `EVEN_BRIDGE_DURABLE_ENABLE=1`):
 
 - `POST /api/prompt` to a durable session also accepts these optional
   fields, validated by the router (400 with an `error` message otherwise):
@@ -479,9 +487,8 @@ Bridge-only additions (durable; 404 unless `EVEN_BRIDGE_DURABLE_ENABLE=1`):
 - `POST /api/agents/:sid/stop` → aborts the run and archives the session
   (`{ ok: true, sessionId }`; 404 for an unknown or archived sid).
 - Both `/api/agents` routes need the bridge token like every `/api/*` route.
-  With the flag off they answer a JSON 404
-  `{ "error": "Durable agents are not enabled" }` (before this they fell
-  through to the official router's HTML 404).
+  With the flag off they fall through to the official router exactly as
+  before they existed (its 404).
 
 ## Development
 

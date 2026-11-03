@@ -57,18 +57,20 @@ export function durableEnabled(env = process.env) {
 /**
  * createDurableProvider options from the environment, or null when the flag is
  * off. EVEN_BRIDGE_DURABLE_CWDS is a colon-separated list of roots; a new
- * agent's cwd — including the PROJECT_DIR default — must lie strictly below one.
+ * agent's cwd must lie strictly below one. A durable prompt without a cwd
+ * works in EVEN_BRIDGE_DURABLE_DEFAULT_CWD, default `<first root>/glasses`
+ * (created on demand) — never the bridge's PROJECT_DIR.
  * @param {object} env
- * @param {{ cwd?: string }} o cwd = the bridge's project dir (default agent cwd)
  */
-export function durableOptions(env = process.env, { cwd } = {}) {
+export function durableOptions(env = process.env) {
   if (!durableEnabled(env)) return null;
+  const allowedCwds = String(env.EVEN_BRIDGE_DURABLE_CWDS ?? "")
+    .split(":")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const opts = {
-    defaultCwd: cwd,
-    allowedCwds: String(env.EVEN_BRIDGE_DURABLE_CWDS ?? "")
-      .split(":")
-      .map((s) => s.trim())
-      .filter(Boolean),
+    defaultCwd: env.EVEN_BRIDGE_DURABLE_DEFAULT_CWD?.trim() || `${(allowedCwds[0] ?? DURABLE_DEFAULT_ROOT).replace(/\/+$/, "")}/glasses`,
+    allowedCwds,
   };
   if (env.EVEN_BRIDGE_DURABLE_STORE) opts.storePath = env.EVEN_BRIDGE_DURABLE_STORE;
   if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
@@ -153,7 +155,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
   // loads pi-durable; a store/models failure leaves the rest of the bridge up.
   let durableProvider = null;
   let durableState = "off";
-  const durableOpts = durableOptions(process.env, { cwd });
+  const durableOpts = durableOptions(process.env);
   if (durableOpts) {
     let p = null;
     try {
@@ -161,7 +163,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
       p = createDurableProvider(emit, { hub, ...durableOpts });
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
-      durableState = "on";
+      durableState = `on wrapper=${p.wrapper ?? "none"}`;
     } catch (err) {
       durableState = `failed: ${err.message}`;
       p?.stopAll().catch(() => {});
@@ -177,7 +179,8 @@ export async function startServer({ flags = {}, cwd } = {}) {
   // Self-heal the dist patch (CC permission-mode env override) on every start.
   // Idempotent + no-op when already applied, so a reboot or an `npm update` that
   // refreshed node_modules can't leave the official CC permission behavior stale.
-  try {
+  // EVEN_BRIDGE_SKIP_PATCH_DIST=1 skips it (test children must not touch node_modules).
+  if (process.env.EVEN_BRIDGE_SKIP_PATCH_DIST !== "1") try {
     const { execFileSync } = await import("node:child_process");
     const { fileURLToPath } = await import("node:url");
     const { dirname, join } = await import("node:path");
