@@ -461,3 +461,25 @@ test("standing orders are bounded and checked by the host", async () => {
     await s.close();
   }
 });
+
+test("sleeping check-ins and the nightly task never make the overseer look busy after a restart", async () => {
+  const dir = newDir();
+  const c1 = clockAt(localAt(12));
+  const one = await open(dir, { clock: c1 });
+  const id = scheduled(await callTool(one, "checkin_schedule", { inMinutes: 60, about: "later" }));
+  c1.stop();
+  await one.close();
+  const c2 = fakeClock(c1.offset + 60000);
+  const two = await open(dir, { clock: c2 });
+  try {
+    assert.equal(await two.provider.getSessionStatus("dur-overseer"), "idle");
+    const task = await taskOf(two, id);
+    assert.equal(task.abortRequested, false, "the sleeping check-in is not taken for a stale run");
+    assert.notEqual(task.state.status, "terminal");
+    c2.advance(60 * 60000);
+    await until(async () => (await byRequest(two, `checkin:${id}`)) != null);
+  } finally {
+    c2.stop();
+    await two.close();
+  }
+});

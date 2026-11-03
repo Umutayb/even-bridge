@@ -519,6 +519,9 @@ export function createDurableProvider(
       for (const t of inspection.tasks) {
         const convId = t.record.conversationId;
         const row = rootRowOf(convId);
+        // The overseer's own background tasks (sleeping check-ins, the nightly reset) are not a run:
+        // they resume on their own and never make dur-overseer busy.
+        if (ov && row?.sid === ov.sid && t.record.background && String(t.record.kind).startsWith("even.overseer-")) continue;
         if (row && !row.archived && row.last_seen >= since) {
           states.set(row.sid, "busy");
           if (isLc(row)) {
