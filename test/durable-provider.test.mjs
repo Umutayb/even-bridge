@@ -1,6 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, realpathSync, symlinkSync } from "node:fs";
+import { SessionMap } from "../src/providers/durable/sessions.mjs";
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { MemoryStorage } from "@earendil-works/pi-durable/storage/memory";
@@ -52,6 +53,15 @@ const until = async (cond, ms = 5000) => {
     await new Promise((r) => setTimeout(r, 10));
   }
 };
+/** The settled record of a submission (a positive signal that nothing is still pending). */
+async function settled(provider, submissionId) {
+  const { ctx } = await provider.ready;
+  return (await provider._harness.submission(submissionId, ctx)).wait(ctx);
+}
+async function statusOf(provider, submissionId) {
+  const { ctx } = await provider.ready;
+  return (await (await provider._harness.submission(submissionId, ctx)).status(ctx)).status;
+}
 const idleCount = (frames, sid) => frames.filter((f) => f.sid === sid && f.type === "status" && f.state === "idle").length;
 
 test("new session creates a conversation and emits a full turn to the hub", async () => {
@@ -105,7 +115,8 @@ test("prompt while busy steers", async () => {
   const { provider, frames } = setup();
   fake.hold();
   const base = fake.calls;
-  const { sessionId } = await provider.prompt(undefined, 'TOOL bash {"command":"echo hi"}', undefined, {});
+  const first = await provider.prompt(undefined, 'TOOL bash {"command":"echo hi"}', undefined, {});
+  const { sessionId } = first;
   await fake.waitForCalls(base + 1);
   assert.equal(provider.getStatus(sessionId).state, "busy");
   const again = await provider.prompt(sessionId, "also say bye", undefined, {});
@@ -116,8 +127,12 @@ test("prompt while busy steers", async () => {
   assert.deepEqual(watch.value.docs["pi.inbox"].items.map((i) => [i.mode, i.content]), [["steer", "also say bye"]]);
   await watch.stop();
   fake.release();
+  // Both inputs answered by the same run.
+  const [r1, r2] = [await settled(provider, first.submissionId), await settled(provider, again.submissionId)];
+  assert.equal(r1.status, "done");
+  assert.equal(r2.status, "done");
+  assert.equal(r1.answer, r2.answer);
   await until(() => idleCount(frames, sessionId) === 1);
-  await new Promise((r) => setTimeout(r, 50));
   const mine = frames.filter((f) => f.sid === sessionId);
   // One run: one result, one idle; the steer shows as a second user_prompt inside it.
   assert.equal(mine.filter((f) => f.type === "result").length, 1);
@@ -139,8 +154,8 @@ test("prompt while busy on a text-only run queues behind it, never a parallel ru
   const base = fake.calls;
   const { sessionId } = await provider.prompt(undefined, "first", undefined, {});
   await fake.waitForCalls(base + 1);
-  await provider.prompt(sessionId, "second", undefined, {});
-  await new Promise((r) => setTimeout(r, 50));
+  const second = await provider.prompt(sessionId, "second", undefined, {});
+  assert.equal(await statusOf(provider, second.submissionId), "queued", "waits in the inbox, no parallel run");
   assert.equal(fake.calls - base, 1, "no second request while the first is in flight");
   fake.release();
   await until(() => idleCount(frames, sessionId) === 2);
@@ -171,9 +186,11 @@ test("requestId is stable across prompt retries", async () => {
   fake.release();
   await until(() => idleCount(frames, a.sessionId) === 1);
   // A retry after it settled still finds the same submission and starts nothing.
+  const callsAtIdle = fake.calls;
   const d = await provider.prompt(a.sessionId, "do it once", undefined, { requestId: "req-1" });
   assert.equal(d.submissionId, a.submissionId);
-  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await settled(provider, d.submissionId)).status, "done");
+  assert.equal(fake.calls, callsAtIdle, "the deduped retry asked the model nothing");
   const mine = frames.filter((f) => f.sid === a.sessionId);
   assert.equal(mine.filter((f) => f.type === "user_prompt").length, 1);
   assert.equal(mine.filter((f) => f.type === "result").length, 1);
@@ -342,7 +359,10 @@ test("a restart resumes the unfinished run once and re-attaches its watcher", as
   const again = await two.provider.prompt(undefined, "survive", work, { requestId: "req-r" });
   assert.equal(again.sessionId, a.sessionId);
   assert.equal(again.submissionId, a.submissionId);
-  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await settled(two.provider, again.submissionId)).status, "done");
+  assert.equal(mine.filter((f) => f.type === "user_prompt").length, 1);
+  assert.equal(two.frames.filter((f) => f.sid === a.sessionId && f.type === "user_prompt").length, 1);
+  assert.equal(fake.calls - base, 2, "one held request from the first provider, exactly one from the second");
   assert.deepEqual(await two.provider.getHistory(a.sessionId, 10), [
     { role: "user", text: "survive" },
     { role: "assistant", text: "ok: survive" },
@@ -371,7 +391,7 @@ test("watchTranscript keeps a watcher for clients; the last unwatch stops it", a
   provider.watchTranscript(sessionId);
   provider.watchTranscript(sessionId);
   await provider._live.get(sessionId).starting;
-  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setTimeout(r, 0)); // past the post-attach stop check (a macrotask)
   assert.ok(provider._live.has(sessionId));
   provider.unwatchTranscript(sessionId);
   assert.ok(provider._live.has(sessionId));
@@ -384,4 +404,205 @@ test("watchTranscript keeps a watcher for clients; the last unwatch stops it", a
   provider.watchTranscript("dur-unknown"); // unknown: ignored
   assert.equal(provider._live.has("dur-unknown"), false);
   await provider.stopAll();
+});
+
+// ───────────────────────────── fix round 1
+
+test("cwd policy never fails open: no roots configured = only below ~/sandbox/agents", () => {
+  const r = realpathSync(mkdtempSync(join(tmpdir(), "dur-cwd-def-")));
+  const home = join(r, "home");
+  mkdirSync(join(home, "github", "proj"), { recursive: true });
+  // An existing project outside the default root is refused when nothing is configured.
+  assert.throws(() => resolveAgentCwd(join(home, "github", "proj"), { allowedCwds: [], home }), (e) => e.statusCode === 400);
+  assert.throws(() => resolveAgentCwd("/tmp", { allowedCwds: [], home }), (e) => e.statusCode === 400);
+  assert.throws(() => resolveAgentCwd("~/sandbox/agents", { allowedCwds: [], home }), (e) => e.statusCode === 400); // the bare root
+  // Below the default root it is created on demand (the root itself need not exist).
+  const made = resolveAgentCwd("~/sandbox/agents/fix-tests", { allowedCwds: [], home });
+  assert.equal(made, join(home, "sandbox", "agents", "fix-tests"));
+  assert.ok(existsSync(made));
+  rmSync(r, { recursive: true, force: true });
+});
+
+test("resolveAgentCwd checks a symlinked ancestor before creating anything", () => {
+  const r = realpathSync(mkdtempSync(join(tmpdir(), "dur-cwd-ln-")));
+  const root = join(r, "agents");
+  const outside = join(r, "outside");
+  mkdirSync(root);
+  mkdirSync(outside);
+  symlinkSync(outside, join(root, "escape"));
+  assert.throws(() => resolveAgentCwd(join(root, "escape", "new"), { allowedCwds: [root] }), (e) => e.statusCode === 400);
+  assert.equal(existsSync(join(outside, "new")), false, "nothing created outside the root");
+  rmSync(r, { recursive: true, force: true });
+});
+
+test("agent shells get the allowlisted env, never the bridge's tokens", async () => {
+  const saved = { LETS_CODE_TOKEN: process.env.LETS_CODE_TOKEN, BRIDGE_TOKEN: process.env.BRIDGE_TOKEN };
+  process.env.LETS_CODE_TOKEN = "x-lets-code";
+  process.env.BRIDGE_TOKEN = "x-bridge";
+  try {
+    const { provider, frames } = setup();
+    const { sessionId } = await provider.prompt(undefined, 'TOOL bash {"command":"env"}', undefined, {});
+    await until(() => idleCount(frames, sessionId) === 1);
+    const out = frames.find((f) => f.sid === sessionId && f.type === "tool_end").detail.output;
+    assert.match(out, /PATH=/);
+    assert.doesNotMatch(out, /LETS_CODE_TOKEN|BRIDGE_TOKEN|x-lets-code|x-bridge/);
+    await provider.stopAll();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+});
+
+test("a stopped watcher keeps only the last line, not the view", async () => {
+  const { provider, frames } = setup();
+  const { sessionId } = await provider.prompt(undefined, "line one", undefined, {});
+  await until(() => idleCount(frames, sessionId) === 1);
+  await until(() => !provider._live.has(sessionId));
+  assert.equal(provider._lastLines.get(sessionId), "ok: line one");
+  assert.equal(typeof provider._lastLines.get(sessionId), "string");
+  const [agent] = await provider.listAgents();
+  assert.equal(agent.lastLine, "ok: line one");
+  await provider.stopAll();
+});
+
+test("forgetSession aborts a busy conversation and archives it", async () => {
+  const { provider } = setup();
+  fake.hold();
+  const base = fake.calls;
+  const a = await provider.prompt(undefined, "busy then forgotten", undefined, {});
+  await fake.waitForCalls(base + 1);
+  provider.forgetSession(a.sessionId);
+  assert.equal(provider.getStatus(a.sessionId), null);
+  const rec = await settled(provider, a.submissionId);
+  fake.release();
+  assert.equal(rec.status, "unanswered");
+  assert.equal(rec.reason, "aborted");
+  await provider.stopAll();
+});
+
+test("untilIdle drops its waiter when it times out", async () => {
+  const { provider, frames } = setup();
+  fake.hold();
+  const base = fake.calls;
+  const { sessionId } = await provider.prompt(undefined, "slow", undefined, {});
+  await fake.waitForCalls(base + 1);
+  await provider._untilIdle(sessionId, 5);
+  assert.equal(provider._idleWaiters.has(sessionId), false);
+  fake.release();
+  await until(() => idleCount(frames, sessionId) === 1);
+  await provider.stopAll();
+});
+
+test("a watch that dies while busy is re-attached and the run still reaches the ring", async () => {
+  const { provider, frames } = setup();
+  fake.hold();
+  const base = fake.calls;
+  const { sessionId } = await provider.prompt(undefined, "keep going", undefined, {});
+  await fake.waitForCalls(base + 1);
+  const dead = provider._live.get(sessionId);
+  await dead.watch.stop(); // ended from outside, not by the provider
+  await until(() => provider._live.has(sessionId) && provider._live.get(sessionId) !== dead && provider._live.get(sessionId).watch);
+  fake.release();
+  await until(() => frames.some((f) => f.sid === sessionId && f.type === "result"));
+  const result = frames.find((f) => f.sid === sessionId && f.type === "result");
+  assert.equal(result.success, true);
+  await until(() => provider.getStatus(sessionId).state === "idle");
+  await provider.stopAll();
+});
+
+test("maxTurns is validated and stored on the row; the repair path uses the stored value", async () => {
+  const { provider, frames, work } = setup();
+  await provider.ready;
+  await assert.rejects(provider.prompt(undefined, "x", undefined, { maxTurns: "abc" }), (e) => e.statusCode === 400);
+  await assert.rejects(provider.prompt(undefined, "x", undefined, { maxTurns: 0 }), (e) => e.statusCode === 400);
+  // A row whose conversation was never created (crash between the two steps), then a retry.
+  const sid = provider._map.create({ name: "repair", cwd: work, modelRef: { provider: "fake", modelId: "fake-model" }, origin: "evenai", maxTurns: 7 });
+  provider._map.noteRequest("req-repair", sid);
+  const r = await provider.prompt(undefined, "repair me", undefined, { requestId: "req-repair", maxTurns: "garbage-ignored-on-repair" });
+  assert.equal(r.sessionId, sid);
+  const { ctx } = await provider.ready;
+  const conv = await provider._harness.conversation(provider._map.get(sid).conversation_id, ctx);
+  assert.equal((await conv.agent(ctx)).maxTurns, 7);
+  await until(() => idleCount(frames, sid) === 1);
+  await provider.stopAll();
+});
+
+test("a store that fails to open turns calls into 503s", async () => {
+  const { provider } = setup({ storage: { broken: true } });
+  await assert.rejects(provider.ready, (e) => e.statusCode === 503);
+  await assert.rejects(provider.prompt(undefined, "x", undefined, {}), (e) => e.statusCode === 503);
+  await assert.rejects(provider.listAgents(), (e) => e.statusCode === 503);
+  await provider.stopAll();
+});
+
+test("getStatus reports busy for rows of unknown state until the restart check is done", async () => {
+  const { dir, work } = setup();
+  const opts = { storage: undefined, storePath: join(dir, "pending.sqlite"), allowedCwds: [dir], defaultCwd: work };
+  const one = setup(opts);
+  const a = await one.provider.prompt(undefined, "done before restart", undefined, {});
+  await settled(one.provider, a.submissionId);
+  await one.provider.stopAll();
+  const two = setup(opts);
+  assert.equal(two.provider.getStatus(a.sessionId).state, "busy"); // sync, before ready
+  await two.provider.ready;
+  assert.equal(two.provider.getStatus(a.sessionId).state, "idle");
+  await two.provider.stopAll();
+});
+
+test("seedTranscript never emits the tail of a run whose prompt is outside the window", async () => {
+  const { provider, frames } = setup({ historyWindow: 4 });
+  const a = await provider.prompt(undefined, 'TOOL bash {"command":"echo one"}', undefined, {});
+  await until(() => idleCount(frames, a.sessionId) === 1);
+  await provider.prompt(a.sessionId, "q2", undefined, {});
+  await until(() => idleCount(frames, a.sessionId) === 2);
+  await until(() => !provider._live.has(a.sessionId));
+  const mark = frames.length;
+  await provider.seedTranscript(a.sessionId);
+  const seeded = frames.slice(mark).filter((f) => f.sid === a.sessionId);
+  assert.equal(seeded[0].type, "user_prompt");
+  assert.deepEqual(seeded.filter((f) => f.type === "user_prompt").map((f) => f.text), ["q2"]);
+  assert.equal(seeded.filter((f) => f.type === "tool_end" || f.type === "tool_start").length, 0);
+  assert.equal(seeded.filter((f) => f.type === "result").length, 1);
+  await provider.stopAll();
+});
+
+test("stopAll({abort:true}) aborts busy runs so a restart does not resume them", async () => {
+  const { dir, work } = setup();
+  const opts = { storage: undefined, storePath: join(dir, "abort.sqlite"), allowedCwds: [dir], defaultCwd: work };
+  const one = setup(opts);
+  fake.hold();
+  const base = fake.calls;
+  const a = await one.provider.prompt(undefined, "abort on shutdown", undefined, {});
+  await fake.waitForCalls(base + 1);
+  await one.provider.stopAll({ abort: true });
+  fake.release();
+  const two = setup(opts);
+  await two.provider.ready;
+  assert.equal(two.provider.getStatus(a.sessionId).state, "idle");
+  const rec = await settled(two.provider, a.submissionId);
+  assert.equal(rec.status, "unanswered");
+  assert.equal(rec.reason, "aborted");
+  assert.equal(fake.calls - base, 1, "the second provider asked the model nothing");
+  assert.equal(two.provider._live.has(a.sessionId), false);
+  await two.provider.stopAll();
+});
+
+test("a restart only re-attaches rows seen within the last 7 days", async () => {
+  const { dir, work } = setup();
+  const storePath = join(dir, "stale.sqlite");
+  const opts = { storage: undefined, storePath, allowedCwds: [dir], defaultCwd: work };
+  const one = setup(opts);
+  fake.hold();
+  const base = fake.calls;
+  const a = await one.provider.prompt(undefined, "old run", undefined, {});
+  await fake.waitForCalls(base + 1);
+  await one.provider.stopAll();
+  // Age the row by 8 days.
+  const m = new SessionMap(storePath);
+  m.db.prepare("UPDATE sessions SET last_seen = last_seen - ? WHERE sid = ?").run(8 * 86400, a.sessionId);
+  m.close();
+  const two = setup(opts);
+  await two.provider.ready;
+  assert.equal(two.provider._live.has(a.sessionId), false);
+  fake.release();
+  await two.provider.stopAll({ abort: true });
 });

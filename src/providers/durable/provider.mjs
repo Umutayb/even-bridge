@@ -22,30 +22,33 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { createRegistry, LiveDoc } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
-import { expandHome, loadPiModels, thinkingLevelFor } from "./models.mjs";
+import { loadPiModels, thinkingLevelFor } from "./models.mjs";
 import { openDurable } from "./harness.mjs";
 import { SessionMap } from "./sessions.mjs";
 import { ViewTranslator } from "./wire.mjs";
-import { createGuardExtension } from "./guard.mjs";
+import { createGuardExtension, shellEnv as guardShellEnv } from "./guard.mjs";
 
 const NAME = "durable";
 const WIRE_PROVIDER = "claude";
 const VERSION = "pi-durable 1.5.0";
 export const DEFAULT_MAX_TURNS = 60;
+/** Where agents may work when no roots are configured: never "anywhere". */
+export const DEFAULT_AGENT_ROOT = "~/sandbox/agents";
 const HISTORY_WINDOW = 200; // entries a history read / seed looks at
+const RESUME_WINDOW_S = 7 * 86400; // rows seen longer ago are not re-attached on open
 
 export const AGENT_INSTRUCTIONS =
   "You are an autonomous coding agent started from smart glasses. Work in the given directory only. " +
   "Finish with a two-sentence summary of what you did and what is left. " +
   "If you need a decision from the user, ask one concise question and stop.";
 
-const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
+const httpError = (statusCode, message, cause) => Object.assign(new Error(message, cause ? { cause } : undefined), { statusCode });
 const notFound = () => httpError(404, "Session not found");
 
 const textOf = (content) => {
@@ -67,6 +70,12 @@ function historyItems(entries) {
   return out;
 }
 
+/** The last non-empty line of the newest assistant answer in `entries`. */
+function lastLineOf(entries) {
+  const answer = historyItems(entries ?? []).filter((h) => h.role === "assistant").at(-1);
+  return answer ? (answer.text.split("\n").filter((l) => l.trim()).at(-1) ?? "") : "";
+}
+
 const isDir = (p) => {
   try {
     return statSync(p).isDirectory();
@@ -75,30 +84,55 @@ const isDir = (p) => {
   }
 };
 
+const expandWith = (p, home) => (p === "~" ? home : p.startsWith("~/") ? home + p.slice(1) : p);
+
+/** realpath of the deepest existing ancestor of `abs`, with the missing tail appended. */
+function realish(abs) {
+  let base = abs;
+  const tail = [];
+  while (!existsSync(base)) {
+    const up = dirname(base);
+    if (up === base) break;
+    tail.unshift(basename(base));
+    base = up;
+  }
+  return join(existsSync(base) ? realpathSync(base) : base, ...tail);
+}
+
 /**
- * Where a new conversation may work. `allowedCwds` are roots: the cwd must lie
- * strictly below one of them (a bare root is refused); empty = any existing
- * directory. The home directory itself is always refused. A missing cwd below
- * an allowed root is created (e.g. `~/sandbox/agents/<label>`).
+ * Where a new conversation may work. The cwd must lie strictly below one of
+ * the roots (a bare root is refused); no roots configured = `[~/sandbox/agents]`.
+ * `~` and `/` are always refused. Symlinks are resolved on the deepest existing
+ * ancestor and checked BEFORE anything is created; a missing cwd below a root
+ * is then created (e.g. `~/sandbox/agents/<label>`).
  * @returns {string} the real path
  */
 export function resolveAgentCwd(want, { allowedCwds = [], home = homedir() } = {}) {
   if (!want) throw httpError(400, "No working directory given for the new agent");
-  const abs = resolve(expandHome(String(want)));
-  const realHome = existsSync(home) ? realpathSync(home) : home;
-  const roots = allowedCwds.filter(Boolean).map((r) => {
-    const a = resolve(expandHome(r));
-    return existsSync(a) ? realpathSync(a) : a;
-  });
+  const configured = allowedCwds.filter(Boolean);
+  const roots = (configured.length ? configured : [DEFAULT_AGENT_ROOT]).map((r) => realish(resolve(expandWith(r, home))));
+  const realHome = realish(resolve(home));
   const under = (p) => roots.some((r) => p.startsWith(r + sep));
-  if (!isDir(abs)) {
-    if (roots.length && under(abs) && abs !== home) mkdirSync(abs, { recursive: true });
-    else throw httpError(400, `Working directory ${abs} does not exist`);
+  const check = (real) => {
+    if (real === realHome || real === "/") throw httpError(400, `Refusing to run an agent in ${real}`);
+    if (!under(real)) throw httpError(400, `Working directory ${real} is not under an allowed root (${roots.join(", ")})`);
+  };
+  const target = realish(resolve(expandWith(String(want), home)));
+  check(target);
+  if (!isDir(target)) {
+    if (existsSync(target)) throw httpError(400, `Working directory ${target} is not a directory`);
+    mkdirSync(target, { recursive: true });
   }
-  const real = realpathSync(abs);
-  if (real === realHome || real === "/") throw httpError(400, `Refusing to run an agent in ${real}`);
-  if (roots.length && !under(real)) throw httpError(400, `Working directory ${real} is not under an allowed root (${roots.join(", ")})`);
+  const real = realpathSync(target);
+  check(real); // a race may have swapped a component for a symlink
   return real;
+}
+
+function parseMaxTurns(v) {
+  if (v == null || v === "") return DEFAULT_MAX_TURNS;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1) throw httpError(400, "maxTurns must be an integer of 1 or more");
+  return n;
 }
 
 /**
@@ -109,10 +143,11 @@ export function resolveAgentCwd(want, { allowedCwds = [], home = homedir() } = {
  * @param {string} [o.modelsPath] lets-code's models.json.
  * @param {string} [o.settingsPath] lets-code's settings.json (per-model thinking levels).
  * @param {string} [o.defaultCwd] cwd of a new conversation when the prompt gives none.
- * @param {string[]} [o.allowedCwds] roots a new conversation's cwd must lie under (empty = anywhere but ~).
+ * @param {string[]} [o.allowedCwds] roots a new conversation's cwd must lie under (default `[~/sandbox/agents]`).
  * @param {object} [o.storage] a ready Durable Storage instead of `storePath` (tests: MemoryStorage).
  * @param {object} [o.guard] extra options for createGuardExtension (tests: `{ wrapper: "none" }`).
  * @param {object} [o.settings] extra HarnessSettings.
+ * @param {number} [o.historyWindow] entries history/seed reads look at.
  */
 export function createDurableProvider(
   emitRaw,
@@ -128,6 +163,7 @@ export function createDurableProvider(
     guard = {},
     settings,
     env = process.env,
+    historyWindow = HISTORY_WINDOW,
   } = {},
 ) {
   const map = new SessionMap(storePath);
@@ -140,41 +176,58 @@ export function createDurableProvider(
   registry.install(CodingTools);
   registry.install(guardExt); // after CodingTools: the guard's bash (with resource caps) wins
   const EXTENSIONS = [CodingTools, guardExt];
-  const shellEnv = { ...env, PI_TELEMETRY: "0" };
+  // Defense in depth: the guard's `prepare` already rebuilds the bash env from
+  // its allowlist; the environment itself starts from that allowlist too.
+  const shellEnv = guardShellEnv({ PI_TELEMETRY: "0" }, env);
   const envFor = ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? defaultCwd ?? process.cwd(), shellEnv });
 
-  /** sid → watcher { conv, watch, translator, clients, pending, stopped, starting } */
+  /** sid → watcher { conv, watch, translator, view, clients, pending, stopped, starting } */
   const live = new Map();
   /** sid → "busy"|"idle", the last state we saw (kept after a watcher stops). */
   const states = new Map();
-  /** sid → last committed view (kept after a watcher stops; listAgents' last line). */
-  const lastViews = new Map();
+  /** sid → last line of the newest answer, kept when a watcher stops (listAgents). */
+  const lastLines = new Map();
+  /** sid → resolvers waiting for the next `status idle` frame. */
+  const idleWaiters = new Map();
+  /** sid → in-flight conversation creation (concurrent retries share it). */
+  const creating = new Map();
   let closed = false;
+  let resumed = false;
 
   let durable; // { harness, ctx, close }
   // `opened`: the harness is usable. `ready`: also re-attached after a restart.
   // Internal paths await `opened` (the resume step itself needs them).
-  const opened = openDurable({ storePath, storage, models, registry, envFor, settings }).then((d) => (durable = d));
+  const opened = openDurable({ storePath, storage, models, registry, envFor, settings }).then(
+    (d) => (durable = d),
+    (err) => {
+      throw httpError(503, `durable store failed to open: ${err.message}`, err);
+    },
+  );
   const ready = (async () => {
-    await opened;
-    // Resume after a restart: Durable continues unfinished runs (openDurable
-    // calls resume()); re-attach a watcher to each busy one so its frames
-    // reach the ring again.
-    for (const row of map.list({ limit: 1000 })) {
-      if (row.conversation_id == null) continue;
-      try {
-        const lv = await durable.harness.snapshot(LiveDoc, row.conversation_id, durable.ctx);
-        if (lv?.run) {
-          states.set(row.sid, "busy");
-          await ensureWatcher(row.sid);
+    try {
+      await opened;
+      // Resume after a restart: Durable continues unfinished runs (openDurable
+      // calls resume()); re-attach a watcher to each busy one seen recently so
+      // its frames reach the ring again.
+      const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
+      for (const row of map.rows({ seenSince: since })) {
+        if (row.conversation_id == null) continue;
+        try {
+          const lv = await durable.harness.snapshot(LiveDoc, row.conversation_id, durable.ctx);
+          if (lv?.run) {
+            states.set(row.sid, "busy");
+            await ensureWatcher(row.sid);
+          } else states.set(row.sid, "idle");
+        } catch (err) {
+          log.warn?.(`[durable] resume check for ${row.sid} failed: ${err.message}`);
         }
-      } catch (err) {
-        log.warn?.(`[durable] resume check for ${row.sid} failed: ${err.message}`);
       }
+      return durable;
+    } finally {
+      resumed = true;
     }
-    return durable;
   })();
-  ready.catch((err) => log.error?.(`[durable] harness failed to open: ${err.message}`));
+  ready.catch((err) => log.error?.(`[durable] ${err.message}`));
 
   const ctx = () => durable.ctx;
 
@@ -185,9 +238,6 @@ export function createDurableProvider(
     const conv = await durable.harness.conversation(row.conversation_id, ctx());
     return { row, conv };
   }
-
-  /** sid → resolvers waiting for the next `status idle` frame. */
-  const idleWaiters = new Map();
 
   function onFrame(sid, frame) {
     if (frame.type === "status" && (frame.state === "busy" || frame.state === "idle")) {
@@ -209,7 +259,7 @@ export function createDurableProvider(
   function ensureWatcher(sid) {
     const have = live.get(sid);
     if (have) return have.starting;
-    const w = { conv: undefined, watch: undefined, translator: undefined, clients: 0, pending: 0, stopped: false };
+    const w = { conv: undefined, watch: undefined, translator: undefined, view: undefined, clients: 0, pending: 0, stopped: false };
     live.set(sid, w);
     w.starting = (async () => {
       const { conv } = await conversationOf(sid);
@@ -224,19 +274,27 @@ export function createDurableProvider(
       // prime (default): the first view is history already in the ring; an
       // in-flight run is still reported (its prompt, busy, streamed partial).
       w.translator = new ViewTranslator(sid, (f) => onFrame(sid, f), { log });
+      w.view = watch.value;
       w.translator.apply(watch.value);
-      lastViews.set(sid, watch.value);
       watch.start(async (call) => {
         if (call.kind !== "value") return;
-        lastViews.set(sid, call.value);
+        w.view = call.value;
         try {
           w.translator.apply(call.value, call.ops);
         } catch (err) {
           log.warn?.(`[durable] ${sid}: view translation failed: ${err.message}`);
         }
       });
-      watch.closed.then(() => {
-        if (live.get(sid) === w) live.delete(sid);
+      watch.closed.then((end) => {
+        if (live.get(sid) !== w) return;
+        live.delete(sid);
+        lastLines.set(sid, lastLineOf(w.view?.entries));
+        // The watch died on its own (not stopped by us) while a run is going:
+        // attach a fresh one so the run keeps reaching the ring.
+        if (!w.stopped && !closed && states.get(sid) === "busy") {
+          log.warn?.(`[durable] watch ${sid} ended (${end?.kind}) while busy; re-attaching`);
+          setTimeout(() => ensureWatcher(sid).catch(() => {}), 0).unref?.();
+        }
       });
       // A client may have left while we attached. A macrotask, so a prompt
       // awaiting this watcher registers its submit first.
@@ -245,6 +303,7 @@ export function createDurableProvider(
     })();
     w.starting.catch((err) => {
       if (live.get(sid) === w) live.delete(sid);
+      states.delete(sid); // no watcher can tell us when it ends: fall back to "unknown"
       log.warn?.(`[durable] watch ${sid} failed: ${err.message}`);
     });
     return w.starting;
@@ -255,6 +314,7 @@ export function createDurableProvider(
     if (!w) return;
     live.delete(sid);
     w.stopped = true;
+    lastLines.set(sid, lastLineOf(w.view?.entries));
     w.translator?.finish();
     w.watch?.stop().catch(() => {});
   }
@@ -268,22 +328,28 @@ export function createDurableProvider(
     const w = live.get(sid);
     if (!w || !w.watch || w.clients > 0 || w.pending > 0 || hub?.clientCount?.(sid) > 0) return;
     if (states.get(sid) === "busy") return;
-    const v = lastViews.get(sid);
+    const v = w.view;
     if (v?.docs?.["pi.live"]?.run || v?.docs?.["pi.inbox"]?.items?.length || w.translator?.busy) return;
     stopWatcher(sid);
   }
 
-  /** Resolve at the next `status idle` of `sid`, or after `ms`. */
+  /** Resolve at the next `status idle` of `sid`, or after `ms` (the waiter is then removed). */
   function untilIdle(sid, ms) {
     if (states.get(sid) !== "busy") return Promise.resolve();
     return new Promise((resolve) => {
-      const t = setTimeout(resolve, ms);
-      t.unref?.();
       const list = idleWaiters.get(sid) ?? [];
-      list.push(() => {
+      const done = () => {
         clearTimeout(t);
         resolve();
-      });
+      };
+      const t = setTimeout(() => {
+        const rest = (idleWaiters.get(sid) ?? []).filter((r) => r !== done);
+        if (rest.length) idleWaiters.set(sid, rest);
+        else idleWaiters.delete(sid);
+        resolve();
+      }, ms);
+      t.unref?.();
+      list.push(done);
       idleWaiters.set(sid, list);
     });
   }
@@ -303,37 +369,34 @@ export function createDurableProvider(
 
   const modelLabel = (row) => (row?.model_provider ? `${row.model_provider}/${row.model_id}` : null);
 
-  async function createSession(text, phoneCwd, opts) {
+  function createSession(phoneCwd, opts) {
     const origin = opts.origin ?? "phone";
     if (origin !== "evenai" && origin !== "phone") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
     const ref = resolveModel(opts.model);
-    const maxTurns = opts.maxTurns == null ? DEFAULT_MAX_TURNS : Number(opts.maxTurns);
-    if (!Number.isInteger(maxTurns) || maxTurns < 1) throw httpError(400, "maxTurns must be an integer of 1 or more");
+    const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds });
-    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin });
+    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
   }
 
-  /** sid → in-flight conversation creation (concurrent retries share it). */
-  const creating = new Map();
-
   /** Create the Durable conversation of a row that has none yet (fresh, or a crash between the two steps). */
-  function ensureConversation(sid, opts) {
+  function ensureConversation(sid) {
     if (map.get(sid).conversation_id != null) return Promise.resolve();
     let p = creating.get(sid);
     if (!p) {
-      p = createConversationFor(sid, opts).finally(() => creating.delete(sid));
+      p = createConversationFor(sid).finally(() => creating.delete(sid));
       creating.set(sid, p);
     }
     return p;
   }
 
-  async function createConversationFor(sid, opts) {
+  async function createConversationFor(sid) {
     const row = map.get(sid);
     await opened;
     const ref = { provider: row.model_provider, modelId: row.model_id };
-    const maxTurns = opts.maxTurns == null ? DEFAULT_MAX_TURNS : Number(opts.maxTurns);
+    // From the row, validated when it was created: a repair after a crash uses the same budget.
+    const maxTurns = parseMaxTurns(row.max_turns);
     const conv = await durable.harness.createConversation(
       {
         ownership: { kind: "ownerless" },
@@ -349,6 +412,14 @@ export function createDurableProvider(
       ctx(),
     );
     map.setConversation(sid, conv.id);
+  }
+
+  async function stateOf(sid, conversationId) {
+    if (live.has(sid)) return states.get(sid) ?? "idle";
+    const lv = await durable.harness.snapshot(LiveDoc, conversationId, ctx());
+    const state = lv?.run ? "busy" : "idle";
+    if (!live.has(sid)) states.set(sid, state);
+    return state;
   }
 
   const provider = {
@@ -373,12 +444,13 @@ export function createDurableProvider(
     },
 
     async getSessionStatus(sessionId) {
-      const { conv } = await conversationOf(sessionId).catch(() => ({}));
-      if (!conv) return "idle";
-      const lv = await durable.harness.snapshot(LiveDoc, conv.id, ctx());
-      const state = lv?.run ? "busy" : "idle";
-      if (!live.has(sessionId)) states.set(sessionId, state);
-      return state;
+      try {
+        const { conv } = await conversationOf(sessionId);
+        if (!conv) return "idle";
+        return await stateOf(sessionId, conv.id);
+      } catch {
+        return "idle";
+      }
     },
 
     async getInfo() {
@@ -394,7 +466,7 @@ export function createDurableProvider(
       const { conv } = await conversationOf(sessionId);
       if (!conv) return [];
       claim(sessionId, NAME);
-      const page = await conv.entries({}, HISTORY_WINDOW, undefined, ctx());
+      const page = await conv.entries({}, historyWindow, undefined, ctx());
       const entries = [...page.items].reverse(); // newest first → oldest first
       return historyItems(entries).slice(-limit);
     },
@@ -402,18 +474,21 @@ export function createDurableProvider(
     /**
      * Seed the ring with the finished part of the transcript when it is empty
      * (after a restart, or a session never loaded in this process). Each run
-     * is replayed as its own complete turn (one user_prompt per run). A run
-     * still in flight is left to the watcher.
+     * is replayed as its own complete turn (one user_prompt per run). Entries
+     * before the window's first `pi.user` (the tail of a run whose prompt fell
+     * outside the window) and a run still in flight are left out.
      */
     async seedTranscript(sessionId) {
       if (!sessionId || live.has(sessionId)) return;
       if (getMessages(sessionId, 0).length > 0) return;
       const { conv } = await conversationOf(sessionId).catch(() => ({}));
       if (!conv) return;
-      const page = await conv.entries({}, HISTORY_WINDOW, undefined, ctx());
+      const page = await conv.entries({}, historyWindow, undefined, ctx());
       let entries = [...page.items].reverse();
       const lv = await durable.harness.snapshot(LiveDoc, conv.id, ctx());
       if (lv?.run?.first !== undefined) entries = entries.filter((e) => e.id < lv.run.first);
+      const firstUser = entries.findIndex((e) => e.kind === "pi.user");
+      entries = firstUser < 0 ? [] : entries.slice(firstUser);
       if (getMessages(sessionId, 0).length > 0 || live.has(sessionId)) return; // raced with a live feed
       const tr = new ViewTranslator(sessionId, (f) => emitRaw(sessionId, f), { prime: false, log });
       const starts = entries.map((e, i) => (e.kind === "pi.user" ? i : -1)).filter((i) => i >= 0);
@@ -454,9 +529,9 @@ export function createDurableProvider(
         const row = map.get(sid);
         if (!row || row.archived) throw notFound();
       } else {
-        sid = await createSession(text, cwd, opts);
+        sid = createSession(cwd, opts);
       }
-      await ensureConversation(sid, opts);
+      await ensureConversation(sid);
       claim(sid, NAME);
       // Watch before submitting: the first view is the history, so the new
       // input arrives as a change and is reported exactly once.
@@ -497,17 +572,35 @@ export function createDurableProvider(
         .catch((err) => log.warn?.(`[durable] interrupt ${sessionId} failed: ${err.message}`));
     },
 
+    /**
+     * Sync. Unknown or archived → null. Before the restart re-attachment has
+     * finished, a row whose state is not known yet reports `busy` (it may be
+     * a run being resumed); the phone polls again.
+     */
     getStatus(sessionId) {
       const row = map.get(sessionId);
       if (!row || row.archived) return null;
-      return { state: states.get(sessionId) ?? "idle", provider: WIRE_PROVIDER };
+      const state = states.get(sessionId) ?? (resumed ? "idle" : "busy");
+      return { state, provider: WIRE_PROVIDER };
     },
 
+    /**
+     * Unlike pi's (which only drops a dead subprocess), this ARCHIVES the
+     * session: it leaves every list and its id stops resolving. A busy
+     * conversation is aborted first (fire and forget).
+     */
     forgetSession(sessionId) {
+      const row = map.get(sessionId);
+      if (states.get(sessionId) === "busy" && row?.conversation_id != null && durable) {
+        durable.harness
+          .conversation(row.conversation_id, ctx())
+          .then((conv) => conv?.abort(ctx()))
+          .catch((err) => log.warn?.(`[durable] abort on forget ${sessionId} failed: ${err.message}`));
+      }
       stopWatcher(sessionId);
       map.archive(sessionId);
       states.delete(sessionId);
-      lastViews.delete(sessionId);
+      lastLines.delete(sessionId);
       forget(sessionId);
     },
 
@@ -519,36 +612,45 @@ export function createDurableProvider(
         await conv.abort(ctx());
         await untilIdle(sessionId, 2000); // let the watcher deliver the aborted run's result
       }
+      states.set(sessionId, "idle"); // aborted: nothing left to abort on forget
       provider.forgetSession(sessionId);
     },
 
+    /** Every live (non-archived) agent; status and last-line lookups run concurrently. */
     async listAgents() {
-      const out = [];
-      for (const r of map.list({ limit: 1000 })) {
-        if (r.conversation_id == null) continue;
-        let state = states.get(r.sid);
-        if (!live.has(r.sid)) state = await provider.getSessionStatus(r.sid).catch(() => state ?? "idle");
-        let lastLine = "";
-        let entries = lastViews.get(r.sid)?.entries;
-        if (!entries) {
-          const { conv } = await conversationOf(r.sid).catch(() => ({}));
-          entries = conv ? [...(await conv.entries({}, 20, undefined, ctx())).items].reverse() : [];
-        }
-        const answer = historyItems(entries).filter((h) => h.role === "assistant").at(-1);
-        if (answer) lastLine = answer.text.split("\n").filter((l) => l.trim()).at(-1) ?? "";
-        out.push({
-          sid: r.sid,
-          name: r.name,
-          cwd: r.cwd,
-          model: modelLabel(r),
-          state: state ?? "idle",
-          origin: r.origin,
-          createdAt: r.created_at * 1000,
-          lastSeen: r.last_seen * 1000,
-          lastLine,
-        });
-      }
-      return out;
+      await opened;
+      const rows = [...map.rows()].filter((r) => r.conversation_id != null).reverse(); // newest first
+      return Promise.all(
+        rows.map(async (r) => {
+          let state = states.get(r.sid) ?? "idle";
+          let lastLine = "";
+          try {
+            state = await stateOf(r.sid, r.conversation_id);
+            const w = live.get(r.sid);
+            if (w?.view) lastLine = lastLineOf(w.view.entries);
+            else if (lastLines.has(r.sid)) lastLine = lastLines.get(r.sid);
+            else {
+              const conv = await durable.harness.conversation(r.conversation_id, ctx());
+              const page = conv ? await conv.entries({}, 20, undefined, ctx()) : { items: [] };
+              lastLine = lastLineOf([...page.items].reverse());
+              lastLines.set(r.sid, lastLine);
+            }
+          } catch (err) {
+            log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
+          }
+          return {
+            sid: r.sid,
+            name: r.name,
+            cwd: r.cwd,
+            model: modelLabel(r),
+            state,
+            origin: r.origin,
+            createdAt: r.created_at * 1000,
+            lastSeen: r.last_seen * 1000,
+            lastLine,
+          };
+        }),
+      );
     },
 
     /**
@@ -566,11 +668,13 @@ export function createDurableProvider(
         return;
       }
       if (abort) {
-        for (const [sid, state] of states) {
-          if (state !== "busy") continue;
-          const { conv } = await conversationOf(sid).catch(() => ({}));
-          await conv?.abort(durable.ctx).catch(() => {});
-        }
+        const busy = [...states].filter(([, s]) => s === "busy").map(([sid]) => sid);
+        await Promise.all(
+          busy.map(async (sid) => {
+            const { conv } = await conversationOf(sid).catch(() => ({}));
+            await conv?.abort(durable.ctx).catch(() => {});
+          }),
+        );
       }
       for (const sid of [...live.keys()]) stopWatcher(sid);
       await durable.close();
@@ -582,6 +686,9 @@ export function createDurableProvider(
       return durable?.harness;
     },
     _live: live,
+    _lastLines: lastLines,
+    _idleWaiters: idleWaiters,
+    _untilIdle: untilIdle,
   };
 
   return provider;

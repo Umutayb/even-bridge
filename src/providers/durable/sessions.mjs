@@ -9,7 +9,9 @@ import { basename, dirname } from "node:path";
 import { expandHome } from "./models.mjs";
 
 const ORIGINS = new Set(["evenai", "phone"]);
-const COLUMNS = "sid, conversation_id, name, cwd, model_provider, model_id, created_at, last_seen, origin, archived";
+const COLUMNS = "sid, conversation_id, name, cwd, model_provider, model_id, created_at, last_seen, origin, archived, max_turns";
+export const REQUEST_TTL_S = 7 * 86400;
+const PAGE = 200;
 
 export const sessionMapPath = (storePath) => expandHome(storePath) + ".sessions.sqlite";
 
@@ -18,9 +20,10 @@ const nowSeconds = () => Math.floor(Date.now() / 1000);
 export class SessionMap {
   /**
    * @param {string} storePath Durable's store path; the map opens `storePath + ".sessions.sqlite"`.
-   * @param {{ now?: () => number }} [opts] clock in epoch seconds (tests).
+   * @param {{ now?: () => number, requestTtlS?: number }} [opts] clock in epoch seconds (tests);
+   *   request rows older than `requestTtlS` are pruned on open.
    */
-  constructor(storePath, { now = nowSeconds } = {}) {
+  constructor(storePath, { now = nowSeconds, requestTtlS = REQUEST_TTL_S } = {}) {
     this.now = now;
     this.path = sessionMapPath(storePath);
     mkdirSync(dirname(this.path), { recursive: true });
@@ -37,8 +40,12 @@ export class SessionMap {
       created_at INTEGER NOT NULL,
       last_seen INTEGER NOT NULL,
       origin TEXT NOT NULL CHECK (origin IN ('evenai', 'phone')),
-      archived INTEGER NOT NULL DEFAULT 0
+      archived INTEGER NOT NULL DEFAULT 0,
+      max_turns INTEGER
     )`);
+    // Maps created before max_turns existed.
+    const cols = this.db.prepare("PRAGMA table_info(sessions)").all().map((c) => c.name);
+    if (!cols.includes("max_turns")) this.db.exec("ALTER TABLE sessions ADD COLUMN max_turns INTEGER");
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_conversation ON sessions (conversation_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_created ON sessions (archived, created_at)");
     // Which session a new-session request created, so a retried prompt with the
@@ -48,8 +55,10 @@ export class SessionMap {
       sid TEXT NOT NULL,
       created_at INTEGER NOT NULL
     )`);
+    this.db.prepare("DELETE FROM requests WHERE created_at < ?").run(this.now() - requestTtlS);
     this.stmt = {
-      insert: this.db.prepare(`INSERT INTO sessions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`),
+      insert: this.db.prepare(`INSERT INTO sessions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`),
+      page: this.db.prepare(`SELECT rowid AS _rowid, ${COLUMNS} FROM sessions WHERE archived = 0 AND last_seen >= ? AND rowid > ? ORDER BY rowid LIMIT ?`),
       get: this.db.prepare(`SELECT ${COLUMNS} FROM sessions WHERE sid = ?`),
       byConversation: this.db.prepare(`SELECT ${COLUMNS} FROM sessions WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 1`),
       list: this.db.prepare(`SELECT ${COLUMNS} FROM sessions WHERE archived = 0 ORDER BY created_at DESC, rowid DESC LIMIT ?`),
@@ -63,12 +72,12 @@ export class SessionMap {
   }
 
   /** @returns {string} the new sid ("dur-" + uuid). */
-  create({ name, cwd, modelRef, origin, conversationId = null }) {
+  create({ name, cwd, modelRef, origin, conversationId = null, maxTurns = null }) {
     if (!ORIGINS.has(origin)) throw new Error(`invalid origin ${JSON.stringify(origin)}: expected evenai|phone`);
     const sid = "dur-" + randomUUID();
     if (!name) name = (cwd && basename(cwd)) || "agent";
     const t = this.now();
-    this.stmt.insert.run(sid, conversationId, name, cwd, modelRef?.provider ?? null, modelRef?.modelId ?? null, t, t, origin);
+    this.stmt.insert.run(sid, conversationId, name, cwd, modelRef?.provider ?? null, modelRef?.modelId ?? null, t, t, origin, maxTurns);
     return sid;
   }
 
@@ -84,6 +93,23 @@ export class SessionMap {
   list({ limit = 100, cwd } = {}) {
     const rows = cwd ? this.stmt.listCwd.all(cwd, limit) : this.stmt.list.all(limit);
     return rows.map(plain);
+  }
+
+  /**
+   * Every non-archived row seen at or after `seenSince` (epoch s), oldest first,
+   * read in pages so a large map is never loaded at once.
+   */
+  *rows({ seenSince = 0, pageSize = PAGE } = {}) {
+    let after = 0;
+    for (;;) {
+      const page = this.stmt.page.all(seenSince, after, pageSize);
+      for (const r of page) {
+        after = r._rowid;
+        const { _rowid, ...row } = r;
+        yield row;
+      }
+      if (page.length < pageSize) return;
+    }
   }
 
   /** Record the Durable conversation once it has been created. */

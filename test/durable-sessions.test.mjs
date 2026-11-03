@@ -27,14 +27,14 @@ test("session map lives in its own file next to the Durable store", () => {
 });
 
 test("create then get round-trips the row", () => {
-  const { map } = freshMap(clock(5000));
+  const { map } = freshMap(clock(4999)); // the constructor reads the clock once (request pruning)
   const sid = map.create({ name: "fix-tests", cwd: "/home/ay/github/x", modelRef: QWEN, origin: "evenai", conversationId: 7 });
   assert.match(sid, /^dur-[0-9a-f-]{36}$/);
   const row = map.get(sid);
   assert.deepEqual(row, {
     sid, conversation_id: 7, name: "fix-tests", cwd: "/home/ay/github/x",
     model_provider: "lets-code", model_id: "qwen3.8-27b",
-    created_at: 5000, last_seen: 5000, origin: "evenai", archived: 0,
+    created_at: 5000, last_seen: 5000, origin: "evenai", archived: 0, max_turns: null,
   });
   assert.equal(map.get("dur-missing"), undefined);
   map.close();
@@ -177,4 +177,35 @@ test("noteRequest remembers which session a request created, across reopen", () 
   const m2 = new SessionMap(storePath);
   assert.equal(m2.sidForRequest("req-1"), sid);
   m2.close();
+});
+
+test("request rows older than 7 days are pruned on open", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dur-req-ttl-"));
+  const storePath = join(dir, "durable.sqlite");
+  let t = 1_000_000;
+  const m1 = new SessionMap(storePath, { now: () => t });
+  m1.noteRequest("old", "dur-a");
+  t += 6 * 86400;
+  m1.noteRequest("recent", "dur-b");
+  m1.close();
+  t += 2 * 86400; // "old" is now 8 days old, "recent" 2
+  const m2 = new SessionMap(storePath, { now: () => t });
+  assert.equal(m2.sidForRequest("old"), undefined);
+  assert.equal(m2.sidForRequest("recent"), "dur-b");
+  m2.close();
+});
+
+test("rows() pages through live rows seen since a cutoff, and max_turns is stored", () => {
+  let t = 100;
+  const { map } = freshMap(() => t);
+  const sids = [];
+  for (let i = 0; i < 5; i++) {
+    t = 100 + i;
+    sids.push(map.create({ name: `r${i}`, cwd: "/w", modelRef: QWEN, origin: "phone", maxTurns: i + 1 }));
+  }
+  map.archive(sids[4]);
+  assert.deepEqual([...map.rows({ pageSize: 2 })].map((r) => r.sid), sids.slice(0, 4));
+  assert.deepEqual([...map.rows({ seenSince: 102, pageSize: 2 })].map((r) => r.sid), sids.slice(2, 4));
+  assert.equal(map.get(sids[2]).max_turns, 3);
+  map.close();
 });
