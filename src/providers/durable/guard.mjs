@@ -1,9 +1,10 @@
 // The guard every Even-AI Durable conversation runs behind.
 //
-// - `confinePath`: a path may only reach the conversation's cwd or /tmp, after
-//   resolving `..`, `~`, `$HOME` and symlinks; ~/.ssh ~/.aws ~/.config
-//   ~/.even-terminal ~/.pi ~/.gnupg and /etc are refused even when a symlink
-//   under an allowed root leads there.
+// - `confinePath`: a write may only reach the conversation's cwd or /tmp (a
+//   read also the system dirs), after resolving `..`, `~`, `$HOME` and
+//   symlinks; ~/.ssh ~/.aws ~/.config ~/.even-terminal ~/.pi ~/.gnupg and the
+//   secret parts of /etc are refused even when a symlink under an allowed root
+//   leads there.
 // - `judgeCommand`: vets a bash command. `RULES` are the deny patterns ported
 //   from lets-code's `judgeBash` (destructive git, sudo, scripts piped into a
 //   shell, ...); on top of that a small lexer follows `cd`, removals, write
@@ -16,6 +17,20 @@
 //
 // `judgeCommand`, `confinePath`, `guardBeforeTool` and `guardPrepare` need no
 // Durable and are unit-tested directly.
+//
+// Reads vs writes: reads may also reach the system dirs (/usr /bin /sbin /lib*
+// /opt /snap /etc /proc/self); writes and removals only cwd and /tmp. Secret
+// system files (/etc/shadow*, /etc/sudoers*, /etc/ssh, ...) are refused for both.
+//
+// Known MVP limits (this is a lexer/regex guard, not a sandbox; real isolation
+// is bwrap, which borealis does not have installed):
+// - Code given to an interpreter is not inspected: `python3 -c`, `node -e`,
+//   `perl -e`, `python3 <<EOF`, or writing a script and then running
+//   `bash file.sh`. Only the denied home dirs are caught there, by name.
+// - RULES also run on the raw text, so `echo "git reset --hard" x` is
+//   blocked too. That over-blocking is intended.
+// - Child conversations (subagents) must map to their parent's cwd; `cwdOf`
+//   is the caller's responsibility.
 
 import { lstatSync, readlinkSync, accessSync, constants as FS } from "node:fs";
 import { homedir } from "node:os";
@@ -25,7 +40,13 @@ import { createBashTool } from "@earendil-works/pi-durable/tools";
 
 const TMP = "/tmp";
 const DENIED_IN_HOME = [".ssh", ".aws", ".config", ".even-terminal", ".pi", ".gnupg"];
-const DENIED_ABS = ["/etc"];
+const DENIED_ABS = ["/etc/ssh", "/etc/ssl/private", "/etc/netplan", "/etc/wpa_supplicant", "/etc/NetworkManager"];
+const DENIED_PREFIX = ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
+const READ_SYSTEM = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/snap", "/etc"];
+const PROC_SELF = "/proc/self";
+// The shell sees only these variables from the bridge's environment (never tokens or keys).
+const ENV_ALLOW = /^(?:PATH|HOME|LANG|LC_\w+|TERM|USER|LOGNAME|SHELL|TMPDIR|NVM_DIR|NODE_\w+|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)$/;
+const ENV_SECRET = /(?:TOKEN|_KEY|SECRET|PASSWORD|PASSWD)$|^(?:LETS_CODE_TOKEN|BRIDGE_TOKEN)$/i;
 const DEVICES = /^\/dev\/(?:null|zero|u?random|stdin|stdout|stderr|tty|fd\/\d+)$/;
 const SECRET_NAME = /^(?:\.env(?:\..*)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|authorized_keys|.*\.(?:pem|key|p12|pfx|jks|keystore))$/;
 const SHELLS = /^(?:sh|bash|zsh|dash|ksh|fish)$/;
@@ -60,7 +81,15 @@ export const RULES = [
   { re: r(`${G}worktree\\s+remove\\b${A}\\s(?:-f|--force)${E}`), why: "git worktree remove -f discards work" },
   { re: r(`${G}config\\b${A}\\s(?:--unset-all|--remove-section)${E}`), why: "git config --unset-all/--remove-section is refused" },
   { re: r(`${G}submodule\\s+deinit\\b${A}\\s(?:-f|--force)${E}`), why: "git submodule deinit -f discards work" },
-  { re: /(?<![\w./-])(?:sudo|doas|pkexec)(?![\w.-])/, why: "sudo/doas/pkexec is refused" },
+  { re: /(?<![\w.-])(?:sudo|doas|pkexec)(?![\w./-])/, why: "sudo/doas/pkexec is refused" },
+  { re: /(?<![\w.-])(?:docker|podman|nerdctl)(?![\w./-])(?!\s+(?:ps|images|logs|inspect|version|info)(?=\s|$|[;&|)]))/, why: "container tools are refused (docker group membership is root-equivalent)" },
+  { re: /(?<![\w.-])(?:nsenter|unshare|chroot)(?![\w./-])/, why: "namespace and chroot tools are refused" },
+  { re: /(?<![\w.-])(?:pkill|killall|loginctl|crontab|systemd-run)(?![\w./-])/, why: "process, session and scheduler control is refused" },
+  { re: r(`(?<![\\w.-])kill\\b${A}\\s(?:--\\s+)?-1${E}`), why: "kill -1 signals every process" },
+  { re: r(`(?<![\\w.-])kill\\b${A}(?:\\$\\(|\`)`), why: "kill with a computed target cannot be checked" },
+  { re: r(`(?<![\\w.-])(?:ba|z|da|k|fi)?sh(?![\\w./-])${A}<<<`), why: "a here-string fed to a shell cannot be checked; use bash -c '...'" },
+  { re: r(`${G}config\\b${A}\\s--(?:global|system)${E}`), why: "git config --global/--system is refused" },
+  { re: /\bgit\b[^;&|\n]*\s(?:-c\s*|--config-env[= ])["']?(?:core\.(?:sshcommand|pager|editor|hookspath|fsmonitor|gitproxy|askpass)|credential\.|alias\.|protocol\.|uploadpack\.|diff\.\S*\.textconv|filter\.)/i, why: "git -c that runs commands (core.sshCommand, pager, hooksPath, credential.helper, ...) is refused" },
   { re: /(?:^|[;&|(\n]|\$\()\s*su(?=\s|$)/, why: "su is refused" },
   { re: r(`\\|\\s*(?:env\\s+)?(?:\\S*\\/)?(?:ba|z|da|k|fi)?sh${E}(?!${A}\\s-c\\b)`), why: "a script piped into a shell cannot be checked; use bash -c '...' or a heredoc" },
   { re: /\b(?:curl|wget)\b[^;&\n]*\|\s*(?:\S*\/)?(?:python[\d.]*|perl|ruby|node|php)\b/, why: "a downloaded script piped into an interpreter is refused" },
@@ -73,6 +102,7 @@ export const RULES = [
   { re: /:\(\)\s*\{\s*:\s*\|\s*:/, why: "fork bomb" },
   { re: /(?:^|[;&|(\n]|\$\()\s*(?:shutdown|reboot|poweroff|halt)(?=\s|$)/, why: "powering the host off is refused" },
   { re: r(`\\bsystemctl\\b${A}\\s(?:start|stop|restart|reload|kill|disable|enable|mask|isolate|poweroff|reboot)${E}`), why: "service control is refused" },
+  { re: r(`\\bsystemctl\\b${A}\\s--user${E}`), why: "systemctl --user is refused" },
 ];
 
 // ================================================================ paths
@@ -115,12 +145,13 @@ function expandHome(p, home) {
 const tilde = (p, home) => (within(p, home) ? "~" + p.slice(home.length) : p);
 
 /**
- * May `p` (relative to `cwd`) be touched? Allowed roots are `cwd` and /tmp; the denied
+ * May `p` (relative to `cwd`) be touched? `mode` "write" (default): cwd and /tmp only;
+ * "read": also /usr /bin /sbin /lib* /opt /snap /etc and (lexically) /proc/self. The denied
  * dirs are refused even under an allowed root, also when reached through a symlink.
  * `base` (default `cwd`) is where a relative `p` starts, e.g. after a `cd` in a command.
  * @returns {{ ok: boolean, why?: string, real?: string }}
  */
-export function confinePath(p, cwd, home = homedir(), { tmp = TMP, base = cwd } = {}) {
+export function confinePath(p, cwd, home = homedir(), { tmp = TMP, base = cwd, mode = "write" } = {}) {
   if (typeof p !== "string" || p === "") return { ok: false, why: "no path" };
   const expanded = expandHome(p, home);
   if (expanded === null) return { ok: false, why: `cannot tell where '${p}' points` };
@@ -134,9 +165,12 @@ export function confinePath(p, cwd, home = homedir(), { tmp = TMP, base = cwd } 
     const dr = resolveReal(d) ?? d;
     if (within(real, dr) || within(real, d) || within(lexical, d)) return { ok: false, why: `${tilde(d, home)} is off limits`, real };
   }
+  for (const d of DENIED_PREFIX) if (real.startsWith(d) || lexical.startsWith(d)) return { ok: false, why: `${d}* is off limits`, real };
   const roots = [realCwd, resolveReal(tmp) ?? tmp];
-  if (!roots.some((root) => within(real, root))) return { ok: false, why: `'${p}' is outside the workspace (${tilde(realCwd, home)} and ${tmp})`, real };
-  return { ok: true, real };
+  if (roots.some((root) => within(real, root))) return { ok: true, real };
+  if (mode === "read" && (READ_SYSTEM.some((root) => within(real, resolveReal(root) ?? root)) || within(lexical, PROC_SELF))) return { ok: true, real };
+  const where = mode === "read" ? "the workspace, /tmp and the system dirs" : `the workspace (${tilde(realCwd, home)} and ${tmp})`;
+  return { ok: false, why: `'${p}' is outside ${where}${mode === "write" ? " for writing" : ""}`, real };
 }
 
 // ================================================================ lexing
@@ -144,14 +178,19 @@ export function confinePath(p, cwd, home = homedir(), { tmp = TMP, base = cwd } 
 function stripHeredocs(src) {
   const lines = src.replace(/\\\n/g, " ").split("\n");
   const out = [];
+  const shellBodies = [];  // bodies fed to a shell (`bash <<EOF`): those are scripts
   for (let i = 0; i < lines.length; i++) {
-    out.push(lines[i]);
-    const docs = [...lines[i].matchAll(/<<(?!<)(-?)\s*(['"]?)([\w.-]+)\2/g)];
+    const line = lines[i];
+    out.push(line);
+    const toShell = /(?<![\w.-])(?:ba|z|da|k|fi)?sh(?![\w./-])[^|;&<]*<<(?!<)/.test(line.replace(/[\\'"]/g, ""));
+    const docs = [...line.matchAll(/<<(?!<)(-?)\s*(['"]?)([\w.-]+)\2/g)];
     for (const [, dash, , delim] of docs) {
-      while (++i < lines.length && (dash ? lines[i].replace(/^\t+/, "") : lines[i]) !== delim);
+      const body = [];
+      while (++i < lines.length && (dash ? lines[i].replace(/^\t+/, "") : lines[i]) !== delim) body.push(lines[i]);
+      if (toShell) shellBodies.push(body.join("\n"));
     }
   }
-  return out.join("\n");
+  return { text: out.join("\n"), shellBodies };
 }
 
 /** Index of the `)` matching the `(` at `i`, skipping quoted text. */
@@ -190,6 +229,7 @@ function lex(src) {
     if (seg.argv.length || seg.writes.length || seg.reads.length) out.push(seg);
     seg = { argv: [], writes: [], reads: [] };
   };
+  // Note: `seg.piped` (stdin from a `|`) and `seg.herestring` (`<<<`) ride on the segment.
   const nested = (inner) => { out.push({ open: true }, ...lex(inner), { close: true }); };
   // `$(..)` / `<(..)` / `>(..)` at `i` (pointing at the `(`): lex the inside, return the end.
   const substitution = (i) => { const j = matchParen(src, i); nested(src.slice(i + 1, j)); return j; };
@@ -218,13 +258,14 @@ function lex(src) {
       if (c === "&" && src[i + 1] === ">") { endTok(); redir = "write"; i++; if (src[i + 1] === ">") i++; continue; }
       endSeg();
       if ((c === "|" || c === "&") && src[i + 1] === c) i++;
+      else if (c === "|") { if (src[i + 1] === "&") i++; seg.piped = true; }
       continue;
     }
     if (c === ">" || c === "<") {
       if (tok !== null && /^\d+$/.test(tok)) tok = null;  // fd number: 2>
       endTok();
       if (c === "<" && src[i + 1] === "<") {
-        if (src[i + 2] === "<") { i += 2; redir = "skip"; continue; }  // here-string: data
+        if (src[i + 2] === "<") { i += 2; redir = "skip"; seg.herestring = true; continue; }  // here-string
         i++; if (src[i + 1] === "-") i++; redir = "skip"; continue;   // heredoc delimiter
       }
       if (c === ">" && (src[i + 1] === ">" || src[i + 1] === "|")) i++;
@@ -288,8 +329,9 @@ export function judgeCommand(cmd, cwd, home = homedir(), { tmp = TMP } = {}) {
 
 function judge(cmd, cwd0, home, tmp, depth) {
   if (depth > MAX_DEPTH) return "commands nested too deeply to check";
-  const text = stripHeredocs(cmd);
+  const { text, shellBodies } = stripHeredocs(cmd);
   for (const rule of RULES) if (rule.re.test(text)) return rule.why;
+  for (const body of shellBodies) { const v = judge(body, cwd0, home, tmp, depth + 1); if (v) return v; }
   // A denied dir named anywhere, also inside quoted interpreter code (`python -c "open('~/.ssh/..')"`).
   for (const d of DENIED_IN_HOME) {
     const tail = d.replace(/\./g, "\\.") + "(?![\\w.-])";
@@ -297,8 +339,11 @@ function judge(cmd, cwd0, home, tmp, depth) {
     if (new RegExp(`(?:${homes.join("|")})/+${tail}`).test(text)) return `~/${d} is off limits`;
   }
 
-  const confine = (p, base) => confinePath(p, cwd0, home, { tmp, base });
-  const roots = () => [resolveReal(resolve(cwd0)), resolveReal(tmp) ?? tmp];
+  const confine = (p, base, mode = "write") => confinePath(p, cwd0, home, { tmp, base, mode });
+  const realCwd0 = resolveReal(resolve(cwd0));
+  const realTmp = resolveReal(tmp) ?? tmp;
+  // Recursive removal: strictly inside the workspace, or at least two levels below /tmp.
+  const removableRecursively = (real) => inside(real, realCwd0) || (inside(real, realTmp) && real.slice(realTmp.length + 1).split(sep).filter(Boolean).length >= 2);
   const UNKNOWN = null;
   let cwd = cwd0;
   const stack = [];
@@ -313,8 +358,8 @@ function judge(cmd, cwd0, home, tmp, depth) {
   const checkToken = (raw) => {
     const t = expand(raw);
     if (DEVICES.test(t) || !pathLike(t) || unresolved(t)) return undefined;
-    if (cwd === UNKNOWN) return isAbsolute(t) || t.startsWith("~") ? (confine(t, cwd0).ok ? undefined : confine(t, cwd0).why) : `cannot tell what '${raw}' refers to after an unresolved cd`;
-    const res = confine(t, cwd);
+    if (cwd === UNKNOWN && !isAbsolute(t) && !t.startsWith("~")) return `cannot tell what '${raw}' refers to after an unresolved cd`;
+    const res = confine(t, cwd ?? cwd0, "read");
     return res.ok ? undefined : res.why;
   };
   const checkWrite = (raw) => {
@@ -338,16 +383,18 @@ function judge(cmd, cwd0, home, tmp, depth) {
     if (basename(t) === ".git" || /(?:^|\/)\.git(?:\/|$)/.test(res.real)) return `${name} ${raw}: removing .git is refused`;
     if (glob) {
       if (recursive && within(cwd, res.real) && globRe(basename(t)).test(".git")) return `${name} ${raw}: the pattern would take .git`;
+      if (recursive && res.real === realTmp) return `${name} ${raw}: emptying /tmp is refused`;
       return undefined;
     }
-    if (recursive && !roots().some((root) => inside(res.real, root))) return `${name} -r ${raw}: only paths inside the workspace or /tmp may be removed recursively`;
+    if (recursive && !removableRecursively(res.real)) return `${name} -r ${raw}: only paths inside the workspace or two levels below /tmp may be removed recursively`;
     return undefined;
   };
 
   const segs = lex(text);
+  let prevWords = "";
   for (const seg of segs) {
-    if (seg.open) { stack.push(cwd); continue; }
-    if (seg.close) { if (stack.length) cwd = stack.pop(); continue; }
+    if (seg.open) { stack.push(cwd); prevWords = ""; continue; }
+    if (seg.close) { if (stack.length) cwd = stack.pop(); prevWords = ""; continue; }
     for (const w of seg.writes) { const v = checkWrite(w); if (v) return v; }
     for (const rd of seg.reads) { const v = checkToken(rd); if (v) return v; }
 
@@ -362,8 +409,23 @@ function judge(cmd, cwd0, home, tmp, depth) {
       if (argv.length === 1 || argv.every((a) => /^\w+=/.test(a))) vars[m[1]] = expand(m[2]);
     }
     argv = unwrapArgv(argv.slice(k));
-    if (!argv.length) continue;
-    const name = basename(argv[0]);
+    if (!argv.length) { prevWords = ""; continue; }
+    // The program word must be literal: `$G push`, `$(..) push`, `"" push` cannot be checked.
+    const prog = expand(argv[0]);
+    if (prog === "" || unresolved(prog)) return `cannot tell which program '${argv[0]}' runs; use a literal name`;
+    // RULES again on the dequoted, expanded words: `"git" push "--force"`, `g\\it`, `--hard""`.
+    const words = argv.map(expand).join(" ");
+    const joined = seg.piped && prevWords ? `${prevWords} | ${words}` : words;
+    prevWords = words;
+    for (const rule of RULES) if (rule.re.test(joined)) return rule.why;
+    const name = basename(prog);
+    if (seg.herestring && SHELLS.test(name)) return "a here-string fed to a shell cannot be checked; use bash -c '...'";
+    if (name === "git") {
+      const ga = argv.slice(1);
+      let gi = 0;
+      while (gi < ga.length && ga[gi].startsWith("-")) gi += /^-[Cc]$|^--(?:git-dir|work-tree|namespace|config-env)$/.test(ga[gi]) ? 2 : 1;
+      if (gi < ga.length && unresolved(expand(ga[gi]))) return `cannot tell which git command '${ga[gi]}' is; use a literal verb`;
+    }
 
     for (const t of argv) {
       const v = checkToken(t) ?? (/^-{0,2}[\w-]+=(.+)$/.test(t) ? checkToken(t.slice(t.indexOf("=") + 1)) : undefined);
@@ -376,7 +438,7 @@ function judge(cmd, cwd0, home, tmp, depth) {
       const d = expand(args[0]);
       if (args[0] === "-" || unresolved(d) || hasGlob(d)) { cwd = UNKNOWN; continue; }
       if (cwd === UNKNOWN && !isAbsolute(d) && !d.startsWith("~")) continue;
-      const res = confine(d, cwd ?? cwd0);
+      const res = confine(d, cwd ?? cwd0, "read");
       if (!res.ok) return `cd ${args[0]}: ${res.why}`;
       cwd = res.real;
       continue;
@@ -460,17 +522,29 @@ export function detectWrapper({ env = process.env, which = (bin) => onPath(bin, 
 
 const DEFAULT_CAPS = { memoryMax: "600M", cpuQuota: "200%" };
 
+/**
+ * The shell's environment: the allowlisted variables of `baseEnv` (PATH, HOME, LANG, LC_*,
+ * NODE_*, ...; XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS so `systemd-run --user` works)
+ * plus what the caller set, minus anything that looks like a token, key or secret.
+ */
+export function shellEnv(own = {}, baseEnv = process.env) {
+  const env = {};
+  for (const [k, v] of Object.entries(baseEnv)) if (ENV_ALLOW.test(k) && !ENV_SECRET.test(k) && v !== undefined) env[k] = v;
+  for (const [k, v] of Object.entries(own ?? {})) if (!ENV_SECRET.test(k)) env[k] = v;
+  return env;
+}
+
 /** Rewrite a bash execution (`{command, cwd, env, inheritEnv}`) to run under the wrapper. */
-export function guardPrepare(execution, { wrapper = "none", caps = DEFAULT_CAPS } = {}) {
+export function guardPrepare(execution, { wrapper = "none", caps = DEFAULT_CAPS, baseEnv = process.env } = {}) {
   const cmd = execution.command;
+  execution.env = shellEnv(execution.env, baseEnv);
+  execution.inheritEnv = false;
   if (wrapper === "systemd-run") {
     const { memoryMax, cpuQuota } = { ...DEFAULT_CAPS, ...caps };
     execution.command = `systemd-run --user --scope -q -p MemoryMax=${memoryMax} -p CPUQuota=${cpuQuota} -- bash -lc ${SHQ(cmd)}`;
-    // `--user` talks to the user manager over XDG_RUNTIME_DIR; keep it in a non-inherited env.
-    if (!execution.inheritEnv && execution.env && !execution.env.XDG_RUNTIME_DIR && process.env.XDG_RUNTIME_DIR) execution.env.XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR;
   } else if (wrapper === "bwrap") {
     const cwd = execution.cwd;
-    execution.command = `bwrap --ro-bind / / --bind ${cwd} ${cwd} --bind /tmp /tmp --dev /dev --proc /proc --unshare-all --share-net --die-with-parent -- bash -lc ${SHQ(cmd)}`;
+    execution.command = `bwrap --ro-bind / / --bind ${SHQ(cwd)} ${SHQ(cwd)} --bind /tmp /tmp --dev /dev --proc /proc --unshare-all --share-net --die-with-parent -- bash -lc ${SHQ(cmd)}`;
   }
   return execution;
 }
@@ -490,7 +564,7 @@ export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = 
   if (!cwd) why = "no workspace is known for this conversation";
   else if (name === "bash") why = judgeCommand(args.command, cwd, home, { tmp }).block;
   else {
-    const res = confinePath(args.path, cwd, home, { tmp });
+    const res = confinePath(args.path, cwd, home, { tmp, mode: name === "read" ? "read" : "write" });
     if (!res.ok) why = res.why;
     else if (name !== "read" && SECRET_NAME.test(basename(res.real))) why = `writing '${basename(res.real)}' (env files and keys) is refused`;
     else if (name !== "read" && /(?:^|\/)\.git(?:\/|$)/.test(res.real)) why = "writing inside .git is refused; use git commands instead";
@@ -504,7 +578,9 @@ export function guardBeforeTool(call, { cwd, home = homedir(), tmp = TMP, log = 
 /**
  * The Durable extension. Install after CodingTools so its `bash` (with `prepare`) wins.
  * @param {object} o
- * @param {(conversationId: unknown) => string|undefined} o.cwdOf
+ * @param {(conversationId: unknown) => string|undefined} o.cwdOf the workspace of a
+ *   conversation. The caller owns this mapping: a child conversation (a subagent, Task 7)
+ *   must map to its parent's cwd, and an unknown conversation must return undefined (blocks).
  */
 export function createGuardExtension({ cwdOf, caps = DEFAULT_CAPS, wrapper = detectWrapper(), home = homedir(), tmp = TMP, log } = {}) {
   return defineExtension({
