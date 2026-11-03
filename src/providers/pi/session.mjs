@@ -187,7 +187,7 @@ export class PiSession {
       this.opts.onExit?.(this, { code, signal });
     });
     client.on("error", (err) => {
-      console.error(`[pi] spawn error: ${err.message}`);
+      console.error(`[pi] spawn error: ${err.message} (cwd=${this.opts.cwd ?? process.cwd()})`);
       this.send({ type: "error", message: `pi failed to start: ${err.message}` });
       this.opts.onExit?.(this, { code: null, signal: null, error: err.message });
     });
