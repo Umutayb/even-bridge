@@ -194,6 +194,30 @@ A bridge shutdown does not abort running agents: their runs stay pending in
 the store and resume on the next start. On SIGTERM/SIGINT the bridge waits
 up to 3 s for the store to close. Rollback = unset the flag and restart.
 
+### lets-code engine and overseer (opt-in, read at restart)
+
+Both need `EVEN_BRIDGE_DURABLE_ENABLE=1`; with them unset the behavior and the
+wire output are those of `main`. Details, the dialog policy, the action gate,
+the restart sequence, accepted limits and rollback per flag: `docs/durable.md`.
+Operator deploy checklist: `docs/deploy-overseer.md`.
+
+| env | default | meaning |
+| --- | --- | --- |
+| `EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE` | off | `1` adds the lets-code engine: `engine: "lets-code"` on `POST /api/prompt` runs the agent in an owned `lets-code --mode rpc` child (`--mandate ask --subagents --sandbox`, even-guard) inside the scope `even-lc-<sid>`; `GET /api/agents` then advertises `engines` |
+| `EVEN_BRIDGE_LC_BIN` | `EVEN_BRIDGE_PI_BIN`, else `lets-code` | the lets-code launcher |
+| `EVEN_BRIDGE_LC_MAX_LIVE` | `1` | live lets-code children at once (else 429) |
+| `EVEN_BRIDGE_LC_MEMORY_MAX` | `500M` | `MemoryMax` (with `MemorySwapMax=0`) of each child's scope, when the kernel has a memory controller |
+| `EVEN_BRIDGE_LC_SANDBOX` | on | `0` drops lets-code's `--sandbox` (tests only); without `bwrap` and `socat` every lets-code start is a 503 |
+| `EVEN_BRIDGE_OVERSEER_ENABLE` | off | `1` adds the overseer: the root conversation `dur-overseer` (qwen, no coding tools), `/api/overseer/*` (ask, outbox, sessions, gated actions with confirm/deny), `overseer: true` on `GET /api/agents` |
+| `EVEN_BRIDGE_OVERSEER_AUDIT` | `~/.even-terminal/overseer-actions.log` | the action audit log (JSONL, 0600) |
+| `EVEN_BRIDGE_OVERSEER_HANDOFF` | off | `1` accepts overnight hand-offs on a told ask (no producer exists yet; leave off) |
+
+The startup line gains `lc=on(sandbox|nosandbox|sandbox-missing,mem|nomem)` /
+`lc=off` after `wrapper=…`, and `, overseer=on` / `, overseer=failed: <reason>`
+when the overseer flag is set. The factory (lets-code orchestration) stays
+disabled: its experts are not enabled on the host, so every factory request
+answers 409 `experts_disabled`.
+
 ## Live settings (`~/.even-terminal/bridge.env`)
 
 `KEY=VALUE` lines, loaded before anything else at startup and re-read within
@@ -451,6 +475,9 @@ src/providers/durable/       Pi Durable agents (EVEN_BRIDGE_DURABLE_ENABLE=1)
   wire.mjs                   conversation views → the bridge's wire frames
   guard.mjs                  path confinement, command vetting, resource caps
   provider.mjs               durable provider (pi provider contract + agents)
+  lc/                        lets-code engine (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1)
+src/overseer/                the overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1)
+src/session-twins.mjs        the RC-twin rule shared by /api/sessions and the overseer inventory
 test/                        node:test suites (hermetic, no real provider state)
 scripts/onboard.sh           first-time onboarding flow (run as the user)
 scripts/setup-claude-wrap.sh install/switch/remove the claude shell wrapper
@@ -489,6 +516,14 @@ Bridge-only additions (durable; only with `EVEN_BRIDGE_DURABLE_ENABLE=1`):
 - Both `/api/agents` routes need the bridge token like every `/api/*` route.
   With the flag off they fall through to the official router exactly as
   before they existed (its 404).
+- With the lets-code engine: `engine` (`native` | `lets-code`) and `factory`
+  on `POST /api/prompt`, `POST /api/agents/:sid/factory {on, ticket?,
+  howToRun?}`, and `engines` on `GET /api/agents`.
+- With the overseer: `POST /api/overseer/ask`, `GET /api/overseer/outbox`,
+  `POST /api/overseer/outbox/read`, `GET /api/overseer/sessions[?all=1]`,
+  `GET|POST /api/overseer/actions`, `POST /api/overseer/actions/:id/confirm`,
+  `POST /api/overseer/actions/:id/deny`; origin `overseer` on agents. Without
+  the flag they fall through. See `docs/durable.md`.
 
 ## Development
 

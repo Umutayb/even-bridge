@@ -52,10 +52,14 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE` | off | `1` adds the lets-code engine (needs `EVEN_BRIDGE_DURABLE_ENABLE=1`): a prompt with `engine: "lets-code"` runs in an owned `lets-code --mode rpc` child (`--mandate ask --subagents --sandbox`, `-e even-guard.ts`) inside the scope `even-lc-<sid>`; banner `lc=on(sandbox,mem|nomem)` / `lc=off` |
 | `EVEN_BRIDGE_LC_BIN` | `EVEN_BRIDGE_PI_BIN`, else `lets-code` | the lets-code launcher (`pi-inference` works too) |
 | `EVEN_BRIDGE_LC_MAX_LIVE` | `1` | live lets-code children at once (an idle-kept child makes room; otherwise 429) |
-| `EVEN_BRIDGE_LC_MEMORY_MAX` | `500M` | `MemoryMax` of `even-lc-<sid>.scope`, applied only when `/sys/fs/cgroup/cgroup.controllers` lists `memory` (not on borealis today: one startup warning, banner `nomem`) |
+| `EVEN_BRIDGE_LC_MEMORY_MAX` | `500M` | `MemoryMax` (plus `MemorySwapMax=0`) of `even-lc-<sid>.scope`, applied only when `/sys/fs/cgroup/cgroup.controllers` lists `memory` (borealis has it since 2026-11-03: banner `mem`; without it one startup warning and banner `nomem`) |
 | `EVEN_BRIDGE_LC_SANDBOX` | on | `0` drops lets-code's `--sandbox` (tests only); on and without `bwrap`+`socat`, every lets-code start answers 503 |
+| `EVEN_BRIDGE_OVERSEER_ENABLE` | off | `1` adds the overseer (needs `EVEN_BRIDGE_DURABLE_ENABLE=1`; it does not need the lets-code engine): the root conversation `dur-overseer`, `/api/overseer/*`, `overseer: true` on `GET /api/agents`; banner `, overseer=on` / `, overseer=failed: …` (the part is absent while the flag is unset). See *The overseer* below |
+| `EVEN_BRIDGE_OVERSEER_AUDIT` | `~/.even-terminal/overseer-actions.log` | the action audit file (JSONL, 0600); throwaway instances point it at their own dir |
+| `EVEN_BRIDGE_OVERSEER_HANDOFF` | off | `1` accepts overnight hand-offs (`POST /api/overseer/ask {mode:"tell", handoff}`); off: `400 hand-offs are off`. Leave off until a producer (Ideate) exists |
 
-All of them are read at startup only.
+All of them are read at startup only. With every flag of this table unset the behavior and the wire output
+are those of `main` (tests assert that no `src/providers/durable/lc/` or `src/overseer/` module is loaded).
 
 ## Limits
 
@@ -175,6 +179,31 @@ zram; `--collect` plus a
 `systemctl --user reset-failed even-lc-<sid>.scope` before each spawn: a scope that an
 OOM kill left failed never blocks the next spawn's unit name).
 
+**The factory stays DISABLED on the live bridge** until a separate confinement task ("3b") lands:
+host-level confinement of the lets-code child (bwrap or a `systemd-run --user` service that hides
+`~/.ssh`, `~/.even-terminal` and `~/.pi`, with writes only under `~/sandbox/agents` and the factory
+root; even-guard as a global pi extension that stays inert without `EVEN_GUARD_CWD`). Until then the
+five factory experts stay off in `~/.pi/agent/lets-code-state.json`, so every factory request (voice
+`agent_factory`, `factory: true` on a new agent, `POST /api/agents/:sid/factory {on:true}`) answers 409
+`experts_disabled`, and the overseer can never propose one. Do not run `/experts enable` on borealis.
+
+- **Run model (ruling 1).** One background task `even.lc-run` per busy period drives the child;
+  the record is the conversation doc `even.lc-session` plus `lc.user` / `lc.answer` / `lc.tool`
+  entries (at most 20 `lc.tool` per run). Idle sessions hold no process and no task; the child is
+  kept `LC_IDLE_KEEP_MS` = 120 s after a run and then stopped; the next prompt re-spawns it with
+  `--session <file>`. At most `EVEN_BRIDGE_LC_MAX_LIVE` children live at once (an idle-kept one is
+  stopped to make room, otherwise 429).
+- **Dialog policy.** What lets-code asks reaches the phone and glasses as frames on the agent's
+  session; nothing is auto-approved:
+  - a mandate `ask` (e.g. a write outside the project) → one `permission_request` Yes/No (Yes =
+    `Allow once`, No = `Deny`; an "allow always" also becomes `Allow once`);
+  - a factory checkpoint → a `user_question` without `Edit` or `Cancel`, **held** (never answered
+    by a timeout);
+  - an `editor` dialog → answered `cancelled`, nothing shown (glasses cannot edit text);
+  - a `confirm` / mandate `select` with no client attached is denied after 10 min
+    (`LC_CONFIRM_DENY_MS`); while a client watches it waits;
+  - lets-code's "Enable the factory's experts?" and "Enable the <name> expert?" confirms are
+    answered No by the bridge (error frame `factory experts must be enabled by the operator`).
 - **Child token.** The bridge passes no token or key (allowlisted env). lets-code reads
   `~/.config/lets-code/config` itself and exports `LETS_CODE_TOKEN` to its pi, so that
   variable is in pi's environment anyway; the bridge's own `LETS_CODE_TOKEN` is not needed
@@ -256,6 +285,70 @@ OOM kill left failed never blocks the next spawn's unit name).
   cut-off prompt (or `/factory resume <id>`); an undelivered prompt is sent again as it was.
   A child that crashes while the bridge runs gets a crash prompt after an error frame
   `lets-code exited mid-turn; starting it again (attempt n of 6)`.
+
+## The overseer (`EVEN_BRIDGE_OVERSEER_ENABLE=1`)
+
+Code: `src/overseer/` (`overseer.mjs` root and ask, `extension.mjs` tools, `host.mjs` inventory and
+execute, `actions.mjs` gate, `checkins.mjs` check-ins and the nightly task, `docs.mjs` docs and limits).
+Smoke: `scripts/overseer-smoke.mjs [--actions]`.
+
+- **The root.** The overseer is Durable's root conversation, listed first as the virtual session
+  `dur-overseer` ("Overseer"; chat with it from the phone Terminal). It runs qwen, `maxTurns` 12,
+  with exactly one extension, `even-overseer`, and **no CodingTools**: it cannot run commands or touch
+  files. `stopSession`/`forgetSession` on it answer 403; it never appears in `GET /api/agents` (the
+  shim reaper never sees it). A failed root setup leaves the banner `overseer=failed: …` and the
+  overseer routes fall through.
+- **Tools.** Read-only: `sessions_list {}` (the inventory below, fenced), `session_read {id, n≤20}`
+  (`<<untrusted session output: id>>` … `<<end of untrusted output>>`, ≤ 4096 bytes, cut from the
+  oldest end, `<<`/`>>` inside defused), `notes_get` / `notes_put` (≤ 16 KB, fenced on read), `notify
+  {text≤500, tag?}` (≤ 3 per run). Gated (they only write a proposal): `session_start`,
+  `session_message`, `session_interrupt`, `session_stop`, `standing_order`. Reminders:
+  `checkin_schedule`, `checkin_cancel`.
+- **Ask and outbox.** `POST /api/overseer/ask {question 1–2000, requestId 1–128, waitMs 0–15000,
+  mode: "ask"|"tell"}` submits one input (`whenBusy: followUp`) and waits; in time →
+  `{status:"done", answer, actions?, refused?, sent?}`, else `{status:"pending"}` and the answer lands in
+  the outbox exactly once (also across a restart: `even.overseer.asks` is reconciled on every outbox
+  read and at start). `GET /api/overseer/outbox?since=<seq>`, `POST /api/overseer/outbox/read {upTo}`.
+  The outbox keeps the newest 50 items (`answer`, `notify`, `action`, `checkin`, `system`, `reply`;
+  hand-off items younger than 24 h are pinned on top). Even AI's "what's new" reads it without an LLM.
+- **The action gate.** Nothing the overseer (or Even AI's one gate) wants to change runs before a
+  confirmation outside the model:
+  - `propose` validates the arguments, applies the limits and the single-writer rules, writes the
+    item (`even.overseer.actions`) and an `action` outbox item, and — for overseer proposals — puts a
+    `permission_request` (`toolName: "overseer"`, Yes/No) on `dur-overseer`. Summaries are built by
+    host code from the arguments, never by the model: `Start lets-code agent 'fix-ci' in
+    ~/sandbox/agents/fix-ci on qwen to: "<task ≤ 140>"?`, `Send pi session 'notes-0a1b2c': "…"?`,
+    `Stop agent 'fix-ci'?`, `Let the overseer tell agent 'x' "…" up to 2 times until 18:30?`.
+  - `POST /api/overseer/actions/:id/confirm {confirmFrameId, by?}` (the shim's spoken or HUD yes) or
+    the phone's permission answer on `dur-overseer` executes it. Confirm is idempotent by action id
+    (both racers get the same result); expired → 410 `action expired`; denied → 409; the kill switch
+    `~/.even-terminal/agents.disabled` → 423 `agents are switched off`. `…/deny` denies.
+  - Pending actions expire after 90 s (sweep every 10 s) and at every restart (outbox `system` item
+    "N pending action(s) were dropped by a restart." and a note to the overseer). Only one overseer
+    proposal may wait at a time (409 `another action is waiting for your answer`).
+  - Limits, at propose and again at confirm: 2 non-archived agents of origin `evenai|overseer`
+    (`2 agents exist; stop one first`); a Claude model needs 2 free slots on the Claude bridge
+    (`GET :8795/status`, unreachable = refused) and at most one overseer-started Claude agent; `ttlS`
+    300–43200 (default 7200); the overseer's task/message text ≤ 140 characters, Even AI's ≤ 2000
+    (≤ 140 for any non-durable target); a text starting with `/` or `!` (after whitespace or
+    invisible characters), control or invisible characters, or no words is refused at propose and
+    at execute; overseer starts never carry `factory`.
+  - Stop and interrupt work only on bridge (durable) agents; messages follow the route table below.
+- **Audit log.** `~/.even-terminal/overseer-actions.log` (`EVEN_BRIDGE_OVERSEER_AUDIT`), JSONL, mode
+  0600, created by the bridge: one line per `propose`, `confirm`, `deny`, `expire`, `execute`, `fail`,
+  `standing`: `{ts, event, id, kind, origin, summary, by}`. It never throws; it is not rotated.
+- **Check-ins and the nightly reset.** `checkin_schedule {inMinutes 15–720 | at, about≤200}` creates a
+  background task `even.overseer-checkin` that later submits `check-in: <about>` to the root (≤ 6
+  pending, ≥ 15 min apart, ≤ 24 a day; a check-in run may schedule one more; skipped with the kill
+  switch on). `even.overseer-nightly` resets the root at 04:00 when it is idle (else retries every 10
+  min), handing off the fenced notes and the pending check-ins, and writes the day's token/cost usage
+  to the outbox (the first report after a deploy says "so far").
+- **Standing orders.** A confirmed `standing_order {id, text, maxTimes 1–3, until ≤ 12 h}` lets a later
+  overseer `session_message` with exactly that target and text (not a steer) run without a new
+  confirm while it has uses left (audit `standing`; a refused execution refunds the use).
+- **Hand-offs** (`EVEN_BRIDGE_OVERSEER_HANDOFF=1`, default off): a told ask with `handoff {tag,
+  label, ttlS}` holds the start the overseer proposes in that run to that label, folder, qwen and the
+  deadline. The Ideate producer is not built yet.
 
 ## Every session of both harnesses: listing and messaging (overseer, `EVEN_BRIDGE_OVERSEER_ENABLE=1`)
 
@@ -407,6 +500,51 @@ whose state is not yet known as `busy`. Submissions are deduplicated, so a
 resumed run never re-submits the prompt (verified by
 `node scripts/durable-smoke.mjs --kill-mid-turn`, below).
 
+With the lets-code engine and the overseer on, a start runs in this order:
+
+1. The session map migrates to schema v2 (`engine`, `ttl_s`, origin `overseer`; on every start, flag
+   or not; main's code can still open a v2 map).
+2. `even-durable-*` scopes and the `even-lc-<sid>.scope` of **this store's** lets-code rows are stopped
+   (by own sids, never by glob: a throwaway instance never kills the live bridge's children).
+3. With the overseer: the root is configured (`even-overseer` only) before anything resumes.
+4. Live tasks are inspected and resumed. An `even.lc-run` task re-spawns its child with `--session
+   <file>`: a run lets-code had accepted gets one cut-off prompt ("you were cut off …", or `/factory
+   resume <id>`), an undelivered prompt is sent again as it was; after 5 restarts in a row the run
+   stops (`lets-code run stopped: restarted 5 times in a row`). Sleeping check-ins and the nightly
+   task do not make `dur-overseer` look busy.
+5. The overseer's actions: every `pending` item from before this start becomes `expired` (outbox
+   `system` item and a note for the overseer); a `confirmed` start without a result is looked up by
+   its requestId `ovs-act:<id>` (found → its result is stored; else `failed`); other cut-off confirmed
+   actions are marked `failed`. Unanswered asks are reconciled into the outbox.
+
+What a restart loses (accepted limits, see below): reply watches, the refusal reasons kept for late
+asks, and whether a `session_message` cut off mid-execute reached its target.
+
+## Accepted limits (v1)
+
+- Messages over pi RPC to an **existing** pi session run the user's pi (normal tools, no sandbox) in
+  that session's folder, which can be anywhere: they are not confined to `~/sandbox/agents` (that
+  constraint covers new agents only).
+- Reply watches are in-process: a restart ends them and no reply is reported after it.
+- A `session_message` cut off by a restart mid-execute is marked failed without checking whether it
+  landed (only starts are reconciled).
+- Refusal reasons for a told ask live in memory (newest 50 submissions): after a restart a late tell
+  gets no `refused` list.
+- The `.pi` bash rule is text-based; it is backed by sealing (see the lets-code engine). Nested
+  `sub/.pi` dirs planted by bash without naming `.pi` are not scanned.
+- The first factory stage has a ~1 s trust window (the factory watch tick) before its worktree is
+  guarded and sealed. Irrelevant while the factory stays disabled.
+- The window between the seal at spawn and pi loading its extensions (a few hundred ms).
+- The phone's permission answer on `dur-overseer` carries no action id; it answers the only pending
+  overseer proposal (one may wait at a time).
+- The tmux allowlist (`inputReady`) is rebuilt from sources, not captured; it fails closed. Claude
+  Code's placeholder is ASSUMED dim (SGR 2): if it is not, every message to a Claude Code terminal is
+  refused ("has unsent text") until the fixtures are corrected from real captures.
+- A lets-code agent can loop: in the Task 7 QA run a "write hi to hi.txt" agent wrote the file 68
+  times in ~35 s (one prompt, 69 assistant turns) until it was stopped. lets-code children have no
+  turn cap from the bridge; stop works (`POST /api/agents/:sid/stop`, or the overseer's gated stop).
+- The overseer's root store grows forever (no pruning yet; see *Store growth*).
+
 ## Backup
 
 The store is two SQLite files: `durable.sqlite` and `durable.sqlite.sessions.sqlite`.
@@ -437,6 +575,24 @@ the bridge. pi-durable is then never imported, `/api/agents` falls through to
 the official router (its 404) exactly as before, and every other route behaves
 as before. The store is left on disk untouched; set
 the flag again to get the sessions back.
+
+Per flag (each: remove the line from the drop-in, `sudo systemctl daemon-reload`, `sudo systemctl
+restart even-bridge`, check the banner):
+
+- `EVEN_BRIDGE_OVERSEER_ENABLE`: the overseer modules are not loaded, `/api/overseer/*` falls through,
+  `GET /api/agents` loses `overseer: true`, so the shim stops offering `overseer_ask`, `overseer_tell`,
+  `list_sessions` and `message_session` within its 60 s engines cache, and its one gate falls back to
+  `POST /api/prompt`. The root conversation, notes, outbox and actions stay in the store; pending
+  actions expire at the next start with the flag on. The audit log stays.
+- `EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE`: new `engine: "lets-code"` prompts answer 400, `GET
+  /api/agents` loses `engines`, so the shim dispatches native agents again. Existing lets-code rows
+  stay in the map; their session files stay in `<store dir>/lc-sessions/<sid>/` and their
+  quarantine in `<store dir>/lc-quarantine/<sid>/`. Stop live lets-code agents first (`POST
+  /api/agents/:sid/stop`), so no `even-lc-*` scope outlives the switch; with the engine off the
+  startup scope cleanup of lets-code rows does not run (check `systemctl --user list-units
+  'even-lc-*'`).
+- The session map stays at schema v2 after a rollback of the code; main's SessionMap opens it. To
+  return to the exact pre-deploy files, stop the bridge and restore the backup pair.
 
 ## Smoke run
 
