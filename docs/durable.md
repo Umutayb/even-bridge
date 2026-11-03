@@ -166,6 +166,43 @@ The wait is bounded by the file's `timeout` (`N`, `Ns`, `Nm`, `Nh`; default
 Agent files are read **once at bridge start**: restart the bridge to pick
 up edits.
 
+## Web tools
+
+With `EVEN_BRIDGE_WEB_SEARCH_URL` set (env or `~/.even-terminal/bridge.env`,
+read **once at bridge start**; trailing slash stripped) every durable
+conversation also has the `even-web` extension (`src/providers/durable/web.mjs`)
+with two tools backed by the private even-search service (SearXNG +
+trafilatura on the LAN, the same service the glasses' own web search uses):
+
+- `web_search({ query })`: `GET <base>/search?q=<query>&n=5`, up to 5
+  results `{title, url, snippet}` (snippet at most 300 characters), then
+  `GET <base>/fetch?url=<url>` for the top 2 in parallel, `text` at most
+  1200 characters each (a failed or timed-out page keeps `text: ""`).
+  Timeouts: search 8 s, each fetch 6 s. A failed search returns
+  `{results: [], error: "search unavailable"}`.
+- `web_fetch({ url })`: http(s) URLs only (anything else returns
+  `{error: "only http(s) URLs"}` without a request), via `/fetch`, `text` at
+  most 6000 characters; `{url, text}` or `{url, text: "", error}`.
+
+Neither tool throws into the model. They are not bash and never touch the
+filesystem, so the guard does not vet them; every page is fetched by
+even-search, never by the bridge host. Subagent children keep the
+extension, subject to their agent file's `tools` / `disallowed` lists (an
+agent whose `tools` list does not name `web_search` does not get it). The
+tool descriptions tell the model when to search (current information, news,
+prices, facts it does not know) and to name the source site; the agent
+instructions do not list tools.
+
+Logging: `[durable:web] search "<query>" -> <n> results` and
+`[durable:web] fetch <url> -> <chars> chars` (failures say `failed`); page
+text and snippets are never logged.
+
+Unset: the extension is not installed, no conversation is offered the tools,
+and the bridge logs `[durable] web tools off (EVEN_BRIDGE_WEB_SEARCH_URL unset)`
+once at start. A conversation's extensions are stored when it is created:
+conversations created before the URL was set do not get the tools, and
+unsetting the URL later just drops them (a missing extension is skipped).
+
 ## The lets-code engine
 
 `POST /api/prompt` with `provider: "durable"` and **`engine: "lets-code"`** (`native`

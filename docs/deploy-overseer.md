@@ -144,6 +144,14 @@ the same for the shim with `~/github/even-cloud-shim-overseer` and `overseer`).
   git -C ~/github/even-bridge pull --ff-only && git -C ~/github/even-bridge log --oneline -1
   ```
   (No dependency changes: `package.json` and `package-lock.json` are unchanged.)
+- [ ] Turn on the durable agents' web tools (read once at start, so before the restart below):
+  ```sh
+  grep -q '^EVEN_BRIDGE_WEB_SEARCH_URL=' ~/.even-terminal/bridge.env \
+    || echo 'EVEN_BRIDGE_WEB_SEARCH_URL=https://evsearch.i-bora.com' >> ~/.even-terminal/bridge.env
+  curl -s -o /dev/null -w '%{http_code}\n' 'https://evsearch.i-bora.com/search?q=test&n=1'
+  ```
+  Expected: `200`. After the start, `journalctl -u even-bridge` must NOT show
+  `[durable] web tools off (EVEN_BRIDGE_WEB_SEARCH_URL unset)`.
 
 ## 3. Stage 1: the lets-code engine (bridge)
 
