@@ -558,3 +558,123 @@ test("native sessions are unchanged next to the engine", async (t) => {
   const rows = await p.listAgents();
   assert.equal(rows.length, 0, "no conversation yet: not listed");
 });
+
+// ── Task 3: the factory toggle ─────────────────────────────────────────────
+
+/** The prompts one child (by its spawn index) received. */
+const promptsOf = (c, i) => {
+  const pid = c.spawns()[i]?.pid;
+  return c.prompts().filter((x) => x._pid === pid).map((x) => x.message);
+};
+/** Answer the open factory checkpoint and wait for the session to go idle. */
+async function confirmCheckpoint(c, p, sid) {
+  await until(() => c.frames.some((f) => f.sid === sid && f.type === "user_question"), 5000, "checkpoint");
+  await p.respondQuestion(sid, "Confirm");
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle after checkpoint");
+}
+
+test("factory on sends /mode orchestration and is kept across a respawn", async (t) => {
+  const c = makeCase({ lc: { idleKeepMs: 300 } });
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "a", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.deepEqual(await p.setFactory(sid, true), { factory: true, mode: "orchestration" });
+  assert.deepEqual(promptsOf(c, 0), ["a", "/mode orchestration"]);
+  await until(() => p._lc.liveCount() === 0, 5000, "idle stop");
+  await p.prompt(sid, "b");
+  await idleAfter(c, sid, 2);
+  assert.equal(c.spawns().length, 2);
+  assert.deepEqual(promptsOf(c, 1), ["/mode orchestration", "b"]);
+  const rec = await recordOf(p, sid);
+  assert.equal(rec.factory, true);
+  assert.equal(rec.mode, "orchestration");
+  assert.equal((await p.listAgents())[0].factory, true);
+});
+
+test("factory with a ticket writes .factory/ticket-<ms>.md and starts it", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.deepEqual(await p.setFactory(sid, true, { ticket: "Fix the CI\n\nIt fails on main." }), { factory: true, mode: "orchestration" });
+  await until(() => c.prompts().some((x) => x.message.startsWith("/factory start")), 5000, "factory start");
+  const start = c.prompts().find((x) => x.message.startsWith("/factory start")).message;
+  const m = /^\/factory start (\.factory\/ticket-\d+\.md)$/.exec(start);
+  assert.ok(m, start);
+  assert.equal(readFileSync(join(c.work, m[1]), "utf8"), "Fix the CI\n\nIt fails on main.");
+  assert.deepEqual(promptsOf(c, 0), ["hello", "/mode orchestration", start]);
+  await confirmCheckpoint(c, p, sid);
+});
+
+test("the how-to-run goes unquoted", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Add hello.txt", howToRun: "test -f hello.txt" });
+  await until(() => c.prompts().some((x) => x.message.startsWith("/factory start")), 5000, "factory start");
+  assert.match(c.prompts().find((x) => x.message.startsWith("/factory start")).message, /^\/factory start \.factory\/ticket-\d+\.md test -f hello\.txt$/);
+  await confirmCheckpoint(c, p, sid);
+});
+
+test("factory off sends /mode ask", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true);
+  assert.deepEqual(await p.setFactory(sid, false), { factory: false, mode: "ask" });
+  assert.deepEqual(promptsOf(c, 0), ["hello", "/mode orchestration", "/mode ask"]);
+  assert.equal((await recordOf(p, sid)).factory, false);
+});
+
+test("the mode comes from the notify", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true);
+  assert.equal((await recordOf(p, sid)).mode, "orchestration");
+
+  const c2 = makeCase();
+  const q = c2.open({ lc: { modeAckMs: 50, childEnv: { FAKE_PI_LOG: c2.logFile, FAKE_PI_NO_NOTIFY: "1" } } });
+  t.after(c2.closeAll);
+  const { sessionId: sid2 } = await q.prompt(undefined, "hello", c2.work, { engine: "lets-code" });
+  await idleAfter(c2, sid2);
+  const before = (await recordOf(q, sid2)).mode;
+  const t0 = Date.now();
+  await assert.rejects(q.setFactory(sid2, true), (err) => err.statusCode === 504 && err.message === "lets-code did not confirm the mode");
+  assert.ok(Date.now() - t0 < 2000, "gave up after modeAckMs");
+  assert.equal((await recordOf(q, sid2)).mode, before);
+});
+
+test("new session with factory:true sends /mode orchestration before the first prompt", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code", factory: true });
+  await idleAfter(c, sid);
+  assert.deepEqual(promptsOf(c, 0), ["/mode orchestration", "hello"]);
+  const rec = await recordOf(p, sid);
+  assert.equal(rec.factory, true);
+  assert.equal(rec.mode, "orchestration");
+  await assert.rejects(p.prompt(undefined, "x", c.work, { factory: true }), (err) => err.statusCode === 400 && err.message === "'factory' needs engine lets-code");
+});
+
+test("the factory never enables experts", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code", factory: true });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI", howToRun: "npm test" });
+  await confirmCheckpoint(c, p, sid);
+  await p.setFactory(sid, false);
+  assert.ok(c.prompts().length >= 4);
+  assert.ok(!c.prompts().some((x) => x.message.startsWith("/experts")));
+});

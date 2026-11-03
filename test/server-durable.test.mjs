@@ -229,7 +229,7 @@ test("server, lets-code engine on: the banner says lc=on(...) and GET /api/agent
   });
   const r = await fetch(`${s.base}/api/agents`, authed);
   assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { agents: [] });
+  assert.deepEqual(await r.json(), { agents: [], engines: ["native", "lets-code"] });
   const { code, out } = await s.stop();
   assert.equal(code, 0);
   assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=on\(nosandbox,(?:mem|nomem)\)/);

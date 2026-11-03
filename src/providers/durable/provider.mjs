@@ -682,6 +682,7 @@ export function createDurableProvider(
     const engine = opts.engine ?? "native";
     if (engine !== "native" && engine !== "lets-code") throw httpError(400, `Invalid engine ${JSON.stringify(engine)}`);
     if (engine === "lets-code" && !lcEngine) throw httpError(400, "the lets-code engine is off");
+    if (opts.factory && engine !== "lets-code") throw httpError(400, "'factory' needs engine lets-code");
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
@@ -872,15 +873,20 @@ export function createDurableProvider(
       await ready;
       let sid = sessionId;
       if (!sid && opts.requestId) sid = map.sidForRequest(opts.requestId);
+      let created = false;
       if (sid) {
         const row = map.get(sid);
         if (!row || row.archived) throw notFound();
       } else {
         sid = createSession(cwd, opts);
+        created = true;
       }
       await ensureConversation(sid);
       claim(sid, NAME);
       if (isLc(map.get(sid))) {
+        // A new session started with the factory on: recorded before the first spawn, which then
+        // sends `/mode orchestration` before the text (no child yet, so nothing is sent here).
+        if (created && opts.factory === true) await lcEngine.setFactory(sid, true);
         const r = await lcEngine.prompt(sid, text, { requestId: opts.requestId });
         map.touch(sid);
         return { sessionId: sid, provider: WIRE_PROVIDER, ...(r.taskId != null ? { submissionId: r.taskId } : {}) };

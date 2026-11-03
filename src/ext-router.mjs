@@ -36,7 +36,7 @@ const NAME_RE = /^[\w .-]+$/;
  * out; `maxTurns` may be a number or a digit-only string and comes back a number.
  * @returns {{ opts: object } | { error: string }}
  */
-export function agentOpts({ name, model, maxTurns, requestId, origin, engine } = {}) {
+export function agentOpts({ name, model, maxTurns, requestId, origin, engine, factory } = {}) {
   const opts = {};
   const L = AGENT_LIMITS;
   if (name != null) {
@@ -77,7 +77,42 @@ export function agentOpts({ name, model, maxTurns, requestId, origin, engine } =
     }
     opts.engine = engine;
   }
+  if (factory != null) {
+    if (typeof factory !== "boolean") return { error: "'factory' must be true or false" };
+    if (factory && opts.engine !== "lets-code") return { error: "'factory' needs engine lets-code" };
+    opts.factory = factory;
+  }
   return { opts };
+}
+
+// POST /api/agents/:sid/factory body limits. The how-to-run goes to lets-code unquoted
+// (ruling 4: it splits on whitespace), so it is one line without quotes.
+export const FACTORY_LIMITS = Object.freeze({ ticketMax: 8000, howToRunMax: 200 });
+
+/**
+ * Validate a factory toggle body.
+ * @returns {{ on: boolean, opts: { ticket?: string, howToRun?: string } } | { error: string }}
+ */
+export function factoryOpts({ on, ticket, howToRun } = {}) {
+  const L = FACTORY_LIMITS;
+  if (typeof on !== "boolean") return { error: "'on' must be true or false" };
+  const opts = {};
+  if (ticket != null) {
+    if (typeof ticket !== "string" || ticket.length < 1 || ticket.length > L.ticketMax) {
+      return { error: `'ticket' must be a string of 1-${L.ticketMax} characters` };
+    }
+    if (!on) return { error: "'ticket' needs on true" };
+    opts.ticket = ticket;
+  }
+  if (howToRun != null) {
+    if (typeof howToRun !== "string" || howToRun.trim().length < 1 || howToRun.length > L.howToRunMax) {
+      return { error: `'howToRun' must be a string of 1-${L.howToRunMax} characters` };
+    }
+    if (/[\r\n"'`]/.test(howToRun)) return { error: "'howToRun' must be one line without quotes" };
+    if (opts.ticket == null) return { error: "'howToRun' needs a ticket" };
+    opts.howToRun = howToRun.trim();
+  }
+  return { on, opts };
 }
 
 /**
@@ -251,7 +286,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
   // ── POST /api/prompt ───────────────────────────────────────────────────────
   router.post("/prompt", async (req, res, next) => {
-    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin, engine } = req.body ?? {};
+    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin, engine, factory } = req.body ?? {};
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing 'text' field" });
     }
@@ -279,7 +314,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       let result;
       if (p.name === "durable") {
         // Agent fields: validated, and only the ones the caller sent.
-        const checked = agentOpts({ name, model, maxTurns, requestId, origin, engine });
+        const checked = agentOpts({ name, model, maxTurns, requestId, origin, engine, factory });
         if (checked.error) return res.status(400).json({ error: checked.error });
         result = await p.prompt(sessionId, text, effectiveCwd, checked.opts);
       } else {
@@ -417,7 +452,10 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
   router.get("/agents", async (req, res, next) => {
     if (!durable) return next();
     try {
-      res.json({ agents: await durable.listAgents() });
+      const agents = await durable.listAgents();
+      // `engines` only when there is a choice (ruling 9); with the lets-code flag off the body is as before.
+      const engines = Array.isArray(durable.engines) && durable.engines.includes("lets-code") ? durable.engines : null;
+      res.json(engines ? { agents, engines } : { agents });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -428,6 +466,20 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     try {
       await durable.stopSession(req.params.sid);
       res.json({ ok: true, sessionId: req.params.sid });
+    } catch (err) {
+      const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
+      res.status(statusCode).json({ error: err.message });
+    }
+  });
+
+  // Factory toggle of a lets-code agent (ruling 4): 409 native, 504 without the mode notify.
+  router.post("/agents/:sid/factory", async (req, res, next) => {
+    if (!durable) return next();
+    const checked = factoryOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      const r = await durable.setFactory(req.params.sid, checked.on, checked.opts);
+      res.json({ ok: true, sessionId: req.params.sid, factory: r?.factory, mode: r?.mode });
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
       res.status(statusCode).json({ error: err.message });

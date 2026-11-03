@@ -551,3 +551,125 @@ test("a durable prompt without a cwd reaches the provider with no cwd (never PRO
   assert.equal(r.status, 202);
   assert.equal(durable.calls.prompt[0].cwd, undefined);
 });
+
+// ── Task 3: engine selection and the factory toggle ────────────────────────
+
+/** A durable stub with the lets-code engine: `engines` and `setFactory`. */
+function stubDurableLc({ engines = ["native", "lets-code"] } = {}) {
+  const d = stubDurable();
+  d.calls.factory = [];
+  d.engines = engines;
+  d.listAgents = async () => [];
+  d.setFactory = async (sid, on, opts) => {
+    if (!sid.startsWith("dur-")) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+    if (sid === "dur-native") throw Object.assign(new Error("the factory needs the lets-code engine"), { statusCode: 409 });
+    if (sid === "dur-mute") throw Object.assign(new Error("lets-code did not confirm the mode"), { statusCode: 504 });
+    d.calls.factory.push([sid, on, opts]);
+    return { factory: on };
+  };
+  return d;
+}
+
+test("engine and factory are validated", async () => {
+  const { agentOpts } = await import("../src/ext-router.mjs");
+  assert.equal(agentOpts({ engine: "docker" }).error, "'engine' must be one of native, lets-code");
+  assert.deepEqual(agentOpts({ engine: "lets-code", factory: true }).opts, { engine: "lets-code", factory: true });
+  assert.equal(agentOpts({ factory: true }).error, "'factory' needs engine lets-code");
+  assert.equal(agentOpts({ engine: "native", factory: true }).error, "'factory' needs engine lets-code");
+  assert.equal(agentOpts({ factory: "yes" }).error, "'factory' must be true or false");
+  assert.deepEqual(agentOpts({ factory: false }).opts, { factory: false });
+  assert.deepEqual(agentOpts({}).opts, {});
+});
+
+test("/prompt passes factory to the durable provider", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", factory: true });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error, "'factory' needs engine lets-code");
+  const ok = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", engine: "lets-code", factory: true });
+  assert.equal(ok.status, 202);
+  assert.deepEqual(durable.calls.prompt.map((c) => c.opts), [{ engine: "lets-code", factory: true }]);
+});
+
+test("GET /agents lists engines", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc() });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/agents`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { agents: [], engines: ["native", "lets-code"] });
+});
+
+test("GET /agents without the lets-code engine is unchanged (no engines field)", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc({ engines: ["native"] }) });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [] }));
+});
+
+test("POST /agents/:sid/factory forwards on and ticket", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true, ticket: "Fix the CI" });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true, sessionId: "dur-1", factory: true });
+  r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true, ticket: "Add hello.txt", howToRun: "test -f hello.txt" });
+  assert.equal(r.status, 200);
+  r = await postJson(`${base}/api/agents/dur-1/factory`, { on: false });
+  assert.equal(r.status, 200);
+  assert.deepEqual(durable.calls.factory, [
+    ["dur-1", true, { ticket: "Fix the CI" }],
+    ["dur-1", true, { ticket: "Add hello.txt", howToRun: "test -f hello.txt" }],
+    ["dur-1", false, {}],
+  ]);
+});
+
+test("POST /agents/:sid/factory validates the body", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = [
+    [{}, "'on' must be true or false"],
+    [{ on: "yes" }, "'on' must be true or false"],
+    [{ on: true, ticket: "" }, "'ticket' must be a string of 1-8000 characters"],
+    [{ on: true, ticket: "x".repeat(8001) }, "'ticket' must be a string of 1-8000 characters"],
+    [{ on: true, ticket: 5 }, "'ticket' must be a string of 1-8000 characters"],
+    [{ on: false, ticket: "Fix it" }, "'ticket' needs on true"],
+    [{ on: true, ticket: "t", howToRun: "npm test\nrm -rf /" }, "'howToRun' must be one line without quotes"],
+    [{ on: true, ticket: "t", howToRun: "bash -c 'npm test'" }, "'howToRun' must be one line without quotes"],
+    [{ on: true, ticket: "t", howToRun: 'say "hi"' }, "'howToRun' must be one line without quotes"],
+    [{ on: true, ticket: "t", howToRun: "x".repeat(201) }, "'howToRun' must be a string of 1-200 characters"],
+    [{ on: true, ticket: "t", howToRun: "  " }, "'howToRun' must be a string of 1-200 characters"],
+    [{ on: true, howToRun: "npm test" }, "'howToRun' needs a ticket"],
+  ];
+  for (const [body, error] of bad) {
+    const r = await postJson(`${base}/api/agents/dur-1/factory`, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(await r.json(), { error }, JSON.stringify(body));
+  }
+  assert.equal(durable.calls.factory.length, 0);
+  const ok = await postJson(`${base}/api/agents/dur-1/factory`, { on: true, ticket: "x".repeat(8000), howToRun: "x".repeat(200) });
+  assert.equal(ok.status, 200);
+});
+
+test("factory on a native agent is 409", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc() });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/agents/dur-native/factory`, { on: true });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "the factory needs the lets-code engine" });
+  r = await postJson(`${base}/api/agents/dur-mute/factory`, { on: true });
+  assert.equal(r.status, 504);
+  assert.deepEqual(await r.json(), { error: "lets-code did not confirm the mode" });
+  r = await postJson(`${base}/api/agents/nope/factory`, { on: true });
+  assert.equal(r.status, 404);
+});
+
+test("/agents/:sid/factory falls through without the durable provider", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi() });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
+  assert.equal(fellThrough.length, 1);
+});

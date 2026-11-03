@@ -252,13 +252,15 @@ export function createLcEngine({
     const m = /^mode: (\S+)/.exec(String(text).trim());
     if (!m) return;
     const mode = m[1];
-    updateRecord(sid, (d) => {
-      d.mode = mode;
-    });
     const s = S(sid);
     const [hit, rest] = [s.modeWaiters.filter((w) => w.mode === mode), s.modeWaiters.filter((w) => w.mode !== mode)];
     s.modeWaiters = rest;
-    for (const w of hit) w.resolve(mode);
+    // Resolve once the record holds the mode, so a reader right after setFactory sees it.
+    updateRecord(sid, (d) => {
+      d.mode = mode;
+    }).then(() => {
+      for (const w of hit) w.resolve(mode);
+    });
   }
 
   /** Send `/mode <mode>` and resolve on the child's `mode: <mode>` notify (ruling 4), else 504. */
