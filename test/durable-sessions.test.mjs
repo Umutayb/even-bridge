@@ -163,3 +163,18 @@ test("~ paths expand and missing parent directories are created", async () => {
     else process.env.HOME = oldHome;
   }
 });
+
+test("noteRequest remembers which session a request created, across reopen", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dur-req-"));
+  const storePath = join(dir, "durable.sqlite");
+  const m1 = new SessionMap(storePath);
+  const sid = m1.create({ name: "a", cwd: "/w", modelRef: QWEN, origin: "evenai" });
+  m1.noteRequest("req-1", sid);
+  m1.noteRequest("req-1", "dur-other"); // first writer wins
+  assert.equal(m1.sidForRequest("req-1"), sid);
+  assert.equal(m1.sidForRequest("req-2"), undefined);
+  m1.close();
+  const m2 = new SessionMap(storePath);
+  assert.equal(m2.sidForRequest("req-1"), sid);
+  m2.close();
+});

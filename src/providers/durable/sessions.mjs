@@ -41,6 +41,13 @@ export class SessionMap {
     )`);
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_conversation ON sessions (conversation_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_created ON sessions (archived, created_at)");
+    // Which session a new-session request created, so a retried prompt with the
+    // same requestId (HTTP retry, bridge restart) finds it instead of starting a second agent.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
+      request_id TEXT PRIMARY KEY,
+      sid TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
     this.stmt = {
       insert: this.db.prepare(`INSERT INTO sessions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`),
       get: this.db.prepare(`SELECT ${COLUMNS} FROM sessions WHERE sid = ?`),
@@ -50,6 +57,8 @@ export class SessionMap {
       touch: this.db.prepare("UPDATE sessions SET last_seen = ? WHERE sid = ?"),
       archive: this.db.prepare("UPDATE sessions SET archived = 1 WHERE sid = ?"),
       setConversation: this.db.prepare("UPDATE sessions SET conversation_id = ? WHERE sid = ?"),
+      noteRequest: this.db.prepare("INSERT OR IGNORE INTO requests (request_id, sid, created_at) VALUES (?, ?, ?)"),
+      sidForRequest: this.db.prepare("SELECT sid FROM requests WHERE request_id = ?"),
     };
   }
 
@@ -80,6 +89,16 @@ export class SessionMap {
   /** Record the Durable conversation once it has been created. */
   setConversation(sid, conversationId) {
     this.stmt.setConversation.run(conversationId, sid);
+  }
+
+  /** Remember that `requestId` created `sid` (first writer wins). */
+  noteRequest(requestId, sid) {
+    this.stmt.noteRequest.run(String(requestId), sid, this.now());
+  }
+
+  /** The sid a new-session `requestId` created, if any. */
+  sidForRequest(requestId) {
+    return this.stmt.sidForRequest.get(String(requestId))?.sid;
   }
 
   touch(sid) {
