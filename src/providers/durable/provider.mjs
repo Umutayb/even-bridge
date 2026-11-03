@@ -218,6 +218,9 @@ function parseMaxTurns(v) {
  * @param {object} [o.lc] the lets-code engine (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1): `{ bin, caps, maxLive, sandbox }`
  *   plus test seams (see lc/engine.mjs). Unset: no lets-code module is loaded and nothing changes.
  */
+/** A factory flag on a prompt to an existing agent (the toggle has its own route). */
+export const FACTORY_ON_START = "'factory' is set when an agent starts; use /api/agents/:sid/factory";
+
 export function createDurableProvider(
   emitRaw,
   {
@@ -879,10 +882,12 @@ export function createDurableProvider(
         if (opts.requestId) sid = map.sidForRequest(opts.requestId);
       }
       let created = false;
+      if (sessionId && opts.factory != null) throw httpError(400, FACTORY_ON_START);
       if (sid) {
         const row = map.get(sid);
         if (!row || row.archived) throw notFound();
       } else {
+        if (opts.factory === true && opts.engine === "lets-code") lcEngine?.checkFactoryExperts(); // 409 before any row
         sid = createSession(cwd, opts);
         created = true;
       }
@@ -1028,7 +1033,12 @@ export function createDurableProvider(
           } catch (err) {
             log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
           }
-          return { ...baseRow(r, lcEngine.status(r.sid), rec.lastLine ?? ""), engine: "lets-code", factory: Boolean(rec.factory) };
+          return {
+            ...baseRow(r, lcEngine.status(r.sid), rec.lastLine ?? ""),
+            engine: "lets-code",
+            factory: Boolean(rec.factory),
+            lastError: rec.lastError ?? null, // lets-code refused the last factory start (the shim speaks it)
+          };
         }
         let state = states.get(r.sid) ?? "idle";
         let lastLine = "";

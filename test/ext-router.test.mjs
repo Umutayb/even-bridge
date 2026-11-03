@@ -677,3 +677,36 @@ test("/agents/:sid/factory falls through without the durable provider", async (t
   await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
   assert.equal(fellThrough.length, 1);
 });
+
+
+test("/prompt with a sessionId and a factory flag is 400 (the toggle has its own route)", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  claim("dur-1", "durable");
+  const r = await postJson(`${base}/api/prompt`, { sessionId: "dur-1", text: "go", factory: true });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: "'factory' is set when an agent starts; use /api/agents/:sid/factory" });
+  assert.equal(durable.calls.prompt.length, 0);
+});
+
+test("/agents/:sid/factory falls through when the durable provider has no lets-code engine (as on main)", async (t) => {
+  const durable = stubDurableLc({ engines: ["native"] });
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
+  assert.equal(fellThrough.length, 1);
+  assert.equal(durable.calls.factory.length, 0);
+});
+
+test("a 409 experts_disabled keeps its reason on the wire", async (t) => {
+  const durable = stubDurableLc();
+  durable.setFactory = async () => {
+    throw Object.assign(new Error("factory experts must be enabled by the operator (missing: tester)"), { statusCode: 409, reason: "experts_disabled" });
+  };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "factory experts must be enabled by the operator (missing: tester)", reason: "experts_disabled" });
+});

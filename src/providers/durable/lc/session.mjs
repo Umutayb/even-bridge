@@ -24,6 +24,11 @@ export const MANDATE_DENY = "Deny";
 /** lets-code's factory asks this (a `confirm`) before it enables its experts host-wide; answered No here (R-C2). */
 export const FACTORY_EXPERTS_TITLE = "Enable the factory's experts?";
 export const FACTORY_EXPERTS_ERROR = "factory experts must be enabled by the operator";
+/** The factory's question, or the one for a single expert (lets-code experts.ts: "Enable the <name> expert?"). */
+export const expertsQuestion = (title) => {
+  const t = String(title ?? "").trim();
+  return t === FACTORY_EXPERTS_TITLE || /^Enable the [\w.-]+ expert\?$/.test(t);
+};
 const ACTIVITY_EVENTS = new Set(["agent_start", "turn_start", "message_start", "message_update", "tool_execution_start", "tool_execution_end", "agent_end"]);
 /** The prompt-response wait of a command that may run long (a factory run answers its prompt only when it ends). */
 export const LC_LONG_MS = 2 ** 31 - 1;
@@ -178,7 +183,7 @@ export class LcSession extends PiSession {
 
   onUiRequest(req) {
     if (!(req.method === "notify" && /^mode: /.test(String(req.message ?? "")))) this.activity();
-    if (req.method === "confirm" && String(req.title ?? "").trim() === FACTORY_EXPERTS_TITLE) {
+    if (req.method === "confirm" && expertsQuestion(req.title)) {
       // Experts are host-wide lets-code state: a glasses Yes must never enable them (R-C2).
       this.client?.respondUi({ type: "extension_ui_response", id: req.id, confirmed: false });
       this.send({ type: "error", message: FACTORY_EXPERTS_ERROR });
@@ -186,7 +191,7 @@ export class LcSession extends PiSession {
     }
     if (req.method === "notify") {
       try {
-        this.opts.onNotify?.(String(req.message ?? ""));
+        this.opts.onNotify?.(String(req.message ?? ""), String(req.notifyType ?? "info"));
       } catch {
         /* the engine's callback must not break the stream */
       }

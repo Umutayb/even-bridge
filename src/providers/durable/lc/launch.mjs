@@ -14,7 +14,8 @@
 // `lets-code-<pid>.scope` (spike Finding 2), and the scope stop, the cgroup
 // check of findExternalPi and the memory cap would all miss it.
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -31,6 +32,8 @@ export const LC_CGROUP_CONTROLLERS = "/sys/fs/cgroup/cgroup.controllers";
 export const LC_STATE_FILE = "~/.pi/agent/lets-code-state.json";
 /** The experts the factory needs (lets-code factory.ts `ensureExperts`). */
 export const FACTORY_EXPERTS = Object.freeze(["developer", "expert-reviewer", "design-reviewer", "tester", "acceptance-judge"]);
+/** pi's project trust store (`{ <canonical path>: true|false|null }`, lock dir `<file>.lock`; pi trust-manager.js). */
+export const LC_TRUST_FILE = "~/.pi/agent/trust.json";
 /** The project-local copy of the guard (pi loads `<cwd>/.pi/extensions/*` in every pi it starts there, subagents included). */
 export const LC_PROJECT_GUARD = join(".pi", "extensions", "even-guard.ts");
 const GUARD_CORE = fileURLToPath(new URL("./guard-core.mjs", import.meta.url));
@@ -75,7 +78,8 @@ export function lcLaunch({ sid, cwd, sessionDir, model, bin = LC_DEFAULT_BIN, gu
     // --collect: a scope that failed (an OOM kill under MemoryMax) is unloaded at once, so the
     // next spawn of the same session can take the same unit name.
     wrap.push("systemd-run", "--user", "--scope", "-q", "--collect", `--unit=${lcScopeUnit(sid)}`);
-    if (caps?.memoryMax) wrap.push("-p", `MemoryMax=${caps.memoryMax}`);
+    // With a memory cap the child is OOM-killed at the cap instead of being pushed into swap (zram).
+    if (caps?.memoryMax) wrap.push("-p", `MemoryMax=${caps.memoryMax}`, "-p", "MemorySwapMax=0");
     if (caps?.cpuQuota) wrap.push("-p", `CPUQuota=${caps.cpuQuota}`);
     wrap.push("--");
   }
@@ -154,6 +158,126 @@ export function installProjectGuard(cwd, { source = projectGuardSource() } = {})
   writeFileSync(tmp, source, { mode: 0o644 });
   renameSync(tmp, file);
   return file;
+}
+
+/**
+ * Keep the project-local guard out of git: `/.pi/extensions/even-guard.ts` in the repo's shared
+ * `info/exclude` (a worktree uses its main repo's), so `git add -A` (the factory's stages, an agent's
+ * own commits) never picks it up. A folder that is no git repository is left alone. Never throws.
+ * @returns {boolean} whether the line is (now) there
+ */
+export function excludeProjectGuard(dir, { git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }) } = {}) {
+  try {
+    const common = resolve(dir, String(git(["rev-parse", "--git-common-dir"], dir)).trim());
+    const file = join(common, "info", "exclude");
+    const line = "/" + LC_PROJECT_GUARD.split(sep).join("/");
+    let have = "";
+    try {
+      have = readFileSync(file, "utf8");
+    } catch {
+      /* none yet */
+    }
+    if (have.split("\n").includes(line)) return true;
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${have && !have.endsWith("\n") ? "\n" : ""}# even-bridge: its project-local pi guard\n${line}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const canonical = (p) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+};
+
+/** pi's lock on the trust store: the directory `<file>.lock` (proper-lockfile; stale after 10 s). */
+function withTrustLock(file, fn, { tries = 100, staleMs = 10_000 } = {}) {
+  const lock = `${file}.lock`;
+  mkdirSync(dirname(file), { recursive: true });
+  for (let i = 0; ; i++) {
+    try {
+      mkdirSync(lock);
+      break;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > staleMs) {
+          rmdirSync(lock);
+          continue;
+        }
+      } catch {
+        /* gone meanwhile */
+      }
+      if (i >= tries) throw new Error(`trust store ${file} is locked`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      rmdirSync(lock);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * Set (`trusted: true`) or remove (`trusted: null`) pi project-trust entries for `paths`
+ * (canonical paths, as pi stores them). The file keeps pi's format (sorted keys, 2-space JSON).
+ * @returns {string[]} the keys changed
+ */
+export function updateTrust(paths, trusted, { file = LC_TRUST_FILE } = {}) {
+  const f = expandHome(file);
+  const keys = [...new Set(paths.filter(Boolean).map(canonical))];
+  if (!keys.length) return [];
+  return withTrustLock(f, () => {
+    let data = {};
+    try {
+      data = JSON.parse(readFileSync(f, "utf8"));
+    } catch (err) {
+      if (err.code !== "ENOENT") throw new Error(`trust store ${f} unreadable: ${err.message}`);
+    }
+    const changed = [];
+    for (const k of keys) {
+      if (trusted === true && data[k] !== true) (data[k] = true), changed.push(k);
+      if (trusted !== true && k in data) delete data[k], changed.push(k);
+    }
+    if (changed.length) {
+      const sorted = Object.fromEntries(Object.keys(data).sort().map((k) => [k, data[k]]));
+      const tmp = `${f}.${process.pid}.tmp`;
+      writeFileSync(tmp, `${JSON.stringify(sorted, null, 2)}\n`, "utf8");
+      renameSync(tmp, f);
+    }
+    return changed;
+  });
+}
+
+/** Worktrees of this cwd's running/waiting factory runs (ledger `work`, existing): `[{ id, work }]`. */
+export function factoryWorktrees(cwd, root = FACTORY_ROOT) {
+  if (!cwd) return [];
+  const dir = expandHome(root);
+  let ids;
+  try {
+    ids = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const want = resolve(cwd);
+  const out = [];
+  for (const id of ids) {
+    const L = readLedger(id, dir);
+    if (!L || typeof L.repo !== "string" || (L.status !== "running" && L.status !== "waiting")) continue;
+    if (!within(resolve(L.repo), want)) continue;
+    const work = typeof L.work === "string" && L.work ? L.work : join(dir, id, "work");
+    if (existsSync(work)) out.push({ id: L.id ?? id, work });
+  }
+  return out;
 }
 
 function onPath(bin, env) {

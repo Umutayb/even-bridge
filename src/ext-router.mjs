@@ -314,6 +314,9 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       let result;
       if (p.name === "durable") {
         // Agent fields: validated, and only the ones the caller sent.
+        if (sessionId && factory != null) {
+          return res.status(400).json({ error: "'factory' is set when an agent starts; use /api/agents/:sid/factory" });
+        }
         const checked = agentOpts({ name, model, maxTurns, requestId, origin, engine, factory });
         if (checked.error) return res.status(400).json({ error: checked.error });
         result = await p.prompt(sessionId, text, effectiveCwd, checked.opts);
@@ -474,7 +477,8 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
   // Factory toggle of a lets-code agent (ruling 4): 409 native, 504 without the mode notify.
   router.post("/agents/:sid/factory", async (req, res, next) => {
-    if (!durable) return next();
+    // Without the lets-code engine the route does not exist (as on main).
+    if (!durable || !(Array.isArray(durable.engines) && durable.engines.includes("lets-code"))) return next();
     const checked = factoryOpts(req.body ?? {});
     if (checked.error) return res.status(400).json({ error: checked.error });
     try {

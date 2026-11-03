@@ -8,7 +8,9 @@
 //   node scripts/durable-smoke.mjs --engine lets-code                 # (a) a file, (a2) a mandate ask denied, (c) scope, (d) banner
 //   node scripts/durable-smoke.mjs --engine lets-code --kill-mid-turn --kill-signal SIGKILL   # (b) restart mid-turn
 //   node scripts/durable-smoke.mjs --engine lets-code --factory   # factory:true at start, the toggle, a ticket with an unquoted how-to-run (stopped at its first checkpoint)
-//        [--enable-experts-temporarily]   answer lets-code's "Enable the factory's experts?" yes and restore its state file afterwards
+//        Precondition: the operator has enabled the factory's five experts in lets-code
+//        (`/experts enable developer|expert-reviewer|design-reviewer|tester|acceptance-judge`);
+//        the bridge never enables them (ruling 4), and without them the toggle answers 409 experts_disabled.
 //        WARNING (2026-11-03): two --factory runs on borealis coincided with a hard reboot of the host (one
 //        waiting at the experts question, one ~40 s after answering it yes; MemAvailable stayed > 4.4 GB).
 //        Do not run it on borealis again until that is understood (see the Task 3 report).
@@ -35,7 +37,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, closeSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, closeSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -638,12 +640,7 @@ async function factoryLc() {
   // checkpoint (no build, little vLLM time). The factory dir is removed afterwards when this run created it.
   const factoryRoot = join(homedir(), ".pi", "agent", "lets-code-factory");
   const hadFactoryRoot = existsSync(factoryRoot);
-  // `/factory start` asks once to enable the five stage experts (host-global, ruling 4: the operator's job).
-  // --enable-experts-temporarily answers yes and restores ~/.pi/agent/lets-code-state.json afterwards
-  // (as the Task 1 spike did); without it the smoke answers no and stops there.
-  const statePath = join(homedir(), ".pi", "agent", "lets-code-state.json");
-  const enableExperts = flag("--enable-experts-temporarily");
-  const stateBackup = enableExperts && existsSync(statePath) ? readFileSync(statePath) : null;
+
   const before = hadFactoryRoot ? new Set(readdirSync(factoryRoot)) : new Set();
   const { c } = await lcStart();
   const frames = [];
@@ -670,6 +667,7 @@ async function factoryLc() {
     // the toggle route on the live child: /mode orchestration re-sent, resolved on lets-code's notify
     t = Date.now();
     const ack = await api("POST", `/agents/${encodeURIComponent(sid)}/factory`, { on: true });
+    if (ack.status === 409 && ack.json?.reason === "experts_disabled") fail(`the factory's experts are not enabled: ${ack.json.error} (operator step)`);
     say(`(f2) POST /agents/${sid}/factory {on:true} → ${ack.status} ${JSON.stringify(ack.json)} in ${Date.now() - t} ms`);
     if (ack.status !== 200 || ack.json?.mode !== "orchestration") fail("lets-code did not acknowledge /mode orchestration");
     const bad = await api("POST", `/agents/${encodeURIComponent(sid)}/factory`, { on: true, ticket: "x", howToRun: '"test -f hello.txt"' });
@@ -685,20 +683,11 @@ async function factoryLc() {
     const tickets = readdirSync(join(WORK, ".factory")).filter((f) => /^ticket-\d+\.md$/.test(f));
     say(`(f3) ticket file(s): ${tickets.join(", ")}; content matches: ${tickets.length === 1 && readFileSync(join(WORK, ".factory", tickets[0]), "utf8") === ticket}`);
     const isCheckpoint = (f) => f.type === "user_question" && /^Factory \S+: /.test(f.questions?.[0]?.question ?? "");
-    const isExperts = (f) => f.type === "permission_request" && /^Enable the factory's experts\?/.test(f.toolName ?? "");
-    await waitFor(() => frames.some((f) => isCheckpoint(f) || isExperts(f)), TURN_TIMEOUT_MS, "the experts question or the first checkpoint");
-    if (frames.some(isExperts) && !frames.some(isCheckpoint)) {
-      const ex = frames.find(isExperts);
-      say(`(f3) lets-code asks: ${ex.toolName} ${short(ex.detail ?? "", 160)}`);
-      const pr = await api("POST", "/permission-response", { sessionId: sid, decision: enableExperts ? "allow" : "deny" });
-      say(`(f3) answered ${enableExperts ? "Yes (temporarily; the state file is restored at the end)" : "No"} → ${pr.status}`);
-      if (!enableExperts) {
-        await waitIdle(sid, { sawBusy: true });
-        say("SMOKE PARTIAL: /factory start reached lets-code; it needs the factory's experts enabled (operator step), so no run started");
-        return;
-      }
-      await waitFor(() => frames.some(isCheckpoint), TURN_TIMEOUT_MS, "the first factory checkpoint");
-    }
+    const refused = (f) => f.type === "error" && /^(lets-code refused the factory start|factory experts must be enabled)/.test(f.message ?? "");
+    await waitFor(() => frames.some((f) => isCheckpoint(f) || refused(f)), TURN_TIMEOUT_MS, "the first checkpoint (or a refusal)");
+    // The session answers lets-code's experts question No by itself (R-C2); seeing it here means the
+    // operator has not enabled the experts.
+    if (!frames.some(isCheckpoint)) fail("no factory checkpoint: the factory's experts are not enabled (operator step)");
     const q = frames.find((f) => f.type === "user_question" && /^Factory \S+: /.test(f.questions?.[0]?.question ?? ""));
     const qText = q.questions[0].question;
     runId = /^Factory (\S+):/.exec(qText)[1];
@@ -726,10 +715,6 @@ async function factoryLc() {
     if (left) fail(`scope still there after stop: ${left}`);
     say("SMOKE OK (lets-code factory: factory:true at start acknowledged, toggle acknowledged, unquoted how-to-run reached the ledger)");
   } finally {
-    if (stateBackup) {
-      writeFileSync(statePath, stateBackup);
-      say(`restored ${statePath}`);
-    }
     // the factory data this run created (the operator's own runs are left alone)
     if (existsSync(factoryRoot)) {
       for (const d of readdirSync(factoryRoot)) if (!before.has(d)) rmSync(join(factoryRoot, d), { recursive: true, force: true });

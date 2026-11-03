@@ -169,7 +169,9 @@ starts the session as an owned lets-code child instead of in-process tools. Off
 engine is off`. The child is `lets-code --mode rpc [--session <file>] --name <label>
 --mandate ask --subagents --sandbox --session-dir <store dir>/lc-sessions/<sid>
 -e src/providers/durable/lc/even-guard.ts`, inside `systemd-run --user --scope -q
---collect --unit=even-lc-<sid> [-p MemoryMax=…] -p CPUQuota=200%` (`--collect` plus a
+--collect --unit=even-lc-<sid> [-p MemoryMax=… -p MemorySwapMax=0] -p CPUQuota=200%`
+(with a memory controller the child is OOM-killed at its cap instead of swapping into
+zram; `--collect` plus a
 `systemctl --user reset-failed even-lc-<sid>.scope` before each spawn: a scope that an
 OOM kill left failed never blocks the next spawn's unit name).
 
@@ -187,19 +189,43 @@ OOM kill left failed never blocks the next spawn's unit name).
   project, and the parent's `-e even-guard.ts` answers pi's `project_trust` event "yes,
   remember" for exactly its session cwd (pi records it in `~/.pi/agent/trust.json`).
   Live probe 2026-11-03: before this a subagent's `wc -c ~/.ssh/id_ed25519.pub` ran;
-  after it, the subagent got `even-guard: ~/.ssh is off limits`. **Not covered:** a
-  factory run's stage subagents work in the run's worktree (below), which has no
-  project-local guard.
+  after it, the subagent got `even-guard: ~/.ssh is off limits`. The guard file is added
+  to the repo's `.git/info/exclude` (`/.pi/extensions/even-guard.ts`), so `git add -A`
+  never commits it. **Known limit:** the `.pi` block is text-based for bash (a command that
+  builds the path some other way is not caught); write/edit to `.pi/` are refused.
+- **Forget.** `forgetSession` removes the session cwd's entry from `~/.pi/agent/trust.json`
+  (unless another live lets-code session has the same cwd) and the entries of the factory
+  worktrees it trusted (`record.trusted`).
 - **Factory worktree.** A factory run works in
   `~/.pi/agent/lets-code-factory/<id>/work`; the guard treats that dir as the project
   when the run's `ledger.json` `repo` is the session cwd or below it (ruling 19), and keeps
   the rest of `~/.pi` off limits. `stopSession` leaves the factory dir to lets-code.
+  The run's stage subagents are plain pi processes in that worktree: while a factory run
+  may create one (after `/factory start`, at a checkpoint, on `/factory resume`), the
+  engine gives each new worktree of this session's running/waiting runs the project guard,
+  the git exclude and a pi trust entry (written under pi's own lock `trust.json.lock`).
 - **Experts are the operator's.** lets-code's "Enable the factory's experts?" confirm is
   answered No by the bridge with the error frame `factory experts must be enabled by the
   operator` (a glasses Yes must never change host-wide lets-code state), and
-  `POST /api/agents/:sid/factory` with a ticket answers 409 `{reason: "experts_disabled"}`
-  while `~/.pi/agent/lets-code-state.json` lacks any of developer, expert-reviewer,
-  design-reviewer, tester, acceptance-judge (it is only read).
+  `POST /api/agents/:sid/factory` with `on: true` (with or without a ticket; orchestration
+  without the stage experts only raises expert dialogs that are answered No), and a new
+  agent with `factory: true`, answer 409 `{error, reason: "experts_disabled"}` while
+  `~/.pi/agent/lets-code-state.json` lacks any of developer, expert-reviewer,
+  design-reviewer, tester, acceptance-judge (it is only read). The single-expert confirm
+  "Enable the <name> expert?" is answered No the same way.
+- **The factory toggle.** `POST /api/agents/:sid/factory {on, ticket?, howToRun?}` (only
+  with the lets-code engine; without it the route falls through as on main) records the
+  wish, waits for a child that is starting, then sends `/mode orchestration|ask` to a live
+  child and answers `{ok, sessionId, factory, mode}` with `mode` = what lets-code
+  acknowledged in this call (`null`: no live child, applied at the next spawn). Without the
+  ack: 504 and the flag stays as it was. A ticket goes to `<cwd>/.factory/ticket-<ms>.md`
+  and starts `/factory start <file>[ <howToRun>]` (how-to-run unquoted: one line, no
+  quotes). The 200 comes before lets-code accepts the run: a refusal (a warning/error
+  notify, or "The factory needs these experts enabled…") becomes an error frame
+  `lets-code refused the factory start: …` and `lastError {text, at}` on the agent's
+  `GET /api/agents` row (cleared by the next toggle). `factory` on a prompt to an existing
+  agent is a 400 (use the toggle). The factory smoke (`scripts/durable-smoke.mjs --engine
+  lets-code --factory`) needs the operator to have enabled the five experts first.
 - **Restarts.** A prompt counts as delivered once lets-code accepted it (its response or
   any event after it, recorded as `sentTaskId`). After a restart a delivered run gets one
   cut-off prompt (or `/factory resume <id>`); an undelivered prompt is sent again as it was.

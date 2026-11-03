@@ -22,6 +22,13 @@
 // extension commands): `/mode orchestration|ask` → notify `mode: <m>` (unless
 // FAKE_PI_NO_NOTIFY=1); `/factory start|resume …` → the FACTORY dialog, and the
 // prompt response (disposition "handled") once it is answered; other `/…` → handled.
+// FAKE_PI_FACTORY_REFUSE=1: `/factory start` is refused with a warning notify (experts missing).
+// FAKE_PI_FACTORY_EXPERTS_ASK=1: `/factory start` first asks lets-code's experts confirm; a No ends it
+//   with the warning "The user did not enable the factory's experts.".
+// FAKE_PI_FACTORY_WORK=<factory root>: `/factory start` creates the run's ledger and worktree
+//   (`<root>/20261103-093221-c129/{ledger.json,work}`, repo = cwd, status waiting) before its checkpoint.
+// FAKE_PI_START_DELAY_MS=<ms>: the first get_state is answered that late (a slow start).
+// EXPERT1 (prompt): lets-code's single-expert confirm "Enable the developer expert?".
 // FAKE_PI_CRASH=1: exit 137 on every prompt (a crash mid-turn).
 // FAKE_PI_DIE_ONCE=<marker file>: the first prompt (across processes) exits 137
 // before anything is written or answered (lets-code never accepted it);
@@ -79,6 +86,8 @@ const append = (obj) => {
 };
 const message = (role, content) => append({ type: "message", timestamp: new Date().toISOString(), message: { role, content } });
 
+let startDelayed = false;
+
 // ── runs ──
 let run = null; // { text, dialog?: {id, onAnswer} }
 let uiSeq = 0;
@@ -106,7 +115,7 @@ function ask(req, onAnswer) {
   out({ type: "extension_ui_request", id, ...req });
   return id;
 }
-const notify = (text) => out({ type: "extension_ui_request", id: `ui-${++uiSeq}`, method: "notify", message: text, notifyType: "info" });
+const notify = (text, notifyType = "info") => out({ type: "extension_ui_request", id: `ui-${++uiSeq}`, method: "notify", message: text, notifyType });
 
 const FACTORY_REQ = {
   method: "select",
@@ -135,7 +144,30 @@ function onPrompt(cmd) {
       return;
     }
     if (verb === "/factory") {
-      ask(FACTORY_REQ, () => out({ type: "response", id: cmd.id, command: "prompt", success: true, data: { disposition: "handled" } }));
+      const handled = () => out({ type: "response", id: cmd.id, command: "prompt", success: true, data: { disposition: "handled" } });
+      if (process.env.FAKE_PI_FACTORY_REFUSE === "1") {
+        notify("The factory needs these experts enabled: developer, tester (/experts enable <name>).", "warning");
+        return handled();
+      }
+      const go = () => {
+        const root = process.env.FAKE_PI_FACTORY_WORK;
+        if (root) {
+          const id = "20261103-093221-c129";
+          const work = join(root, id, "work");
+          mkdirSync(work, { recursive: true });
+          writeFileSync(join(root, id, "ledger.json"), JSON.stringify({ v: 1, id, repo: process.cwd(), work, status: "waiting", updated: Date.now() }));
+        }
+        ask(FACTORY_REQ, handled);
+      };
+      if (process.env.FAKE_PI_FACTORY_EXPERTS_ASK === "1") {
+        ask({ method: "confirm", title: "Enable the factory's experts?", message: "developer, tester\nlets-code remembers the answer yes." }, (r) => {
+          if (r.confirmed === true) return go();
+          notify("The user did not enable the factory's experts.", "warning");
+          handled();
+        });
+        return;
+      }
+      go();
       return;
     }
     out({ type: "response", id: cmd.id, command: "prompt", success: true, data: { disposition: "handled" } });
@@ -154,10 +186,12 @@ function onPrompt(cmd) {
     setTimeout(() => process.exit(137), 50);
     return;
   }
-  if (text === "CONFIRM" || text === "EXPERTS") {
+  if (text === "CONFIRM" || text === "EXPERTS" || text === "EXPERT1") {
     const req = text === "CONFIRM"
       ? { method: "confirm", title: "Proceed?", message: "a plain confirm" }
-      : { method: "confirm", title: "Enable the factory's experts?", message: "developer, tester\nlets-code remembers the answer yes." };
+      : text === "EXPERT1"
+        ? { method: "confirm", title: "Enable the developer expert?", message: "writes code\nlets-code remembers the answer yes." }
+        : { method: "confirm", title: "Enable the factory's experts?", message: "developer, tester\nlets-code remembers the answer yes." };
     ask(req, (r) => {
       say(r.cancelled ? "cancelled" : `confirmed: ${r.confirmed}`);
       endRun();
@@ -220,9 +254,15 @@ process.stdin.on("data", (chunk) => {
     }
     log({ ...cmd, _pid: process.pid });
     switch (cmd.type) {
-      case "get_state":
-        out({ type: "response", id: cmd.id, command: "get_state", success: true, data: { sessionId, sessionFile, isStreaming: Boolean(run) } });
+      case "get_state": {
+        const reply = () => out({ type: "response", id: cmd.id, command: "get_state", success: true, data: { sessionId, sessionFile, isStreaming: Boolean(run) } });
+        const delay = Number(process.env.FAKE_PI_START_DELAY_MS || 0);
+        if (delay > 0 && !startDelayed) {
+          startDelayed = true;
+          setTimeout(reply, delay);
+        } else reply();
         break;
+      }
       case "prompt":
         onPrompt(cmd);
         break;

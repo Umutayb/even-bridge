@@ -81,6 +81,8 @@ function makeCase({ lc = {}, extra = {}, warn } = {}) {
         runsRoot,
         childEnv: { FAKE_PI_LOG: logFile },
         stateFile,
+        trustFile: join(dir, "trust.json"), // never the real ~/.pi/agent/trust.json
+        factoryWatchMs: 50,
         ...lc,
         ...(more.lc ?? {}),
       },
@@ -657,6 +659,7 @@ test("the mode comes from the notify", async (t) => {
   await assert.rejects(q.setFactory(sid2, true), (err) => err.statusCode === 504 && err.message === "lets-code did not confirm the mode");
   assert.ok(Date.now() - t0 < 2000, "gave up after modeAckMs");
   assert.equal((await recordOf(q, sid2)).mode, before);
+  assert.equal((await recordOf(q, sid2)).factory, false, "an unconfirmed toggle is not kept for the next spawn");
 });
 
 test("new session with factory:true sends /mode orchestration before the first prompt", async (t) => {
@@ -672,17 +675,141 @@ test("new session with factory:true sends /mode orchestration before the first p
   await assert.rejects(p.prompt(undefined, "x", c.work, { factory: true }), (err) => err.statusCode === 400 && err.message === "'factory' needs engine lets-code");
 });
 
-test("the factory never enables experts", async (t) => {
+test("the factory never enables experts: lets-code's experts question is answered No and the refusal is reported", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_FACTORY_EXPERTS_ASK: "1" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI", howToRun: "npm test" });
+  await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && /^lets-code refused the factory start: /.test(f.message)), 5000, "refusal");
+  assert.ok(!c.frames.some((f) => f.sid === sid && f.type === "permission_request"), "the experts question never reaches the phone");
+  const answers = c.log().filter((l) => l.type === "extension_ui_response");
+  assert.equal(answers.length, 1);
+  assert.equal(answers[0].confirmed, false);
+  assert.ok(!c.prompts().some((x) => x.message.startsWith("/experts")));
+  await until(async () => (await recordOf(p, sid)).lastError?.text === "The user did not enable the factory's experts.", 5000, "lastError");
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
+});
+
+test("a single-expert question is answered No too", async (t) => {
   const c = makeCase();
   const p = c.open();
   t.after(c.closeAll);
-  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code", factory: true });
+  const { sessionId: sid } = await p.prompt(undefined, "EXPERT1", c.work, { engine: "lets-code" });
   await idleAfter(c, sid);
-  await p.setFactory(sid, true, { ticket: "Fix the CI", howToRun: "npm test" });
-  await confirmCheckpoint(c, p, sid);
+  assert.ok(!c.frames.some((f) => f.sid === sid && f.type === "permission_request"));
+  assert.equal(c.log().find((l) => l.type === "extension_ui_response").confirmed, false);
+});
+
+test("a refused factory start reaches the record and the agents list", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_FACTORY_REFUSE: "1" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI" });
+  const msg = "The factory needs these experts enabled: developer, tester (/experts enable <name>).";
+  await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && f.message === `lets-code refused the factory start: ${msg}`), 5000, "error frame");
+  await until(async () => (await recordOf(p, sid)).lastError?.text === msg, 5000, "lastError");
+  const row = (await p.listAgents()).find((a) => a.sid === sid);
+  assert.equal(row.lastError.text, msg);
+  assert.equal(typeof row.lastError.at, "number");
+  // a later toggle clears it
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
   await p.setFactory(sid, false);
-  assert.ok(c.prompts().length >= 4);
-  assert.ok(!c.prompts().some((x) => x.message.startsWith("/experts")));
+  assert.equal((await recordOf(p, sid)).lastError, null);
+});
+
+/** The first run ended (a mode notify may come after its idle frame). */
+const ranOnce = (c, p, sid) => until(() => c.frames.some((f) => f.sid === sid && f.type === "result") && p.getStatus(sid).state === "idle", 8000, "run ended");
+
+test("setFactory on while the child starts waits for the start: the child ends in orchestration", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_START_DELAY_MS: "300" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await until(() => c.spawns().length === 1, 5000, "spawn");
+  const r = await p.setFactory(sid, true); // the child is still starting
+  assert.deepEqual(r, { factory: true, mode: "orchestration" });
+  await ranOnce(c, p, sid);
+  assert.ok(promptsOf(c, 0).includes("/mode orchestration"));
+  assert.equal((await recordOf(p, sid)).mode, "orchestration");
+});
+
+test("setFactory off while a factory child starts: the last mode sent is ask", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_START_DELAY_MS: "300" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code", factory: true });
+  await until(() => c.spawns().length === 1, 5000, "spawn");
+  assert.deepEqual(await p.setFactory(sid, false), { factory: false, mode: "ask" });
+  await ranOnce(c, p, sid);
+  const modes = promptsOf(c, 0).filter((m) => m.startsWith("/mode"));
+  assert.equal(modes.at(-1), "/mode ask");
+  const rec = await recordOf(p, sid);
+  assert.equal(rec.factory, false);
+  assert.equal(rec.mode, "ask");
+});
+
+test("setFactory without a live child records the flag and reports no mode", async (t) => {
+  const c = makeCase({ lc: { idleKeepMs: 0 } });
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await until(() => p._lc.liveCount() === 0, 5000, "idle stop");
+  assert.deepEqual(await p.setFactory(sid, true), { factory: true, mode: null });
+  assert.deepEqual(await p.setFactory(sid, false), { factory: false, mode: null });
+});
+
+test("provider-level factory guards: native 409, archived 404, a factory flag on an existing agent 400", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: nat } = await p.prompt(undefined, "hello", c.work, { name: "nat" });
+  await assert.rejects(p.setFactory(nat, true), (e) => e.statusCode === 409 && e.message === "the factory needs the lets-code engine");
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await assert.rejects(p.prompt(sid, "x", undefined, { factory: true }), (e) => e.statusCode === 400 && /'factory' is set when an agent starts/.test(e.message));
+  await p.stopSession(sid);
+  await assert.rejects(p.setFactory(sid, true), (e) => e.statusCode === 404);
+  await assert.rejects(p.setFactory("dur-nope", true), (e) => e.statusCode === 404);
+});
+
+test("a new agent with the factory on is refused 409 while the experts are off, and leaves no row", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  writeFileSync(c.stateFile, JSON.stringify({ experts: { developer: true } }));
+  const count = () => [...p._map.rows({ seenSince: 0 })].length;
+  const before = count();
+  await assert.rejects(p.prompt(undefined, "hello", c.work, { engine: "lets-code", factory: true }), (e) => e.statusCode === 409 && e.reason === "experts_disabled");
+  assert.equal(count(), before);
+  assert.equal(c.spawns().length, 0);
+});
+
+test("factory worktrees get the project guard, a git exclude and pi trust; forget removes the trust entries", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_FACTORY_WORK: c.factoryRoot } } });
+  t.after(c.closeAll);
+  const trust = join(c.dir, "trust.json");
+  writeFileSync(trust, JSON.stringify({ "/somewhere/else": true, [realpathSync(c.work)]: true }, null, 2));
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI" });
+  const work = join(c.factoryRoot, "20261103-093221-c129", "work");
+  await until(() => existsSync(join(work, ".pi", "extensions", "even-guard.ts")), 5000, "worktree guard");
+  const guard = readFileSync(join(work, ".pi", "extensions", "even-guard.ts"), "utf8");
+  assert.match(guard, /guardDecision/);
+  await until(() => JSON.parse(readFileSync(trust, "utf8"))[realpathSync(work)] === true, 5000, "trust entry");
+  assert.ok(!existsSync(`${trust}.lock`), "the trust lock is released");
+  await until(async () => (await recordOf(p, sid)).trusted?.includes(work), 5000, "record.trusted");
+  await confirmCheckpoint(c, p, sid);
+  await p.forgetSession(sid);
+  await until(() => !(realpathSync(work) in JSON.parse(readFileSync(trust, "utf8"))), 5000, "trust removed");
+  const left = JSON.parse(readFileSync(trust, "utf8"));
+  assert.deepEqual(left, { "/somewhere/else": true }, "the session cwd and its worktree are gone; others stay");
 });
 
 // ── fix round 1 ──────────────────────────────────────────────────────────────
@@ -834,6 +961,7 @@ test("setFactory with a ticket is refused 409 experts_disabled while the experts
   assert.ok(!c.prompts().some((x) => x.message.startsWith("/factory") || x.message.startsWith("/mode")));
   assert.equal(readFileSync(c.stateFile, "utf8"), before, "the state file is only read");
   assert.equal((await recordOf(p, sid)).factory, false);
-  // Without a ticket the toggle itself still works (no factory run starts).
-  assert.equal((await p.setFactory(sid, true)).factory, true);
+  // Orchestration without the stage experts is refused too (Task 3 fix round); off always works.
+  await assert.rejects(p.setFactory(sid, true), (e) => e.statusCode === 409 && e.reason === "experts_disabled");
+  assert.deepEqual(await p.setFactory(sid, false), { factory: false, mode: "ask" });
 });

@@ -35,15 +35,19 @@ import {
   LC_RUNS_ROOT,
   expandHome,
   LC_STATE_FILE,
+  excludeProjectGuard,
   expertsEnabled,
+  factoryWorktrees,
   findFactoryRun,
   installProjectGuard,
+  LC_TRUST_FILE,
   lcLaunch,
   lcMemoryControllerAvailable,
   lcSandboxAvailable,
   removeStaleRegistry,
   resetFailedScope,
   stopLcScopes,
+  updateTrust,
 } from "./launch.mjs";
 import { LC_ANSWER, LC_ANSWER_MAX, LC_TOOL, LC_USER, LcSessionDoc, lcSessionInitial } from "./record.mjs";
 import { LcSession } from "./session.mjs";
@@ -65,6 +69,10 @@ export const LC_SANDBOX_MISSING = "lets-code sandbox unavailable: install bubble
 /** lc.tool entries kept per run (Durable never prunes; the full transcript is pi's session file). */
 export const LC_TOOL_ENTRIES_MAX = 20;
 export const LC_EXPERTS_DISABLED = "factory experts must be enabled by the operator";
+/** lets-code's own refusals of `/factory start` (factory.ts handler), besides notifies of type warning/error. */
+export const LC_FACTORY_REFUSAL_RE = /^(The user did not enable the factory's experts|The factory needs these experts enabled|No ticket file |factory: )/;
+/** How often a session with a factory run looks for new run worktrees to guard. */
+export const LC_FACTORY_WATCH_MS = 1000;
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 const lastLineOf = (text) => String(text ?? "").split("\n").filter((l) => l.trim()).at(-1)?.trim() ?? "";
@@ -120,6 +128,8 @@ export function createLcEngine({
   defaultModel,
   spawnWrap = (wrap) => wrap,
   stateFile = LC_STATE_FILE,
+  trustFile = LC_TRUST_FILE,
+  factoryWatchMs = LC_FACTORY_WATCH_MS,
 } = {}) {
   const mem = memoryController ?? lcMemoryControllerAvailable();
   if (!mem) log.warn?.(LC_NO_MEMORY_WARNING);
@@ -155,6 +165,9 @@ export function createLcEngine({
         starting: null,
         tools: 0,
         toolsDropped: 0,
+        factoryStart: null, // { at, file }: a `/factory start` sent, not yet accepted (a refusal is reported)
+        factoryWatch: null, // the timer guarding new factory worktrees while a run may create them
+        guarded: new Set(), // factory worktrees already guarded by this process
       };
       states.set(sid, s);
     }
@@ -278,6 +291,8 @@ export function createLcEngine({
     const s = S(sid);
     if (s.session !== session) return; // an older child (stopped while idle) exiting late
     s.session = null;
+    s.factoryStart = null;
+    stopFactoryWatch(sid);
     clearTimeout(s.idleTimer);
     s.idleTimer = null;
     const expected = Boolean(session.expectedExit);
@@ -292,12 +307,33 @@ export function createLcEngine({
     for (const m of s.modeWaiters.splice(0)) m.reject(httpError(504, "lets-code did not confirm the mode"));
   }
 
-  function onNotify(sid, text) {
-    const m = /^mode: (\S+)/.exec(String(text).trim());
+  /** lets-code refused a `/factory start`: an error frame, the answer entry and `record.lastError` (the shim reads it). */
+  function factoryRefused(sid, text) {
+    const s = S(sid);
+    s.factoryStart = null;
+    emitTo(sid, { type: "error", message: `lets-code refused the factory start: ${text}` });
+    writeEntry(sid, LC_ANSWER, text);
+    return updateRecord(sid, (d) => {
+      d.lastError = { text, at: now() };
+    });
+  }
+
+  function onNotify(sid, text, type = "info") {
+    const t = String(text).trim();
+    const s = S(sid);
+    if (s.factoryStart && (type === "error" || type === "warning" || LC_FACTORY_REFUSAL_RE.test(t))) {
+      factoryRefused(sid, t);
+      return;
+    }
+    if (s.factoryWatch) guardFactory(sid);
+    // The record follows every mode notify, also lets-code's own switch ("mode: orchestration (<why>): …",
+    // mandate.ts) — so record.mode may say orchestration while record.factory (the user's wish) is false.
+    // Only the exact ack of our `/mode <m>` resolves a waiter.
+    const m = /^mode: (\S+)/.exec(t);
     if (!m) return;
     const mode = m[1];
-    const s = S(sid);
-    const [hit, rest] = [s.modeWaiters.filter((w) => w.mode === mode), s.modeWaiters.filter((w) => w.mode !== mode)];
+    const exact = t === `mode: ${mode}`;
+    const [hit, rest] = exact ? [s.modeWaiters.filter((w) => w.mode === mode), s.modeWaiters.filter((w) => w.mode !== mode)] : [[], s.modeWaiters];
     s.modeWaiters = rest;
     // Resolve once the record holds the mode, so a reader right after setFactory sees it.
     updateRecord(sid, (d) => {
@@ -305,6 +341,50 @@ export function createLcEngine({
     }).then(() => {
       for (const w of hit) w.resolve(mode);
     });
+  }
+
+  /**
+   * Factory stages run as plain pi processes in the run's worktree (`<factory>/<id>/work`), not in the
+   * session cwd: give each new worktree of this session's runs the project guard, keep it out of git,
+   * and trust it in pi's store so pi loads the guard there (ruling (a) of the Task 2 round).
+   */
+  function guardFactory(sid) {
+    const row = map.get(sid);
+    if (!row) return [];
+    const s = S(sid);
+    const added = [];
+    for (const { work } of factoryWorktrees(row.cwd, factoryRoot)) {
+      if (s.guarded.has(work)) continue;
+      try {
+        installProjectGuard(work);
+        excludeProjectGuard(work);
+        updateTrust([work], true, { file: trustFile });
+        s.guarded.add(work);
+        added.push(work);
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: factory worktree ${work} not guarded (${err.message})`);
+      }
+    }
+    if (added.length) {
+      updateRecord(sid, (d) => {
+        d.trusted = [...new Set([...(d.trusted ?? []), ...added])];
+      });
+    }
+    return added;
+  }
+
+  function startFactoryWatch(sid) {
+    const s = S(sid);
+    guardFactory(sid);
+    if (s.factoryWatch) return;
+    s.factoryWatch = setInterval(() => guardFactory(sid), factoryWatchMs);
+    s.factoryWatch.unref?.();
+  }
+
+  function stopFactoryWatch(sid) {
+    const s = S(sid);
+    clearInterval(s.factoryWatch);
+    s.factoryWatch = null;
   }
 
   /** Send `/mode <mode>` and resolve on the child's `mode: <mode>` notify (ruling 4), else 504. */
@@ -350,6 +430,7 @@ export function createLcEngine({
       // from the project-local copy (trusted by the parent's even-guard.ts, see there).
       try {
         installProjectGuard(row.cwd);
+        excludeProjectGuard(row.cwd);
       } catch (err) {
         log.warn?.(`[durable:lc] ${sid}: project guard not written (${err.message}); subagents run without the even guard`);
       }
@@ -369,7 +450,12 @@ export function createLcEngine({
         cwd: row.cwd,
         now,
         clientCount: () => clientCount(sid),
-        onNotify: (text) => onNotify(sid, text),
+        onNotify: (text, type) => onNotify(sid, text, type),
+        onDialog: (kind) => {
+          if (kind !== "factory") return;
+          s.factoryStart = null; // a checkpoint: lets-code accepted the run
+          startFactoryWatch(sid);
+        },
         onAgentEnd: (sess) => finish(sid, sess),
         onToolEnd: (name, args) => {
           if (++s.tools <= LC_TOOL_ENTRIES_MAX) writeEntry(sid, LC_TOOL, summarizePiToolCall(name, args));
@@ -394,7 +480,8 @@ export function createLcEngine({
         d.cwd = row.cwd;
         d.model = row.model_provider ? `${row.model_provider}/${row.model_id}` : null;
       });
-      if (rec.factory) {
+      // The flag as it is NOW: a toggle during this start (it waits for the start) must win.
+      if ((await readRecord(sid)).factory) {
         await sendMode(sid, "orchestration").catch((err) => log.warn?.(`[durable:lc] ${sid}: factory mode after spawn: ${err.message}`));
       }
     })();
@@ -410,6 +497,7 @@ export function createLcEngine({
   function finish(sid, session) {
     const s = S(sid);
     if (session && s.session !== session) return;
+    s.factoryStart = null; // the run ended: a refusal came before its end
     const text = String(session?.answerText ?? "").trim().slice(0, LC_ANSWER_MAX);
     const lastLine = lastLineOf(text);
     if (s.toolsDropped) writeEntry(sid, LC_TOOL, `(+${s.toolsDropped} more tool calls)`);
@@ -524,6 +612,7 @@ export function createLcEngine({
           // The prompt reached lets-code: continue that work, never re-send it.
           const runId = findFactoryRun(row.cwd, factoryRoot);
           send = runId ? `/factory resume ${runId}` : crashed ? LC_CRASH_PROMPT : LC_CUTOFF_PROMPT;
+          if (runId) setImmediate(() => startFactoryWatch(sid));
         } // else lets-code never accepted it: the user's prompt itself again (never replaced by a cut-off prompt)
         await updateRecord(sid, (d) => {
           d.restarts += 1;
@@ -644,7 +733,16 @@ export function createLcEngine({
     /** Forget: stop everything of `sid` and remove its subagent runs dir (ruling 2). */
     async forget(sid) {
       const rec = await readRecord(sid).catch(() => lcSessionInitial());
+      const cwd = map.get(sid)?.cwd ?? rec.cwd;
       await engine.stop(sid).catch(() => {});
+      // pi's trust of this session's cwd (its even-guard.ts answered "remember") and of the factory
+      // worktrees the engine trusted; a cwd another live lets-code session still uses keeps its entry.
+      const shared = cwd && [...map.rows({ seenSince: 0 })].some((r) => r.sid !== sid && !r.archived && r.engine === "lets-code" && r.cwd === cwd);
+      try {
+        updateTrust([...(shared ? [] : [cwd]), ...(rec.trusted ?? [])], null, { file: trustFile });
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: trust entries not removed (${err.message})`);
+      }
       if (rec.piSessionId) {
         rmSync(join(expandHome(runsRoot), rec.piSessionId), { recursive: true, force: true });
         forget(rec.piSessionId);
@@ -714,26 +812,49 @@ export function createLcEngine({
     async setFactory(sid, on, { ticket, howToRun } = {}) {
       const row = map.get(sid);
       if (!row || row.archived) throw httpError(404, "Session not found");
-      if (on && ticket) {
-        // Experts are host-wide lets-code state: only the operator enables them (ruling 4, R-C2).
+      if (on) {
+        // Experts are host-wide lets-code state: only the operator enables them (ruling 4, R-C2). Orchestration
+        // without them only raises expert dialogs the session answers No, so "on" needs them too.
         const ex = expertsEnabled({ stateFile });
         if (!ex.ok) throw Object.assign(httpError(409, `${LC_EXPERTS_DISABLED} (missing: ${ex.missing.join(", ")})`), { reason: "experts_disabled", missing: ex.missing });
       }
+      const s = S(sid);
+      // A child that is starting reads the flag after its start: wait for it, then decide (no race).
+      while (s.starting) await s.starting.catch(() => {});
+      const prev = Boolean((await readRecord(sid)).factory);
       await updateRecord(sid, (d) => {
         d.factory = Boolean(on);
+        d.lastError = null;
       });
-      const s = S(sid);
-      if (s.session?.running && !s.starting) await sendMode(sid, on ? "orchestration" : "ask");
+      let mode = null; // only what lets-code acknowledged in this call; null = applied at the next spawn
+      if (s.session?.running) {
+        try {
+          mode = await sendMode(sid, on ? "orchestration" : "ask");
+        } catch (err) {
+          // not confirmed: the flag stays what it was, so the next spawn does not apply a refused change
+          await updateRecord(sid, (d) => {
+            d.factory = prev;
+          });
+          throw err;
+        }
+      }
       if (on && ticket) {
         const name = `.factory/ticket-${now()}.md`;
         const file = join(row.cwd, name);
         mkdirSync(dirname(file), { recursive: true });
         writeFileSync(file, String(ticket));
         const text = `/factory start ${name}${howToRun ? ` ${String(howToRun).trim()}` : ""}`;
+        s.factoryStart = { at: now(), file: name };
         await engine.prompt(sid, text);
+        startFactoryWatch(sid);
       }
-      const rec = await readRecord(sid);
-      return { factory: rec.factory, mode: rec.mode };
+      return { factory: Boolean(on), mode };
+    },
+
+    /** Experts check for a new session started with the factory on (before any row exists). */
+    checkFactoryExperts() {
+      const ex = expertsEnabled({ stateFile });
+      if (!ex.ok) throw Object.assign(httpError(409, `${LC_EXPERTS_DISABLED} (missing: ${ex.missing.join(", ")})`), { reason: "experts_disabled", missing: ex.missing });
     },
 
     /** Deny mandate asks open for 10 min while nobody watches (ruling Q5). */
@@ -755,6 +876,7 @@ export function createLcEngine({
       for (const s of states.values()) {
         clearTimeout(s.idleTimer);
         s.idleTimer = null;
+        stopFactoryWatch(s.sid);
         if (s.session) {
           sids.push(s.sid);
           s.session.expectedExit = true;

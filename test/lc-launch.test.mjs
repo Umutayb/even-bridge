@@ -45,7 +45,7 @@ test("constants", () => {
 test("lcLaunch builds the glasses argv and the scope wrapper", () => {
   const l = lcLaunch(BASE);
   assert.equal(l.bin, "/home/ay/.local/bin/lets-code");
-  assert.deepEqual(l.wrap, ["systemd-run", "--user", "--scope", "-q", "--collect", "--unit=even-lc-dur-abc", "-p", "MemoryMax=500M", "-p", "CPUQuota=200%", "--"]);
+  assert.deepEqual(l.wrap, ["systemd-run", "--user", "--scope", "-q", "--collect", "--unit=even-lc-dur-abc", "-p", "MemoryMax=500M", "-p", "MemorySwapMax=0", "-p", "CPUQuota=200%", "--"]);
   assert.deepEqual(l.extraArgs, ["--mandate", "ask", "--subagents", "--sandbox", "--session-dir", "/s/lc-sessions/dur-abc", "-e", "/b/src/providers/durable/lc/even-guard.ts"]);
 });
 
@@ -157,4 +157,78 @@ test("the project-local guard imports guard-core by absolute URL and is rewritte
   writeFileSync(f, "tampered");
   installProjectGuard(dir);
   assert.equal(readFileSync(f, "utf8"), src, "every spawn overwrites it");
+});
+
+
+// ── Task 3 fix round: trust store, git exclude, factory worktrees ─────────────
+import { excludeProjectGuard, factoryWorktrees, updateTrust } from "../src/providers/durable/lc/launch.mjs";
+import { execFileSync } from "node:child_process";
+import { realpathSync as realpath3 } from "node:fs";
+
+test("updateTrust sets and removes entries in pi's format and releases its lock", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lc-trust-"));
+  try {
+    const file = join(dir, "trust.json");
+    writeFileSync(file, JSON.stringify({ "/z": true, "/a": false }));
+    const w = join(dir, "work");
+    mkdirSync(w);
+    assert.deepEqual(updateTrust([w], true, { file }), [realpath3(w)]);
+    assert.deepEqual(updateTrust([w], true, { file }), [], "idempotent");
+    const text = readFileSync(file, "utf8");
+    assert.equal(text, JSON.stringify({ "/a": false, [realpath3(w)]: true, "/z": true }, null, 2) + "\n");
+    assert.ok(!existsSync(`${file}.lock`));
+    assert.deepEqual(updateTrust([w, "/nope"], null, { file }), [realpath3(w)]);
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { "/a": false, "/z": true });
+    // a lock held by pi (fresh) makes it wait and give up; a stale one is taken over
+    mkdirSync(`${file}.lock`);
+    assert.throws(() => updateTrust([w], true, { file }), /locked/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("excludeProjectGuard keeps the guard out of git, also in a worktree; not a repo: false", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lc-excl-"));
+  const git = (args, cwd) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString();
+  try {
+    const repo = join(dir, "repo");
+    mkdirSync(repo);
+    git(["init", "-q"], repo);
+    git(["commit", "-q", "--allow-empty", "-m", "first"], repo);
+    const wt = join(dir, "wt");
+    git(["worktree", "add", "-q", "-b", "run", wt], repo);
+    assert.equal(excludeProjectGuard(wt), true);
+    assert.equal(excludeProjectGuard(wt), true);
+    const ex = readFileSync(join(repo, ".git", "info", "exclude"), "utf8");
+    assert.equal(ex.split("\n").filter((l) => l === "/.pi/extensions/even-guard.ts").length, 1);
+    mkdirSync(join(wt, ".pi", "extensions"), { recursive: true });
+    writeFileSync(join(wt, ".pi", "extensions", "even-guard.ts"), "x");
+    git(["add", "-A"], wt);
+    assert.equal(git(["status", "--porcelain"], wt).trim(), "");
+    const plain = join(dir, "plain");
+    mkdirSync(plain);
+    assert.equal(excludeProjectGuard(plain, { git: () => { throw new Error("not a repo"); } }), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("factoryWorktrees lists running/waiting runs of this cwd with an existing worktree", () => {
+  const root = mkdtempSync(join(tmpdir(), "lc-fwt-"));
+  try {
+    const mk = (id, repo, status, work = true) => {
+      mkdirSync(join(root, id), { recursive: true });
+      if (work) mkdirSync(join(root, id, "work"));
+      writeFileSync(join(root, id, "ledger.json"), JSON.stringify({ v: 1, id, repo, status, work: join(root, id, "work") }));
+    };
+    mk("a", "/w/proj", "waiting");
+    mk("b", "/w/proj", "stopped");
+    mk("c", "/w/other", "running");
+    mk("d", "/w/proj/sub", "running");
+    mk("e", "/w/proj", "running", false);
+    assert.deepEqual(factoryWorktrees("/w/proj", root).map((x) => x.id).sort(), ["a", "d"]);
+    assert.deepEqual(factoryWorktrees("", root), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
