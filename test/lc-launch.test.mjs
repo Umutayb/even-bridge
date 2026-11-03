@@ -293,7 +293,7 @@ test("factoryWorktrees ignores a ledger whose work is not its own <root>/<id>/wo
 });
 
 
-import { tracksDotPi } from "../src/providers/durable/lc/launch.mjs";
+import { defaultGit, gitEnv, tracksDotPi } from "../src/providers/durable/lc/launch.mjs";
 
 test("tracksDotPi: a repo tracking .pi (top or nested) is found; untracked or no repo is not", () => {
   const dir = mkdtempSync(join(tmpdir(), "lc-tracks-"));
@@ -334,4 +334,32 @@ test("tracksDotPi fails closed: not a repo is false, any other git error refuses
   assert.equal(tracksDotPi("/x", { git: throwing({ stderr: "error: index file corrupt", status: 128 }), log }), true);
   assert.equal(warned.length, 4);
   assert.match(warned[0], /refusing/);
+});
+
+test("tracksDotPi's git speaks C: a localized bridge still tells a plain dir from a failure", () => {
+  const env = gitEnv({ PATH: "/bin", LANG: "de_DE.UTF-8", LANGUAGE: "de:en", LC_MESSAGES: "de_DE.UTF-8" });
+  assert.equal(env.LC_ALL, "C");
+  assert.equal(env.LANG, "C");
+  assert.ok(!("LANGUAGE" in env), "LANGUAGE would override the messages' language");
+  assert.equal(env.PATH, "/bin");
+  const seen = [];
+  const git = defaultGit((cmd, args, opts) => {
+    seen.push({ cmd, args, opts });
+    return "";
+  });
+  assert.equal(tracksDotPi("/x", { git }), false);
+  assert.equal(seen[0].cmd, "git");
+  assert.equal(seen[0].opts.env.LC_ALL, "C");
+  assert.equal(seen[0].opts.cwd, "/x");
+  // A real plain dir with a German LANGUAGE set: not a repo, so not refused.
+  const plain = mkdtempSync(join(tmpdir(), "lc-plain-"));
+  const prev = process.env.LANGUAGE;
+  process.env.LANGUAGE = "de";
+  try {
+    assert.equal(tracksDotPi(plain, { log: { warn() {} } }), false);
+  } finally {
+    if (prev === undefined) delete process.env.LANGUAGE;
+    else process.env.LANGUAGE = prev;
+    rmSync(plain, { recursive: true, force: true });
+  }
 });

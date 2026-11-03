@@ -100,7 +100,7 @@ test("the overseer has no coding tools", async () => {
     const agent = await (await s.harness.root(s.ctx)).agent(s.ctx);
     assert.deepEqual(agent.extensions.map((e) => e.name), ["even-overseer"]);
     const tools = agent.tools.map((t) => t.name).sort();
-    assert.deepEqual(tools, ["notes_get", "notes_put", "notify", "session_read", "sessions_list"]);
+    assert.deepEqual(tools, ["notes_get", "notes_put", "notify", "session_interrupt", "session_message", "session_read", "session_start", "session_stop", "sessions_list"]);
     for (const t of ["bash", "read", "write", "edit", "subagent"]) assert.ok(!tools.includes(t), t);
     assert.equal(agent.maxTurns, 12);
     assert.equal(agent.instructions, OVERSEER_INSTRUCTIONS);
@@ -270,6 +270,23 @@ test("notify: at most 3 notes per run", async () => {
   run = { first: 20 }; // the next run may write again
   assert.equal((await notify.execute({ text: "next run" }, api, {})).isError, undefined);
   assert.deepEqual(box.items.map((i) => i.text), ["n0", "n1", "n2", "next run"]);
+});
+
+test("notify without a run is refused and counts against no shared key", async () => {
+  const extension = createOverseerExtension({ host: {} });
+  const notify = extension.tools.find((t) => t.name === "notify");
+  const box = { seq: 0, readUpTo: 0, items: [], notifyRun: null };
+  let snap = {};
+  const api = { conversationId: 1, snapshot: async () => snap, commit: async (fn) => fn({ doc: async () => box }) };
+  for (let i = 0; i < 4; i++) {
+    const r = await notify.execute({ text: `n${i}` }, api, {});
+    assert.equal(r.isError, true);
+    assert.match(r.output[0].text, /only inside a run/);
+  }
+  assert.deepEqual(box.items, []);
+  assert.equal(box.notifyRun, null, "no counter is stored");
+  snap = { run: { taskId: "t9" } };
+  assert.equal((await notify.execute({ text: "in a run" }, api, {})).isError, undefined, "a run still may write");
 });
 
 test("the overseer fails closed when its root is not set up as the overseer", async () => {

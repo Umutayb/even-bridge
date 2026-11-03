@@ -126,7 +126,64 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     return "none";
   }
 
+  /** The title of a session in its provider's list (the label a proposal names), or "". */
+  async function titleOf(kind, id) {
+    if (kind === "durable") return (await durable.listAgents({ all: true })).find((a) => a.sid === id)?.name ?? "";
+    const p = providerOf(kind);
+    const list = kind === "cc-local" ? (cc.recentSessions ?? cc.listSessions).call(cc, 50) : p.listSessions(50);
+    return ((await list) ?? []).find((s) => s?.id === id)?.title ?? "";
+  }
+
+  const refuse = (message) => Object.assign(new Error(message), { statusCode: 403 });
+
   return {
+    /** `{ kind, driver, label }` of a session (probed now), or null for an unknown id. */
+    async describe(id) {
+      const kind = await kindOf(id);
+      if (!kind) return null;
+      const driver = await driverOf(id);
+      const label = await safe(`${kind} title ${id}`, () => titleOf(kind, id), "");
+      return { kind, driver, label: label || id };
+    },
+
+    /**
+     * Run a CONFIRMED action (src/overseer/actions.mjs calls this only after the user's yes). The
+     * session's kind and driver are probed again here: a terminal-driven pi and cc-local are never
+     * written to, and only bridge (durable) sessions are interrupted or stopped.
+     */
+    async execute(action) {
+      const { id, kind, args, origin } = action;
+      const requestId = "ovs-act:" + id;
+      if (kind === "session_start") {
+        const opts = { engine: args.engine, name: args.label, model: args.model, origin: origin === "evenai" ? "evenai" : "overseer", requestId, ttlS: args.ttlS };
+        if (args.maxTurns != null) opts.maxTurns = args.maxTurns;
+        if (args.factory) opts.factory = true;
+        const r = await durable.prompt(undefined, args.task, args.cwd, opts);
+        return { sessionId: r.sessionId };
+      }
+      const k = await kindOf(args.id);
+      if (!k) throw Object.assign(new Error(`no session ${args.id}`), { statusCode: 404 });
+      if (kind === "session_message") {
+        if (k === "durable") await durable.prompt(args.id, args.text, undefined, { requestId, whenBusy: args.steer ? "steer" : "followUp" });
+        else if (k === "rc") await rc.prompt(args.id, args.text);
+        else if (k === "pi") {
+          if (String(await driverOf(args.id)).startsWith("terminal")) throw refuse(`${args.id} is driven from a terminal; the overseer only watches it`);
+          await pi.prompt(args.id, args.text);
+        } else throw refuse("cc-local sessions are read-only for the overseer");
+        return { sessionId: args.id };
+      }
+      if (k !== "durable") throw refuse(kind === "session_stop" ? "only bridge agents can be stopped" : "only bridge agents can be interrupted");
+      if (kind === "session_interrupt") {
+        await durable.interrupt(args.id);
+        return { sessionId: args.id, interrupted: true };
+      }
+      if (kind === "session_stop") {
+        await durable.stopSession(args.id);
+        return { sessionId: args.id, stopped: true };
+      }
+      throw Object.assign(new Error(`unknown action kind ${kind}`), { statusCode: 400 });
+    },
+
     /** Every session, durable first, then pi, cc-local, rc; a failing provider is skipped (logged). */
     async sessionsList() {
       const out = [];

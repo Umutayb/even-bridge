@@ -27,7 +27,7 @@ const STATUS_CHECK_COUNT = 10; // mirrors core.js
 
 // Durable prompt fields (POST /api/prompt): limits per the plan's rulings.
 export const AGENT_LIMITS = Object.freeze({ nameMax: 24, maxTurns: 60, requestIdMax: 128, modelMax: 32 });
-export const AGENT_ORIGINS = Object.freeze(["evenai", "phone"]);
+export const AGENT_ORIGINS = Object.freeze(["evenai", "phone", "overseer"]);
 export const AGENT_ENGINES = Object.freeze(["native", "lets-code"]);
 const NAME_RE = /^[\w .-]+$/;
 
@@ -126,8 +126,10 @@ export function factoryOpts({ on, ticket, howToRun } = {}) {
 /** POST /api/overseer/ask limits (the overseer's wait is capped at 15 s). */
 export const OVERSEER_LIMITS = Object.freeze({ questionMax: 2000, requestIdMax: 128, waitMsMax: 15000 });
 
-/** Validate an overseer ask body: `{ question, requestId, waitMs }` or `{ error }`. */
-export function overseerAskOpts({ question, requestId, waitMs } = {}) {
+export const OVERSEER_ASK_MODES = Object.freeze(["ask", "tell"]);
+
+/** Validate an overseer ask body: `{ question, requestId, waitMs, mode }` or `{ error }`. */
+export function overseerAskOpts({ question, requestId, waitMs, mode } = {}) {
   if (typeof question !== "string" || !question.trim()) return { error: "Missing 'question'" };
   if (question.length > OVERSEER_LIMITS.questionMax) return { error: `'question' must be 1-${OVERSEER_LIMITS.questionMax} characters` };
   if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > OVERSEER_LIMITS.requestIdMax) {
@@ -136,7 +138,20 @@ export function overseerAskOpts({ question, requestId, waitMs } = {}) {
   if (waitMs != null && (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > OVERSEER_LIMITS.waitMsMax)) {
     return { error: `'waitMs' must be 0-${OVERSEER_LIMITS.waitMsMax}` };
   }
-  return { question, requestId, waitMs: waitMs ?? OVERSEER_LIMITS.waitMsMax };
+  if (mode != null && !OVERSEER_ASK_MODES.includes(mode)) return { error: `'mode' must be one of ${OVERSEER_ASK_MODES.join(", ")}` };
+  return { question, requestId, waitMs: waitMs ?? OVERSEER_LIMITS.waitMsMax, mode: mode ?? "ask" };
+}
+
+/** Validate a POST /api/overseer/actions body (the shim's one gate): `{ kind, args, requestId }` or `{ error }`. */
+export function overseerActionOpts({ kind, args, origin, requestId } = {}) {
+  if (typeof kind !== "string" || !kind) return { error: "Missing 'kind'" };
+  if (args != null && (typeof args !== "object" || Array.isArray(args))) return { error: "'args' must be an object" };
+  // Only Even AI proposes over HTTP; the overseer's own proposals come from its tools in this process.
+  if (origin !== "evenai") return { error: "'origin' must be evenai" };
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > OVERSEER_LIMITS.requestIdMax) {
+    return { error: `'requestId' must be 1-${OVERSEER_LIMITS.requestIdMax} characters` };
+  }
+  return { kind, args: args ?? {}, requestId };
 }
 
 const seqParam = (v) => {
@@ -533,7 +548,9 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     const checked = overseerAskOpts(req.body ?? {});
     if (checked.error) return res.status(400).json({ error: checked.error });
     try {
-      res.json(await overseer.ask(checked.question, { requestId: checked.requestId, waitMs: checked.waitMs }));
+      const opts = { requestId: checked.requestId, waitMs: checked.waitMs };
+      if (checked.mode === "tell") opts.mode = "tell";
+      res.json(await overseer.ask(checked.question, opts));
     } catch (err) {
       fail(res, err);
     }
@@ -556,6 +573,57 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!Number.isSafeInteger(upTo) || upTo < 0) return res.status(400).json({ error: "'upTo' must be a non-negative integer" });
     try {
       res.json(await overseer.markRead(upTo));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // Gated actions (src/overseer/actions.mjs). Only a confirm executes; the phone answers through
+  // /api/permission-response on dur-overseer instead.
+  const actionsOf = () => overseer?.actions ?? null;
+
+  router.get("/overseer/actions", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    if (req.query.state != null && req.query.state !== "pending") return res.status(400).json({ error: "'state' must be pending" });
+    try {
+      res.json({ actions: await a.pending() });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/actions", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    const checked = overseerActionOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      res.json(await a.propose(checked.kind, checked.args, { origin: "evenai", requestId: checked.requestId }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/actions/:id/confirm", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    const confirmFrameId = req.body?.confirmFrameId;
+    if (confirmFrameId != null && (typeof confirmFrameId !== "string" || confirmFrameId.length > 128)) {
+      return res.status(400).json({ error: "'confirmFrameId' must be a string of at most 128 characters" });
+    }
+    try {
+      res.json(await a.confirm(req.params.id, { confirmFrameId, by: "evenai" }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/actions/:id/deny", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    try {
+      res.json(await a.deny(req.params.id, { by: "evenai" }));
     } catch (err) {
       fail(res, err);
     }

@@ -195,6 +195,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
         ...(await import("./overseer/overseer.mjs")),
         ...(await import("./overseer/extension.mjs")),
         ...(await import("./overseer/host.mjs")),
+        ...(await import("./overseer/actions.mjs")),
       };
       const extension = overseerMods.createOverseerExtension({ host: overseerHost });
       durableOpts.overseer = overseerMods.overseerProviderOptions({ extension });
@@ -227,6 +228,18 @@ export async function startServer({ flags = {}, cwd } = {}) {
           emit: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
         });
         await o.ready;
+        // Gated actions: proposals, the confirm endpoint, the phone's permission prompt on dur-overseer.
+        const actions = overseerMods.createOverseerActions({
+          durable: durableProvider,
+          host: overseerHost,
+          overseer: o,
+          emit,
+          onOutbox: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+        });
+        await actions.ready;
+        overseerHost.actions = actions;
+        o.bindActions(actions);
+        durableProvider.onOverseerPermission = (decision) => actions.respond(decision);
         overseer = o;
         overseerState = "on";
       } catch (err) {

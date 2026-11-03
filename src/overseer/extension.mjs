@@ -4,6 +4,9 @@
 //   session_read {id, n?≤20}    status + last n history items, fenced as untrusted data, ≤ 4 KB
 //   notes_get {} / notes_put {text}   its own notes doc (≤ 16 KB)
 //   notify {text≤500}           a short item in the outbox Even AI reads
+// and four GATED tools that only propose (src/overseer/actions.mjs): session_start,
+// session_message, session_interrupt, session_stop. A proposal runs only after the user
+// confirms it outside the model (phone permission prompt, or Even AI's spoken yes).
 // The tools call the host (src/overseer/host.mjs) in this process. `host` is the object the
 // server fills in once every provider exists (before the durable store resumes any run).
 import { defineExtension, defineTool, LiveDoc } from "@earendil-works/pi-durable";
@@ -104,7 +107,10 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
       if (t.length > NOTIFY_MAX_CHARS) return fail(`a note is limited to ${NOTIFY_MAX_CHARS} characters`);
       // The run this call belongs to: its first entry (or its first input / generation task).
       const run = (await api.snapshot(LiveDoc, api.conversationId, context))?.run;
-      const runKey = String(run?.first ?? run?.inputs?.[0] ?? run?.taskId ?? "none");
+      const key = run?.first ?? run?.inputs?.[0] ?? run?.taskId;
+      // No run to count against: refused, never a shared key that would block notify for good.
+      if (key == null) return fail("notify works only inside a run");
+      const runKey = String(key);
       const item = await api.commit(async (tx) => {
         const box = await tx.doc(OverseerOutbox, api.conversationId);
         const n = box.notifyRun?.key === runKey ? box.notifyRun.n : 0;
@@ -122,5 +128,57 @@ export function createOverseerExtension({ host, onOutbox } = {}) {
     },
   });
 
-  return defineExtension({ name: OVERSEER_EXTENSION, tools: [sessionsList, sessionRead, notesGet, notesPut, notify] });
+  // ── gated tools: they only propose; the summary the user confirms is built by host code ──
+  const gated = (name, description, properties, required) =>
+    defineTool({
+      name,
+      description,
+      parameters: obj(properties, required),
+      // Not replay-safe: a rerun would propose again (a restart drops pending actions anyway).
+      async execute(args, api, context) {
+        const actions = host?.actions;
+        if (typeof actions?.propose !== "function") return fail("the overseer's actions are not ready yet");
+        const run = (await api.snapshot(LiveDoc, api.conversationId, context))?.run;
+        try {
+          const p = await actions.propose(name, args, { origin: "overseer", submissions: run?.inputs ?? [] });
+          return ok(`proposed (${p.id}), waiting for the user: ${p.summary}`);
+        } catch (err) {
+          return fail(String(err.message ?? err));
+        }
+      },
+    });
+  const PROPOSE = " This only PROPOSES it: it runs after the user confirms, so never say it happened.";
+  const sessionStart = gated(
+    "session_start",
+    "Propose starting a new coding agent (a durable session) in its own folder under ~/sandbox/agents." + PROPOSE,
+    {
+      label: { type: "string", maxLength: 24, description: "short name: letters, digits, '-', '_', '.' or space" },
+      task: { type: "string", maxLength: 2000, description: "what the agent should do, in the user's words" },
+      cwd: { type: "string", description: "leave it out: the agent gets ~/sandbox/agents/<label>" },
+      engine: { type: "string", enum: ["native", "lets-code"], description: "leave it out (lets-code when this computer has it)" },
+      model: { type: "string", description: "only when the user names one (default qwen)" },
+      maxTurns: { type: "integer", minimum: 1, maximum: 60 },
+      ttlS: { type: "integer", minimum: 300, maximum: 43200, description: "seconds the agent may live (default 7200)" },
+    },
+    ["label", "task"],
+  );
+  const sessionMessage = gated(
+    "session_message",
+    "Propose sending a message to a session (a bridge agent or a Remote Control session; never a terminal-driven " +
+      "or local Claude Code session). steer true: it joins the running work now; else it waits for the current turn." +
+      PROPOSE,
+    {
+      id: { type: "string", description: "the session id from sessions_list" },
+      text: { type: "string", maxLength: 140, description: "the message, at most 140 characters" },
+      steer: { type: "boolean" },
+    },
+    ["id", "text"],
+  );
+  const sessionInterrupt = gated("session_interrupt", "Propose interrupting a bridge agent's current turn." + PROPOSE, { id: { type: "string" } }, ["id"]);
+  const sessionStop = gated("session_stop", "Propose stopping (aborting and archiving) a bridge agent." + PROPOSE, { id: { type: "string" } }, ["id"]);
+
+  return defineExtension({
+    name: OVERSEER_EXTENSION,
+    tools: [sessionsList, sessionRead, notesGet, notesPut, notify, sessionStart, sessionMessage, sessionInterrupt, sessionStop],
+  });
 }

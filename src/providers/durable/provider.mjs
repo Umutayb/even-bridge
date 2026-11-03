@@ -159,7 +159,23 @@ export function usableRoots(allowedCwds = [], { home = homedir(), forbidden = []
  * missing cwd below a root is then created (e.g. `~/sandbox/agents/<label>`).
  * @returns {string} the real path
  */
-export function resolveAgentCwd(want, { allowedCwds = [], home = homedir(), forbidden = [] } = {}) {
+export function resolveAgentCwd(want, opts = {}) {
+  const target = checkAgentCwd(want, opts);
+  const { allowedCwds = [], home = homedir(), forbidden = [] } = opts;
+  if (!isDir(target)) {
+    if (existsSync(target)) throw httpError(400, `Working directory ${target} is not a directory`);
+    mkdirSync(target, { recursive: true });
+  }
+  const real = realpathSync(target);
+  checkAgentCwd(real, { allowedCwds, home, forbidden }); // a race may have swapped a component for a symlink
+  return real;
+}
+
+/**
+ * The checks of resolveAgentCwd without creating anything: the target path (symlinks of the deepest
+ * existing ancestor resolved) or a 400. The overseer's proposals use it (a proposal creates nothing).
+ */
+export function checkAgentCwd(want, { allowedCwds = [], home = homedir(), forbidden = [] } = {}) {
   if (!want) throw httpError(400, "No working directory given for the new agent");
   if (allowedCwds === null) throw httpError(400, "No usable agent root is configured (see the bridge's startup warnings)");
   const configured = allowedCwds.filter(Boolean);
@@ -175,13 +191,7 @@ export function resolveAgentCwd(want, { allowedCwds = [], home = homedir(), forb
   };
   const target = realish(resolve(expandWith(String(want), home)));
   check(target);
-  if (!isDir(target)) {
-    if (existsSync(target)) throw httpError(400, `Working directory ${target} is not a directory`);
-    mkdirSync(target, { recursive: true });
-  }
-  const real = realpathSync(target);
-  check(real); // a race may have swapped a component for a symlink
-  return real;
+  return target;
 }
 
 function parseMaxTurns(v) {
@@ -222,6 +232,9 @@ function parseMaxTurns(v) {
  *   created (or reconfigured) with only that extension before anything resumes, and is served as the virtual
  *   session `sid`. Unset: nothing changes.
  */
+/** The TTL an overseer-started agent may carry (stored in the row; the shim reaper adopts it). */
+export const AGENT_TTL_S = Object.freeze({ min: 300, max: 43200 });
+
 /** A factory flag on a prompt to an existing agent (the toggle has its own route). */
 export const FACTORY_ON_START = "'factory' is set when an agent starts; use /api/agents/:sid/factory";
 
@@ -293,14 +306,16 @@ export function createDurableProvider(
     engine: "native",
     ttl_s: null,
   });
+  let overseerError = null; // the root could not be created/configured (the overseer stays off)
   if (ov) {
+    // After a failed root setup the root is unknown again: no prompt reaches it (404) and a live
+    // root run is abort-marked as stale at resume instead of being resumed.
     const get = map.get.bind(map);
     const byConversation = map.byConversation.bind(map);
-    map.get = (sid) => (sid === ov.sid ? overseerRow() : get(sid));
-    map.byConversation = (id) => (id === ROOT_CONVERSATION_ID ? overseerRow() : byConversation(id));
+    map.get = (sid) => (sid === ov.sid ? (overseerError ? undefined : overseerRow()) : get(sid));
+    map.byConversation = (id) => (id === ROOT_CONVERSATION_ID ? (overseerError ? undefined : overseerRow()) : byConversation(id));
   }
   const isOverseer = (sid) => Boolean(ov) && sid === ov.sid;
-  let overseerError = null; // the root could not be created/configured (the overseer stays off)
   const notTheOverseer = (sid) => {
     if (isOverseer(sid)) throw httpError(403, "The overseer cannot be stopped or archived");
   };
@@ -462,14 +477,9 @@ export function createDurableProvider(
       }
       if (ov) {
         // The root with the overseer's agent, before anything resumes (a resumed root run needs its tools).
-        const agent = {
-          model: defaultRef,
-          thinkingLevel: thinkingLevelFor(defaultRef, settingsPath),
-          maxTurns: ov.maxTurns,
-          instructions: ov.instructions,
-          extensions: [ov.extension],
-        };
+        const agent = overseerAgent(defaultRef);
         try {
+          if (ov.failSetup) throw new Error(String(ov.failSetup)); // test seam: a root that cannot be set up
           const root = await durable.harness.root(durable.ctx, { agent });
           await root.configure(agent, durable.ctx); // an existing root follows this build's agent
         } catch (err) {
@@ -550,6 +560,17 @@ export function createDurableProvider(
   ready.catch((err) => log.error?.(`[durable] ${err.message}`));
 
   const ctx = () => durable.ctx;
+
+  /** The overseer's agent with `ref` as its model (the default model except during a confirmed model switch). */
+  function overseerAgent(ref) {
+    return {
+      model: ref,
+      thinkingLevel: thinkingLevelFor(ref, settingsPath),
+      maxTurns: ov.maxTurns,
+      instructions: ov.instructions,
+      extensions: [ov.extension],
+    };
+  }
 
   // requestId rows only matter for retries; keep the table small in a long-lived bridge.
   const pruneTimer = setInterval(() => {
@@ -736,7 +757,14 @@ export function createDurableProvider(
 
   function createSession(phoneCwd, opts) {
     const origin = opts.origin ?? "phone";
-    if (origin !== "evenai" && origin !== "phone") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
+    if (origin !== "evenai" && origin !== "phone" && origin !== "overseer") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
+    let ttlS = null;
+    if (opts.ttlS != null) {
+      if (!Number.isInteger(opts.ttlS) || opts.ttlS < AGENT_TTL_S.min || opts.ttlS > AGENT_TTL_S.max) {
+        throw httpError(400, `ttlS must be an integer from ${AGENT_TTL_S.min} to ${AGENT_TTL_S.max}`);
+      }
+      ttlS = opts.ttlS;
+    }
     const engine = opts.engine ?? "native";
     if (engine !== "native" && engine !== "lets-code") throw httpError(400, `Invalid engine ${JSON.stringify(engine)}`);
     if (engine === "lets-code" && !lcEngine) throw httpError(400, "the lets-code engine is off");
@@ -745,7 +773,7 @@ export function createDurableProvider(
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
     if (engine === "lets-code") lcEngine.checkCwd(cwd); // 409 for a repo that tracks a .pi dir, before any row
-    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns, ...(engine === "lets-code" ? { engine } : {}) });
+    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns, ...(engine === "lets-code" ? { engine } : {}), ...(ttlS != null ? { ttlS } : {}) });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
   }
@@ -974,7 +1002,7 @@ export function createDurableProvider(
       let submission;
       try {
         submission = await w.conv.submit(
-          { type: "input", content: text, requestId: opts.requestId ?? randomUUID(), whenBusy: "steer" },
+          { type: "input", content: text, requestId: opts.requestId ?? randomUUID(), whenBusy: opts.whenBusy === "followUp" ? "followUp" : "steer" },
           ctx(),
         );
         const rec = await submission.status(ctx());
@@ -990,6 +1018,8 @@ export function createDurableProvider(
     },
 
     respondPermission(sessionId, decision) {
+      // The overseer's proposals reach the phone as permission requests on dur-overseer (actions.mjs answers).
+      if (isOverseer(sessionId)) return !overseerError && provider.onOverseerPermission ? provider.onOverseerPermission(decision) : false;
       if (isLc(map.get(sessionId))) return lcEngine?.respondPermission(sessionId, decision) ?? false;
       return false; // native Durable has no permission dialogs
     },
@@ -1132,6 +1162,7 @@ export function createDurableProvider(
           createdAt: r.created_at * 1000,
           lastSeen: r.last_seen * 1000,
           lastLine,
+          ...(ov ? { ttlS: r.ttl_s ?? null } : {}), // the overseer's builds only (flag off: rows as before)
         };
       }
     },
@@ -1177,6 +1208,39 @@ export function createDurableProvider(
       if (!isLc(row)) throw httpError(409, "the factory needs the lets-code engine");
       await ready;
       return lcEngine.setFactory(sessionId, on, opts);
+    },
+
+    /** The overseer's actions answer permission responses on dur-overseer (set by the server). */
+    onOverseerPermission: null,
+
+    /** Would a new agent be allowed in `cwd`? Its path, or a 400 (nothing is created). */
+    checkAgentCwd(cwd) {
+      return checkAgentCwd(cwd, { allowedCwds: roots, forbidden });
+    },
+
+    /** Is `name` a model alias or provider/model this bridge can run? */
+    hasModel(name) {
+      try {
+        resolveModel(name);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    /** Switch the overseer's model (`null`: back to the default). A confirmed model_switch only. */
+    async setOverseerModel(name) {
+      if (!ov || overseerError) throw httpError(503, "the overseer is not running");
+      await ready;
+      const root = await durable.harness.root(ctx());
+      await root.configure(overseerAgent(name == null ? defaultRef : resolveModel(name)), ctx());
+    },
+
+    /** Is the overseer's root running or holding queued inputs? */
+    async overseerBusy() {
+      await ready;
+      const lv = await durable.harness.snapshot(LiveDoc, ROOT_CONVERSATION_ID, ctx());
+      return Boolean(lv?.run);
     },
 
     /** Why the overseer's root could not be set up, or null. */

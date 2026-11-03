@@ -849,3 +849,86 @@ test("GET /sessions sorts durable (ms) and CC/RC/pi (ISO) rows by time; the over
   ids = (await (await fetch(`${base}/api/sessions?limit=3`)).json()).sessions.map((s) => s.id);
   assert.deepEqual(ids, ["dur-overseer", "dur-new", "pi-1"]);
 });
+
+// ── /api/overseer/actions (Task 5) ───────────────────────────────────────────
+
+function stubActions() {
+  const calls = { propose: [], confirm: [], deny: [], pending: 0 };
+  return {
+    calls,
+    propose: async (kind, args, opts) => {
+      calls.propose.push([kind, args, opts]);
+      return { id: "act-1", kind, summary: "Stop agent 'docs'?", expiresAt: 5, args };
+    },
+    confirm: async (id, opts) => {
+      calls.confirm.push([id, opts]);
+      if (id === "old") throw Object.assign(new Error("action expired"), { statusCode: 410 });
+      return { ok: true, result: { sessionId: "dur-9" } };
+    },
+    deny: async (id, opts) => {
+      calls.deny.push([id, opts]);
+      return { ok: true };
+    },
+    pending: async () => {
+      calls.pending += 1;
+      return [{ id: "act-1", kind: "session_stop", summary: "Stop agent 'docs'?", expiresAt: 5 }];
+    },
+  };
+}
+
+test("overseer action routes: one gate for Even AI, confirm, deny, pending", async (t) => {
+  const actions = stubActions();
+  const overseer = { ...stubOverseer(), actions };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/overseer/actions`, { kind: "session_stop", args: { id: "dur-1" }, origin: "evenai", requestId: "tok" });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).id, "act-1");
+  assert.deepEqual(actions.calls.propose, [["session_stop", { id: "dur-1" }, { origin: "evenai", requestId: "tok" }]]);
+  r = await postJson(`${base}/api/overseer/actions`, { kind: "session_stop", args: { id: "dur-1" }, origin: "overseer", requestId: "tok" });
+  assert.equal(r.status, 400, "HTTP callers never propose as the overseer");
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, { confirmFrameId: "q-1" });
+  assert.deepEqual(await r.json(), { ok: true, result: { sessionId: "dur-9" } });
+  assert.deepEqual(actions.calls.confirm, [["act-1", { confirmFrameId: "q-1", by: "evenai" }]]);
+  r = await postJson(`${base}/api/overseer/actions/old/confirm`, {});
+  assert.equal(r.status, 410);
+  assert.deepEqual(await r.json(), { error: "action expired" });
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, { confirmFrameId: 7 });
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/overseer/actions/act-1/deny`, {});
+  assert.deepEqual(await r.json(), { ok: true });
+  r = await fetch(`${base}/api/overseer/actions?state=pending`);
+  assert.equal((await r.json()).actions[0].id, "act-1");
+  r = await fetch(`${base}/api/overseer/actions?state=all`);
+  assert.equal(r.status, 400);
+});
+
+test("POST /overseer/ask passes mode tell only when asked", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/overseer/ask`, { question: "start one", requestId: "r1", waitMs: 0, mode: "tell" });
+  await postJson(`${base}/api/overseer/ask`, { question: "what runs", requestId: "r2", waitMs: 0, mode: "ask" });
+  const r = await postJson(`${base}/api/overseer/ask`, { question: "q", requestId: "r3", mode: "yell" });
+  assert.equal(r.status, 400);
+  assert.deepEqual(overseer.calls.ask, [
+    ["start one", { requestId: "r1", waitMs: 0, mode: "tell" }],
+    ["what runs", { requestId: "r2", waitMs: 0 }],
+  ]);
+});
+
+test("/overseer/actions routes fall through without the overseer's actions", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer: stubOverseer() });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/overseer/actions`, { kind: "session_stop", args: {}, origin: "evenai", requestId: "r" });
+  await postJson(`${base}/api/overseer/actions/a/confirm`, {});
+  await postJson(`${base}/api/overseer/actions/a/deny`, {});
+  await fetch(`${base}/api/overseer/actions?state=pending`);
+  assert.deepEqual(fellThrough, ["POST /api/overseer/actions", "POST /api/overseer/actions/a/confirm", "POST /api/overseer/actions/a/deny", "GET /api/overseer/actions"]);
+});
+
+test("the agent origins include overseer", async () => {
+  const { agentOpts, AGENT_ORIGINS } = await import("../src/ext-router.mjs");
+  assert.deepEqual(AGENT_ORIGINS, ["evenai", "phone", "overseer"]);
+  assert.deepEqual(agentOpts({ origin: "overseer" }).opts, { origin: "overseer" });
+});

@@ -325,7 +325,20 @@ export function removeStaleRegistry(pid, { root = LC_REGISTRY_ROOT, alive = pidA
  * false. Any other git failure (timeout, git missing, dubious ownership, a corrupt index): true, so the
  * caller refuses (fail closed), with the reason logged.
  */
-export function tracksDotPi(dir, { git = (args, cwd) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }), log = console } = {}) {
+/**
+ * git with untranslated messages: tracksDotPi tells "not a git repository" from other failures by
+ * the message, so git must not speak the bridge's locale (LC_ALL=C; LANGUAGE dropped).
+ */
+export function gitEnv(env = process.env) {
+  const { LANGUAGE: _drop, ...rest } = env;
+  return { ...rest, LC_ALL: "C", LANG: "C" };
+}
+
+/** The default git runner of tracksDotPi (`exec` is a test seam: execFileSync's signature). */
+export const defaultGit = (exec = execFileSync) => (args, cwd) =>
+  exec("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000, env: gitEnv() });
+
+export function tracksDotPi(dir, { git = defaultGit(), log = console } = {}) {
   try {
     return String(git(["ls-files", "--", ":(glob).pi/**", ":(glob)**/.pi/**"], dir)).trim() !== "";
   } catch (err) {
