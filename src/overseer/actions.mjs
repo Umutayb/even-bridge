@@ -19,7 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { defineDoc } from "@earendil-works/pi-durable";
 import { HANDOFF_MODEL, OVERSEER_SID, OverseerHandoffs, OverseerOutbox, pushOutbox, ROOT_CONVERSATION_ID } from "./docs.mjs";
 import { hhmm } from "./checkins.mjs";
-import { cannotMessage, defuse, KIND_WORD, SESSION_TEXT_MAX, startsWithCommand, textProblem } from "./host.mjs";
+import { cannotMessage, defuse, KIND_WORD, SESSION_TEXT_MAX, startsWithCommand, textProblem, waitingText } from "./host.mjs";
 
 export const ACTION_TTL_MS = 90000;
 export const ACTION_KINDS = Object.freeze(["session_start", "session_message", "session_interrupt", "session_stop", "model_switch", "standing_order"]);
@@ -302,6 +302,11 @@ export function createOverseerActions({
     const d = await describe(id);
     writerCheck(kind, id, d);
     const label = oneLine(d.label || id, 40).replace(/'/g, "’");
+    // A terminal (tmux) session at a permission / select prompt: typing would answer it (I5). Refused here, and
+    // again at execute (its state, then its screen right before typing).
+    if ((kind === "session_message" || kind === "standing_order") && d.via === "tmux" && typeof host.stateOf === "function") {
+      if ((await host.stateOf(id)) === "waiting") throw httpError(409, waitingText(d.kind, label));
+    }
     // The target's kind, for the summary ("Send pi session '…'"); a bridge agent's args are as before.
     const target = d.kind !== "durable" ? { target: d.kind } : {};
     if (kind === "session_message") {

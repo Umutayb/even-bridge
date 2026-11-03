@@ -40,6 +40,17 @@ export const NO_COMMANDS = "the overseer cannot send commands";
 export const NOT_ONE_LINE = "a message must be one line without control characters";
 /** Leading whitespace and invisible format characters (zero-width space/joiners, BOM, bidi marks): skipped before the "/" "!" check. */
 const LEAD_RE = /^[\s\p{Cf}]*/u;
+/**
+ * Invisible characters anywhere in a message: format characters (bidi overrides and isolates, zero-width space and
+ * non-joiner, BOM, word joiner, Mongolian vowel separator, …; the zero-width joiner of emoji sequences is allowed)
+ * and the blank fillers that render as nothing (Hangul fillers, braille blank, halfwidth filler). With them the
+ * summary the user confirms could display differently from what is typed.
+ */
+const INVISIBLE_RE = /(?!\u200d)\p{Cf}|[\u115f\u1160\u3164\u2800\uffa0]/u;
+/** Only punctuation, symbols and spaces: nothing to say (";" alone would even type nothing and submit a draft). */
+const NO_WORDS_RE = /^[\p{P}\p{S}\s]*$/u;
+export const INVISIBLE = "a message can't hold invisible characters";
+export const NO_WORDS = "a message needs words";
 
 /**
  * Why a text may not be sent as a message (null when it may): any control character (newline, CR, ESC, C-…, DEL,
@@ -50,6 +61,8 @@ export function textProblem(text) {
   const t = String(text ?? "");
   if (CONTROL_CHARS_RE.test(t)) return NOT_ONE_LINE;
   if (/^[\/!]/.test(t.replace(LEAD_RE, ""))) return NO_COMMANDS;
+  if (INVISIBLE_RE.test(t)) return INVISIBLE;
+  if (NO_WORDS_RE.test(t)) return NO_WORDS;
   return null;
 }
 
@@ -61,6 +74,7 @@ export const WHY_NOT = Object.freeze({
   "no-terminal": "no terminal runs it; open it in tmux first",
   "phone-claude": "the phone's Claude bridge runs it; message it from the phone",
   "driver-unknown": "who drives it could not be checked",
+  "waiting-in-terminal": "it is waiting for an answer in its terminal; answer it there",
   unknown: "its kind is unknown",
 });
 const LINE_MAX = 160; // characters of a last line / title in a list row
@@ -246,8 +260,10 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
 
   /** label, normalized state, message route: added to every row in one place. */
   const finish = (r) => {
-    const route = messageRoute(r.kind, r.driver);
-    return { ...r, label: safeLabel(r.kind, r.id, r.cwd, r.title), state: normalizeState(r.state), ...route };
+    const state = normalizeState(r.state);
+    // A terminal at a permission / select prompt: typing would answer it, so it takes no message now.
+    const route = waitingInTerminal(messageRoute(r.kind, r.driver), state);
+    return { ...r, label: safeLabel(r.kind, r.id, r.cwd, r.title), state, ...route };
   };
   // Driven by a terminal or a bridge child counts as active; an RC row's driver is always "rc", so RC counts by its
   // state and last activity like any other.
@@ -307,6 +323,11 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
   }
 
   const refuse = (message) => Object.assign(new Error(message), { statusCode: 403 });
+  /** The normalized state of a session of a known kind, now ("idle" when unreadable is never assumed: null). */
+  const stateNow = async (kind, id) => {
+    const st = await safe(`${kind} status ${id}`, () => providerOf(kind).getSessionStatus?.(id), null);
+    return st == null ? null : normalizeState(st);
+  };
 
   return {
     /**
@@ -384,10 +405,14 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
         else if (k === "rc") r = await rc.prompt(args.id, args.text);
         else if (route.via === "tmux") {
           // pi and Claude Code in tmux: one literal line into the pane bound to that terminal's pid, checked again
-          // right before typing; never a resume, a spawn or the official router.
+          // right before typing; never a resume, a spawn or the official router. A session waiting at a permission /
+          // select prompt is refused (its state now, and the pane's screen right before typing).
+          const waiting = () => Object.assign(new Error(waitingText(k, args.label || args.id)), { statusCode: 409 });
+          if ((await stateNow(k, args.id)) === "waiting") throw waiting();
           const p = providerOf(k);
           if (typeof p.deliverToTerminal !== "function") throw notDelivered();
           r = await p.deliverToTerminal(args.id, args.text);
+          if (r?.waiting) throw waiting();
         } else {
           // pi RPC: refused (blocked) if a terminal took the session over since the probe.
           r = await pi.prompt(args.id, args.text, undefined, { noTerminal: true });
@@ -437,6 +462,16 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
     driverOf,
     kindOf,
   };
+}
+
+/** A terminal (tmux) route with the session waiting at a prompt takes no message: `{canMessage:false, why}`. */
+export function waitingInTerminal(route, state) {
+  return route?.via === "tmux" && state === "waiting" ? { canMessage: false, why: "waiting-in-terminal" } : route;
+}
+
+/** The refusal for a message to a terminal session that waits at a permission / select prompt. */
+export function waitingText(kind, label) {
+  return `${KIND_WORD[kind] ?? "session"} '${defuse(label, { oneLine: true, max: 60 })}' is waiting for an answer in its terminal; answer it there`;
 }
 
 /** The refusal text for a session that cannot receive a message (host text; "driven from a terminal" kept for the shim). */

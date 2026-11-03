@@ -29,7 +29,7 @@ import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { transcriptEntriesToWire } from "./wire.mjs";
 import { TranscriptWatcher, defaultFindFile } from "./watcher.mjs";
-import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid } from "./detect.mjs";
+import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid, screenShowsDialog } from "./detect.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -565,6 +565,8 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       const wait = last ? PANE_DELIVERY_GAP_MS - (Date.now() - last) : 0;
       if (wait > 0) await sleep(wait);
       if (!(await paneCheck(target.pane, target.pid).catch(() => false))) return blocked;
+      // A permission / confirm / select dialog on screen: the text and the Enter would answer it. Not typed.
+      if (screenShowsDialog(await paneScreen(target.pane).catch(() => null))) return { ...blocked, waiting: true };
       await deliverTmux(target.pane, text, { singleLine: true });
       paneLastDelivery.set(target.pane, Date.now());
       noteDelivered(sessionId, text);

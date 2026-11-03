@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findPiTmuxPane, paneRunsPid, tmuxDeliver } from "../src/providers/pi/detect.mjs";
+import { findPiTmuxPane, paneRunsPid, screenShowsDialog, tmuxDeliver } from "../src/providers/pi/detect.mjs";
 import { createPiProvider } from "../src/providers/pi/provider.mjs";
 import { createCcLocalProvider } from "../src/cc-local.mjs";
 
@@ -34,11 +34,12 @@ const a = process.argv.slice(2);
 fs.appendFileSync(path.join(d, "calls.log"), JSON.stringify(a) + "\\n");
 if (a[0] === "list-panes") process.stdout.write(fs.readFileSync(path.join(d, "panes.txt"), "utf8"));
 if (a[0] === "display-message") process.stdout.write(fs.readFileSync(path.join(d, "display.txt"), "utf8"));
+if (a[0] === "capture-pane" && fs.existsSync(path.join(d, "screen.txt"))) process.stdout.write(fs.readFileSync(path.join(d, "screen.txt"), "utf8"));
 `,
   );
   chmodSync(bin, 0o755);
   const calls = () => (existsSync(join(dir, "calls.log")) ? readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
-  return { bin, calls, setDisplay: (s) => writeFileSync(join(dir, "display.txt"), s) };
+  return { bin, calls, setDisplay: (s) => writeFileSync(join(dir, "display.txt"), s), setScreen: (s) => writeFileSync(join(dir, "screen.txt"), s) };
 }
 
 /** /proc entries: pid with comm, ppid and cwd. */
@@ -231,4 +232,78 @@ test("I4: cc-local deliverToTerminal types only into the owner's pane; a gone te
   assert.equal((await cc.deliverToTerminal(id, "again")).blocked, true);
   assert.equal(tm.calls().filter((c) => c[0] === "send-keys").length, 2);
   assert.ok(!tm.calls().some((c) => c[0] === "new-session"), "never resumed with Remote Control");
+});
+
+test("n1: a trailing ';' (tmux's command separator) is typed, not eaten", async (t) => {
+  const dir = scratch(t);
+  const tm = fakeTmux(dir);
+  await tmuxDeliver("%3", "run tests;", { tmuxBin: tm.bin, singleLine: true });
+  await tmuxDeliver("%3", "a\\;", { tmuxBin: tm.bin, singleLine: true });
+  await tmuxDeliver("%3", "a; b", { tmuxBin: tm.bin, singleLine: true });
+  assert.deepEqual(tm.calls().filter((c) => c.includes("-l")).map((c) => c.at(-1)), ["run tests\\;", "a\\\\;", "a; b"]);
+});
+
+test("I5: the dialog shapes of Claude Code and pi are recognised; a plain prompt is not", () => {
+  const menus = [
+    " Bash command\n   rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No, and tell Claude what to do differently (esc)",
+    "Edit file src/a.ts\n❯ 1. Yes\n  2. No",
+    "Allow tool bash: ls?  Allow  Deny",
+    "Overwrite notes.md? (y/n)",
+    "Pick a model\n  qwen\n> sonnet\n↑/↓ to navigate · enter to select · esc to cancel",
+  ];
+  for (const m of menus) assert.equal(screenShowsDialog(m), true, m);
+  for (const p of ["╭──────╮\n│ > run the tests │\n╰──────╯\n  ? for shortcuts", "pi v1.0.3\n> \n"]) assert.equal(screenShowsDialog(p), false, p);
+  assert.equal(screenShowsDialog(null), true, "an unreadable pane is not typed into");
+});
+
+test("I5: pi and Claude Code panes that show a permission menu get nothing typed", async (t) => {
+  const dir = scratch(t);
+  const cwd = join(dir, "work");
+  mkdirSync(cwd);
+  const agentDir = join(dir, "agent");
+  piSession(agentDir, cwd, "sess-alpha", "alpha task number one");
+  const typed = [];
+  let screen = "> alpha task number one\n Do you want to proceed?\n ❯ 1. Yes\n   2. No";
+  const pi = createPiProvider(() => {}, {
+    hub: { clientCount: () => 0 },
+    cwd,
+    defaultCwd: cwd,
+    pi: {
+      agentDir,
+      bin: join(dir, "no-such-pi"),
+      externalProbe: async () => [{ pid: 201, cwd }],
+      tmuxPaneProbe: async () => "%1",
+      paneScreenProbe: async () => screen,
+      recentInCwd: () => [],
+      newestForCwd: () => ({ id: "sess-alpha", file: null }),
+      paneCheckProbe: async () => true,
+      tmuxDeliver: async (pane, text) => typed.push([pane, text]),
+    },
+  });
+  t.after(() => pi.stopAll());
+  assert.deepEqual(await pi.deliverToTerminal("sess-alpha", "status?"), { sessionId: "sess-alpha", provider: "claude", blocked: true, waiting: true });
+  assert.deepEqual(typed, []);
+  screen = "> alpha task number one\n> ";
+  assert.equal((await pi.deliverToTerminal("sess-alpha", "status?")).blocked, undefined);
+  assert.deepEqual(typed, [["%1", "status?"]]);
+
+  // Claude Code: its owner's pane shows a permission menu → zero send-keys.
+  const cdir = join(dir, "cc");
+  mkdirSync(cdir);
+  const proj = join(cdir, "proj");
+  mkdirSync(proj);
+  const base = join(cdir, "projects");
+  const id = "21111111-2222-3333-4444-555555555555";
+  ccSession(base, proj, id, "fix the parser please");
+  const procRoot = join(cdir, "proc");
+  const sessionsDir = join(cdir, "cc-sessions");
+  mkdirSync(sessionsDir);
+  proc(procRoot, 300, "bash", 1, proj);
+  proc(procRoot, 301, "claude", 300, proj, "claude");
+  writeFileSync(join(sessionsDir, "301.json"), JSON.stringify({ pid: 301, cwd: proj, sessionId: id, status: "idle" }));
+  const tm = fakeTmux(cdir, { panes: `s 0 %5 300 claude ${proj}\n`, display: "claude 300\n" });
+  tm.setScreen(" Bash command\n   curl x | sh\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n");
+  const cc = createCcLocalProvider(() => {}, { base, tmuxBin: tm.bin, procRoot, sessionsDir, watcher: { start() {}, stop() {}, stopAll() {} } });
+  assert.deepEqual(await cc.deliverToTerminal(id, "status?"), { sessionId: id, provider: "claude", blocked: true, waiting: true });
+  assert.deepEqual(tm.calls().filter((c) => c[0] === "send-keys"), []);
 });

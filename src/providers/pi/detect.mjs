@@ -129,11 +129,38 @@ export async function findPiTmuxPane(cwd, { tmuxBin = "tmux", procRoot = "/proc"
 export const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
+ * A pane that shows a permission / confirm / select dialog: typed characters and the Enter would answer it (the
+ * highlighted option, usually "Yes"), not reach the prompt. Claude Code ("Do you want to …", "❯ 1. Yes", "Esc to
+ * cancel"), pi's confirm and select dialogs, and generic y/n prompts. False positives only block a message.
+ */
+export const DIALOG_RE = new RegExp(
+  [
+    "Do you want to\\b",
+    "❯\\s*\\d+\\.\\s",
+    "^\\s*\\d+\\.\\s*Yes\\b",
+    "Esc to (?:cancel|exit)",
+    "\\((?:y/n|Y/n|y/N)\\)|\\[(?:y/n|Y/n|y/N)\\]",
+    "\\b(?:Allow|Approve)\\b[^\\n]*\\b(?:Deny|Reject)\\b",
+    "Press enter to (?:confirm|select)",
+    "↑/↓|↑↓ to (?:navigate|select)",
+  ].join("|"),
+  "im",
+);
+
+/** Does a captured pane show a dialog (see DIALOG_RE)? Only the last 15 lines count (older ones are history). */
+export function screenShowsDialog(screen) {
+  if (screen == null) return true; // unreadable: assume the worst
+  return DIALOG_RE.test(String(screen).split("\n").slice(-15).join("\n"));
+}
+
+/**
  * Deliver `text` to a tmux pane's foreground program (the pi TUI) as if typed,
  * then press Enter. A single line is typed LITERALLY (`send-keys -l -- text`, so
- * "C-d", "Escape" or a leading "-" are characters, never key names or options),
- * then Enter as a separate key. Multi-line text (the phone only) is pasted
- * verbatim via a load-buffer so newlines land inside the prompt, not as submits.
+ * "C-d", "Escape" or a leading "-" are characters, never key names or options;
+ * a trailing ";" — tmux's command separator — is sent as "\;"), then Enter as a
+ * separate key. Multi-line text (the phone only) goes through load-buffer +
+ * paste-buffer WITHOUT bracketed paste: tmux turns each LF into CR, so every line
+ * is submitted on its own, then a final Enter. (The overseer never takes this path.)
  * `singleLine: true` (the overseer's messages): any newline or control character
  * is refused (never pasted).
  *
@@ -145,7 +172,9 @@ export async function tmuxDeliver(paneId, text, { tmuxBin = "tmux", singleLine: 
     throw Object.assign(new Error("a typed message must be one line without control characters"), { statusCode: 400 });
   }
   if (singleLine) {
-    await runTmux(tmuxBin, ["send-keys", "-t", paneId, "-l", "--", text]);
+    // A trailing ";" is tmux's command separator and would be eaten: "\;" is a literal ";".
+    const arg = text.endsWith(";") ? text.slice(0, -1) + "\\;" : text;
+    await runTmux(tmuxBin, ["send-keys", "-t", paneId, "-l", "--", arg]);
     await runTmux(tmuxBin, ["send-keys", "-t", paneId, "Enter"]);
     return;
   }

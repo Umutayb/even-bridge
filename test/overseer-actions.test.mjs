@@ -371,6 +371,32 @@ test("C1: a message is one plain line for every origin; non-durable targets take
   }
 });
 
+test("I5: a message to a terminal session waiting at a prompt is refused at propose", async () => {
+  let state = "awaiting_permission";
+  const cc = {
+    recentSessions: () => [{ id: "c1", title: "", cwd: "/home/u/proj" }],
+    probe: (id) => id === "c1",
+    driverOf: async () => "terminal-tmux",
+    getSessionStatus: async () => state,
+    deliverToTerminal: async () => {
+      throw new Error("must not be typed");
+    },
+  };
+  const s = await open(newDir(), { cc });
+  try {
+    for (const origin of ["overseer", "evenai"]) {
+      await rejectsWith(s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin, requestId: `w-${origin}` }), 409, /^Claude session 'proj-c1' is waiting for an answer in its terminal; answer it there$/);
+    }
+    // idle at propose, waiting at the yes: refused at confirm, nothing typed
+    state = "idle";
+    const p = await s.actions.propose("session_message", { id: "c1", text: "status?" }, { origin: "evenai", requestId: "w-late" });
+    state = "requires_action";
+    await rejectsWith(s.actions.confirm(p.id, { confirmFrameId: "f" }), 409, /waiting for an answer in its terminal/);
+  } finally {
+    await s.close();
+  }
+});
+
 test("I3: a pi message blocked at the last moment fails with 409 and starts no reply watch", async () => {
   let delivered = 0;
   const pi = {

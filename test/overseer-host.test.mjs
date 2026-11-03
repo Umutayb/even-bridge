@@ -217,7 +217,7 @@ test("the inventory lists every active session of both harnesses with label, sta
       ["aaaa1111-pi", "pi", "even-bridge-1111pi", "idle", true, "pi-rpc"], // driven by a bridge child: active
       ["bbbb2222-pi", "pi", "notes-2222pi", "idle", true, "tmux"], // driven: active although old
       ["dddd4444-pi", "pi", "x-4444pi", "idle", false, "terminal-no-tmux"],
-      ["c1c1c1c1", "cc-local", "proj-c1c1c1", "waiting", true, "tmux"],
+      ["c1c1c1c1", "cc-local", "proj-c1c1c1", "waiting", false, "waiting-in-terminal"], // typing would answer its prompt (I5)
       ["c2c2c2c2", "cc-local", "proj-c2c2c2", "idle", false, "no-terminal"],
       ["cse_01ABCDEF", "rc", "remote-abcdef", "busy", true, "rc"],
     ],
@@ -316,7 +316,11 @@ test("state words, labels, routes and the text gate", () => {
   // C1: one line, no control characters, no command after invisible leading characters
   for (const t of ["hi\n!id", "hi\r/exit", "\u0003", "a\u001b[A", "x\u007f", "x\u0085y", "a b"]) assert.equal(textProblem(t), "a message must be one line without control characters", JSON.stringify(t));
   for (const t of ["/exit", "  !id", "​/compact", "﻿!ls", "  /mode"]) assert.equal(textProblem(t), "the overseer cannot send commands", JSON.stringify(t));
-  for (const t of ["C-d", "Escape", "-t foo", "run the tests", "a/b and !x later"]) assert.equal(textProblem(t), null, t);
+  for (const t of ["C-d", "Escape", "-t foo", "run the tests", "a/b and !x later", "run tests;", "family 👨\u200d👩\u200d👧 ok"]) assert.equal(textProblem(t), null, t);
+  // n2: invisible characters anywhere (bidi overrides, zero-width, BOM, Mongolian VS, blank fillers)
+  for (const t of ["run \u202etests", "a\u200bb", "ok\ufeff", "x\u180ey", "\u3164!id", "\u2800/exit", "go\u2066x\u2069"]) assert.equal(textProblem(t), "a message can't hold invisible characters", JSON.stringify(t));
+  // n1: only punctuation or spaces
+  for (const t of [";", " ;; ", "...", "!?", "-"]) assert.ok(["a message needs words", "the overseer cannot send commands"].includes(textProblem(t)), JSON.stringify(t));
 });
 
 test("a failed driver probe gives no route, and an old RC row is not active (m4, m10)", async () => {
@@ -344,6 +348,7 @@ test("execute delivers a message through each kind's transport, typing only into
   k.pi.deliverToTerminal = async (id, text) => (calls.push(["pi-tmux", id, text]), { sessionId: id });
   k.rc.prompt = async (id, text) => calls.push(["rc", id, text]);
   let ccResult = { sessionId: "c1c1c1c1", provider: "claude" };
+  k.cc.getSessionStatus = async () => "idle"; // at its prompt (a waiting one is covered below)
   k.cc.deliverToTerminal = async (id, text) => (calls.push(["cc-tmux", id, text]), ccResult);
   k.cc.prompt = async () => {
     throw new Error("cc.prompt (official router / RC resume) must never be used for an overseer message");
@@ -390,4 +395,25 @@ test("stateOf and replySnapshot read the session through its provider", async ()
   const snap = await host.replySnapshot("aaaa1111-pi");
   assert.deepEqual([snap.lastRole, snap.text], ["assistant", "the answer"]);
   assert.equal(await host.replySnapshot("nope"), null);
+});
+
+test("I5: a terminal session waiting at a permission or select prompt is never typed into", async () => {
+  const k = everyKind();
+  let ccState = "awaiting_permission";
+  k.cc.getSessionStatus = async () => ccState;
+  const typed = [];
+  let screenSaysMenu = false;
+  k.cc.deliverToTerminal = async (id, text) => (screenSaysMenu ? { sessionId: id, blocked: true, waiting: true } : (typed.push([id, text]), { sessionId: id }));
+  const host = createOverseerHost({ ...k, log: quiet, now: () => NOW });
+  const msg = () => host.execute({ id: "act-1", kind: "session_message", args: { id: "c1c1c1c1", label: "proj-c1c1c1", text: "status?", steer: false }, origin: "overseer" });
+  await assert.rejects(msg(), (e) => e.statusCode === 409 && e.message === "Claude session 'proj-c1c1c1' is waiting for an answer in its terminal; answer it there");
+  assert.deepEqual(typed, [], "state waiting: nothing typed");
+  // The state says idle but the screen shows a menu right before typing: refused too.
+  ccState = "idle";
+  screenSaysMenu = true;
+  await assert.rejects(msg(), (e) => e.statusCode === 409 && /waiting for an answer in its terminal/.test(e.message));
+  assert.deepEqual(typed, []);
+  screenSaysMenu = false;
+  assert.deepEqual(await msg(), { sessionId: "c1c1c1c1" });
+  assert.deepEqual(typed, [["c1c1c1c1", "status?"]]);
 });

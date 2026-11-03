@@ -39,6 +39,7 @@ import {
   findClaudeTmuxPane,
   findExternalClaude,
   paneRunsPid,
+  screenShowsDialog,
   screenShowsFragments,
   tmuxDeliver,
 } from "./providers/pi/detect.mjs";
@@ -320,6 +321,8 @@ export function createCcLocalProvider(
       }
       if (!target) return blocked;
       if (!(await paneRunsPid(target.pane, target.pid, { commands: ["claude"], tmuxBin, procRoot }))) return blocked;
+      // A permission / select menu on screen: the text and the Enter would answer it (usually "Yes"). Not typed.
+      if (screenShowsDialog(await capturePane(target.pane, { tmuxBin }).catch(() => null))) return { ...blocked, waiting: true };
       await tmuxDeliver(target.pane, text, { tmuxBin, singleLine: true });
       claim(sessionId, CC_LOCAL_NAME);
       log?.(`[bridge] cc-local overseer message -> tmux pane ${target.pane} (claude ${target.pid}, cwd ${meta.cwd})`);

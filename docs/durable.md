@@ -311,9 +311,18 @@ Typing into a terminal is code execution if done carelessly, so the tmux route i
   (`\p{Cf}`). Both at propose and again at execute, for every origin and for standing orders. A pi /
   Claude Code / RC target takes at most 140 characters from every origin, so the summary the user
   confirms shows all of it.
+- Invisible characters are refused anywhere in the text (format characters: bidi overrides and
+  isolates, zero-width space/non-joiner, BOM, …, the emoji zero-width joiner excepted; blank fillers
+  such as U+3164 and U+2800), and so is a text of only punctuation and spaces, so the summary the user
+  confirms reads exactly as what is typed.
 - It is typed literally: `tmux send-keys -t <pane> -l -- <text>`, then `send-keys -t <pane> Enter`
-  as a separate key ("C-d", "Escape" or a leading "-" are characters, never key names or options);
-  never through a paste buffer.
+  as a separate key ("C-d", "Escape" or a leading "-" are characters, never key names or options; a
+  trailing ";", tmux's command separator, is sent as "\\;"); never through a paste buffer.
+- A terminal session waiting at a permission, confirm or select prompt is never typed into (the
+  characters and the Enter would answer the prompt, usually "Yes"): its inventory row says
+  `canMessage: false, why: "waiting-in-terminal"`, propose refuses it (409), execute checks its state
+  again, and right before typing the pane is captured and a dialog on screen (Claude Code's "Do you
+  want to …" / "❯ 1. Yes", y/n prompts, select menus) blocks it (409).
 - The pane is bound to the terminal's own process: pi's external pid (with two pi terminals in one
   folder, the pane whose screen shows this conversation, else none), Claude Code's owner pid. Right
   before typing (after the per-pane gap) the pane must still run `pi` / `claude` with `pane_pid` an
