@@ -1,0 +1,137 @@
+{
+  "_note": "Replies captured by scripts/assistant-spike.mjs (plan Task A0) from pi 1.0.3 + lets-code main-8c3fb10 (~/.local/bin/lets-code) --mode rpc on 2026-11-03; ids removed, model objects trimmed to the keys and identity fields.",
+  "set_thinking_level": {
+    "type": "response",
+    "command": "set_thinking_level",
+    "success": true
+  },
+  "set_model_claude": {
+    "type": "response",
+    "command": "set_model",
+    "success": true,
+    "dataKeys": [
+      "id",
+      "name",
+      "api",
+      "provider",
+      "baseUrl",
+      "reasoning",
+      "thinkingLevelMap",
+      "input",
+      "cost",
+      "contextWindow",
+      "maxTokens",
+      "compat"
+    ],
+    "data": {
+      "provider": "Anthropic",
+      "id": "claude-haiku",
+      "api": "openai-completions",
+      "reasoning": true
+    }
+  },
+  "set_model_qwen": {
+    "type": "response",
+    "command": "set_model",
+    "success": true,
+    "dataKeys": [
+      "id",
+      "name",
+      "api",
+      "provider",
+      "baseUrl",
+      "reasoning",
+      "thinkingLevelMap",
+      "input",
+      "cost",
+      "contextWindow",
+      "maxTokens",
+      "samplingParamsByThinkingLevel",
+      "compat"
+    ],
+    "data": {
+      "provider": "lets-code",
+      "id": "qwen3.8-27b",
+      "api": "openai-completions",
+      "reasoning": true
+    }
+  },
+  "thinking_after_model_switch": {
+    "set low, then set_model Anthropic/claude-haiku": "medium",
+    "then set_model lets-code/qwen3.8-27b": "medium"
+  },
+  "compact_too_small": {
+    "type": "response",
+    "command": "compact",
+    "success": false,
+    "error": "Nothing to compact (session too small)"
+  },
+  "compact_ok": {
+    "type": "response",
+    "command": "compact",
+    "success": true,
+    "data": {
+      "summary": "\n\n## Goal\n- User wanted to check their Friday (Nov 6, 2026) calendar events.\n- User wanted to review their saved notes/memos.\n\n## Constraints & Preferences\n- Language: English\n- Style: brief (short, spoken-language replies, 1\u20132 sentences)\n- Timezone: Europe/Amsterdam\n- Current date in context: Tuesday, 3 Nov 2026\n\n## Progress\n### Done\n- [x] Fetched Friday (2026-11-06) calendar \u2192 1 event: Lasagna at 18:00\n- [x] Fetched notes \u2192 2 items: \"Buy oat milk\", \"Call Anna about Saturday\"\n\n### In Progress\n- [ ] Awaiting next user request\n\n### Blocked\n- (none)\n\n## Key Decisions\n- **Calendar date resolution**: \"Friday\" from a Tuesday (Nov 3) was resolved to the nearest upcoming Friday, Nov 6, 2026, and queried as a single-day range (2026-11-06 to 2026-11-06).\n\n## Next Steps\n1. Await the user's next question or task (likely related to calendar, notes, or other personal data).\n\n## Critical Context\n- **Calendar (Fri 2026-11-06)**: 18:00 Lasagna\n- **Notes (2 items)**: \"Buy oat milk\" \u00b7 \"Call Anna about Saturday\"\n- **Tools used**: `fetch_calendar(from, to)`, `fetch_notes()`\n- The notes mention a Saturday call with Anna, which may relate to future planning.\n\n---\n\n**Turn Context (split turn):**\n\n\n\n## Original Request\nThe user shared a tentative personal plan: they might go to Anna's on Saturday (Nov 7, 2026), but aren't sure yet. No explicit question or task was requested.\n\n## Progress So Far\n- The assistant attempted to save this as a memory (kind: fact, by: user) via the `memory` tool.\n- The assistant made approximately 8+ tool calls to `memory(action=\"remember\", by=\"user\")`, each time receiving the same error: \"Give the gist (one dense line) and, when there are any, refs (file:line, run:<id>, factory:<id>, session file).\"\n- The assistant struggled to identify the correct parameter name for the gist/content and repeatedly called the tool without the required `gist` parameter. The memory was **never successfully saved**.\n- No response was delivered to the user acknowledging their plan.\n\n## Context Needed to Continue\n- The user's tentative plan (Anna's, Saturday, uncertain) is the only information shared so far.\n- The memory tool requires a `gist` parameter (one dense line) and optional `refs` to successfully save; the assistant never successfully passed it. If the memory still needs saving, the correct call format is `memory(action=\"remember\", by=\"user\", gist=\"User may go to Anna's on Sat 2026-11-07 (uncertain)\", kind=\"fact\")`.\n- The conversation has not yet produced a visible reply to the user; a brief acknowledgment of their tentative plan would be the natural next step.",
+      "firstKeptEntryId": "8a2db772",
+      "tokensBefore": 4524,
+      "estimatedTokensAfter": 2648,
+      "usage": {
+        "input": 2474,
+        "output": 922,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 221,
+        "totalTokens": 3396,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      }
+    },
+    "dataKeys": [
+      "summary",
+      "firstKeptEntryId",
+      "tokensBefore",
+      "estimatedTokensAfter",
+      "usage",
+      "details"
+    ]
+  },
+  "messages_after_compact": [
+    "system",
+    "compactionSummary",
+    "assistant",
+    "toolResult",
+    "assistant"
+  ],
+  "new_session": {
+    "type": "response",
+    "command": "new_session",
+    "success": true,
+    "data": {
+      "cancelled": false
+    }
+  },
+  "even_note_prompt": {
+    "type": "response",
+    "command": "prompt",
+    "success": true,
+    "data": {
+      "disposition": "handled"
+    }
+  },
+  "even_note_events": [
+    "message_start",
+    "message_end"
+  ],
+  "messages_after_even_note": [
+    {
+      "role": "custom",
+      "customType": "even-note",
+      "text": "\"(host note) At 07:30 the user said goodbye and Even AI was switched off.\""
+    }
+  ]
+}
