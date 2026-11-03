@@ -489,8 +489,11 @@ export function createOverseerHost({ durable, pi, cc, rc, log = console, now = D
       const status = (await safe(`${kind} status ${id}`, () => p.getSessionStatus?.(id), null)) ?? "unknown";
       const hist = (await safe(`${kind} history ${id}`, () => p.getHistory?.(id, n), [])) ?? [];
       const driver = await driverOf(id);
-      // The head (kind, driver, status) is always kept; the history is cut from the oldest end.
-      const head = `${UNTRUSTED_OPEN(defuse(id, { oneLine: true, max: 80 }))}\nkind: ${kind}\ndriver: ${driver}\nstatus: ${defuse(status, { oneLine: true, max: 40 })}`;
+      // A lets-code agent's last error (a capped run, a refused factory start); other kinds have none.
+      const lastError = await safe(`${kind} last error ${id}`, () => p.lastError?.(id), null);
+      const errLine = lastError?.text ? `\nlast error: ${defuse(lastError.text, { oneLine: true, max: LINE_MAX })}` : "";
+      // The head (kind, driver, status, last error) is always kept; the history is cut from the oldest end.
+      const head = `${UNTRUSTED_OPEN(defuse(id, { oneLine: true, max: 80 }))}\nkind: ${kind}\ndriver: ${driver}\nstatus: ${defuse(status, { oneLine: true, max: 40 })}${errLine}`;
       const lines = hist.map((h) => `${h.role === "user" ? "user" : "assistant"}: ${defuse(h.text)}`);
       if (!lines.length) return `${head}\n(no history)\n${UNTRUSTED_CLOSE}`;
       const budget = READ_CAP_BYTES - bytes(head) - bytes(UNTRUSTED_CLOSE) - 2;

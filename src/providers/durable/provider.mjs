@@ -473,6 +473,8 @@ export function createDurableProvider(
           baseEnv: toolEnv,
           clientCount: (sid) => clientsOf(sid) + (hub?.clientCount?.(sid) ?? 0),
           defaultModel: `${defaultRef.provider}/${defaultRef.modelId}`,
+          // A run stopped at its turn / repeated-call cap: the server writes the overseer's audit line.
+          onCap: (ev) => provider.onLcCap?.(ev),
           ...seams,
         });
         lcBox.engine = lcEngine;
@@ -778,7 +780,9 @@ export function createDurableProvider(
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
     if (engine === "lets-code") lcEngine.checkCwd(cwd); // 409 for a repo that tracks a .pi dir, before any row
-    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns, ...(engine === "lets-code" ? { engine } : {}), ...(ttlS != null ? { ttlS } : {}) });
+    // lets-code: only an agent's own maxTurns is kept (it lowers EVEN_BRIDGE_LC_MAX_TURNS for that agent).
+    const rowTurns = engine === "lets-code" && (opts.maxTurns == null || opts.maxTurns === "") ? null : maxTurns;
+    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns: rowTurns, ...(engine === "lets-code" ? { engine } : {}), ...(ttlS != null ? { ttlS } : {}) });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
   }
@@ -866,6 +870,12 @@ export function createDurableProvider(
       if (!ov || overseerError || (cwd && cwd !== defaultCwd)) return rows;
       // The overseer first (the phone Terminal opens it like any session).
       return [{ id: ov.sid, title: ov.title, timestamp: Date.now(), cwd: defaultCwd ?? "", provider: WIRE_PROVIDER, status: null }, ...rows].slice(0, limit);
+    },
+
+    /** The last error of a lets-code agent (a cap, a refused factory start): `{text, at, reason?}` or null. */
+    async lastError(sessionId) {
+      if (!isLc(map.get(sessionId)) || !lcEngine) return null;
+      return (await lcEngine.record(sessionId)).lastError ?? null;
     },
 
     async getSessionStatus(sessionId) {
@@ -1133,7 +1143,7 @@ export function createDurableProvider(
             ...baseRow(r, lcEngine.status(r.sid), rec.lastLine ?? ""),
             engine: "lets-code",
             factory: Boolean(rec.factory),
-            lastError: rec.lastError ?? null, // lets-code refused the last factory start (the shim speaks it)
+            lastError: rec.lastError ?? null, // a refused factory start or a capped run (the shim speaks it)
           };
         }
         let state = states.get(r.sid) ?? "idle";
@@ -1217,6 +1227,9 @@ export function createDurableProvider(
 
     /** The overseer's actions answer permission responses on dur-overseer (set by the server). */
     onOverseerPermission: null,
+
+    /** Told about a lets-code run stopped at a cap (`{sid, label, message, reason, …}`; set by the server for the audit). */
+    onLcCap: null,
 
     /** Would a new agent be allowed in `cwd`? Its path, or a 400 (nothing is created). */
     checkAgentCwd(cwd) {

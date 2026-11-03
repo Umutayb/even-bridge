@@ -79,6 +79,13 @@ test("lc options only with EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1", () => {
   assert.equal(durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1", EVEN_BRIDGE_LC_MAX_LIVE: "x" }).lc.maxLive, 1, "a bad number keeps the default");
 });
 
+test("EVEN_BRIDGE_LC_MAX_TURNS reaches the engine only with the engine on; unset adds no key", () => {
+  const on = { EVEN_BRIDGE_DURABLE_ENABLE: "1" };
+  assert.equal(durableOptions({ ...on, EVEN_BRIDGE_LC_MAX_TURNS: "12" }).lc, undefined, "engine off: nothing");
+  assert.equal("maxTurns" in durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1" }).lc, false);
+  assert.equal(durableOptions({ ...on, EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE: "1", EVEN_BRIDGE_LC_MAX_TURNS: "12" }).lc.maxTurns, "12");
+});
+
 test("cwdAllowed: strictly below a root, never ~ or /, ~ roots expand", (t) => {
   const home = mkdtempSync(join(tmpdir(), "durable-home-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));

@@ -57,7 +57,7 @@ export class LcSession extends PiSession {
    * @param {(sid: string, frame: object) => void} emit
    * @param {object} opts PiSession/PiRpcClient options (bin, wrap, envExact, env, extraArgs, resume, name, cwd) plus
    *   `sid` (the bridge session id frames go to), `clientCount()`, `onDialog(kind, req)`, `onNotify(text)`,
-   *   `onAgentEnd(session)`, `onToolEnd(summary)`, `now()`.
+   *   `onAgentEnd(session)`, `onToolEnd(summary)`, `onToolStart(name, args)`, `onTurnEnd(session)`, `now()`.
    */
   constructor(emit, opts = {}) {
     super(emit, opts);
@@ -270,6 +270,13 @@ export class LcSession extends PiSession {
       return;
     }
     super.onEvent(e);
+    // The engine's per-run caps (turns, identical consecutive tool calls), after the frame went out.
+    try {
+      if (e.type === "tool_execution_start") this.opts.onToolStart?.(e.toolName, e.args ?? {});
+      else if (e.type === "turn_end") this.opts.onTurnEnd?.(this);
+    } catch {
+      /* see above */
+    }
   }
 
   onMessageUpdate(e) {

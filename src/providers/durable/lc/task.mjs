@@ -18,6 +18,8 @@ export const LC_RESTART_LIMIT_MESSAGE = `lets-code run stopped: restarted ${LC_R
 
 /** The child died mid-turn (not stopped by us): the run is retried. */
 export const LC_EXIT = "LC_EXIT";
+/** The engine stopped the run at a per-run cap (turns, repeated tool call): failed, never retried; the engine already went idle. */
+export const LC_CAP = "LC_CAP";
 
 /**
  * @param {{ drive(sid, {text, attempt}, signal): Promise<{lastLine: string}>, abortChild(sid): Promise<void>|void,
@@ -47,6 +49,10 @@ export function createLcRunTask(engine) {
           } catch (err) {
             if (runtime.signal.aborted) throw err; // closing or aborted: the rerun / abort handler takes over
             if (err?.code === LC_EXIT) continue; // a crash: next attempt
+            if (err?.code === LC_CAP) {
+              await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: err.message } } }), context);
+              return;
+            }
             const message = `lets-code run failed: ${err?.message ?? err}`;
             engine.runFailed(sid, message);
             await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message } } }), context);

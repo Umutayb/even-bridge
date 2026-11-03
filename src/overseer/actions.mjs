@@ -134,6 +134,11 @@ export function summarize(kind, args = {}) {
   }
 }
 
+/** The audit line of a lets-code run stopped at a cap (the engine's `onCap` event). No tool args: they may carry output. */
+export function lcCapAuditEvent({ sid, label, message, reason, turns, cap, tool, repeats } = {}) {
+  return { event: "lc_cap", sid, label, reason, turns, cap, tool, repeats, summary: message, by: "bridge" };
+}
+
 /** Append-only JSONL, 0600, created by the bridge. Never throws. */
 export function createAuditLog(path = DEFAULT_AUDIT_PATH, { log = console } = {}) {
   const file = resolve(expand(path));
@@ -922,6 +927,10 @@ export function createOverseerActions({
     refusedFor,
     sweep,
     auditPath: audit.path,
+    /** One line in the audit log for a bridge event outside the action flow (a lets-code cap). */
+    auditEvent(event) {
+      audit.write(event);
+    },
     bindOverseer(o) {
       overseer = o;
     },

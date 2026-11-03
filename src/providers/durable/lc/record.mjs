@@ -26,7 +26,7 @@ export const lcSessionInitial = () => ({
   lastRequestId: null,
   childPid: null,
   sentTaskId: null, // the run task whose prompt lets-code accepted: a restart continues it with a cut-off prompt
-  lastError: null, // { text, at }: lets-code refused the last factory start (cleared by the next toggle)
+  lastError: null, // { text, at }: lets-code refused the last factory start (cleared by the next toggle); { text, at, reason: "cap" }: the last run hit a cap (cleared by the next run)
   trusted: [], // factory worktrees the engine gave the project guard and pi trust (removed again by forget)
 });
 

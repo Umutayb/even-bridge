@@ -84,6 +84,7 @@ export function durableOptions(env = process.env) {
  * The bin defaults to the pi provider's (the live bridge runs lets-code directly); MemoryMax
  * applies only where the kernel has a memory controller; at most EVEN_BRIDGE_LC_MAX_LIVE
  * children at once (default 1); EVEN_BRIDGE_LC_SANDBOX=0 drops lets-code's sandbox (tests only).
+ * EVEN_BRIDGE_LC_MAX_TURNS caps each run's turns (the engine parses it: default 40, at most 200).
  */
 export function lcOptions(env = process.env) {
   if (String(env.EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE ?? "").trim() !== "1") return null;
@@ -93,6 +94,7 @@ export function lcOptions(env = process.env) {
     caps: { memoryMax: env.EVEN_BRIDGE_LC_MEMORY_MAX || "500M", cpuQuota: "200%" },
     maxLive: Number.isInteger(n) && n >= 1 ? n : 1,
     sandbox: env.EVEN_BRIDGE_LC_SANDBOX !== "0",
+    ...(env.EVEN_BRIDGE_LC_MAX_TURNS != null ? { maxTurns: env.EVEN_BRIDGE_LC_MAX_TURNS } : {}),
   };
 }
 
@@ -255,6 +257,8 @@ export async function startServer({ flags = {}, cwd } = {}) {
         });
         await checkins.ready;
         durableProvider.onOverseerPermission = (decision) => actions.respond(decision);
+        // A lets-code run stopped at its turn / repeated-call cap: one audit line.
+        durableProvider.onLcCap = (ev) => actions.auditEvent(overseerMods.lcCapAuditEvent(ev));
         overseer = o;
         overseerState = "on";
       } catch (err) {

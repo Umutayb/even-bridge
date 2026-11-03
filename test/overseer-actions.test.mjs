@@ -13,7 +13,7 @@ import { createDurableProvider } from "../src/providers/durable/provider.mjs";
 import { createOverseerHost } from "../src/overseer/host.mjs";
 import { createOverseerExtension } from "../src/overseer/extension.mjs";
 import { createOverseer, overseerProviderOptions, OverseerAsks, OverseerHandoffs, OverseerOutbox, ROOT_CONVERSATION_ID } from "../src/overseer/overseer.mjs";
-import { ACTION_TTL_MS, claudeFreeSlots, createOverseerActions, OverseerActions, summarize, tildePath } from "../src/overseer/actions.mjs";
+import { ACTION_TTL_MS, claudeFreeSlots, createOverseerActions, lcCapAuditEvent, OverseerActions, summarize, tildePath } from "../src/overseer/actions.mjs";
 import { startFakeOpenAI } from "./helpers/fake-openai.mjs";
 
 const quiet = { warn() {}, error() {}, log() {} };
@@ -126,6 +126,20 @@ test("summaries are built from the arguments", () => {
   assert.equal(summarize("session_interrupt", { label: "docs" }), "Interrupt agent 'docs'?");
   assert.equal(summarize("model_switch", { model: "sonnet" }), "Ask the overseer this with sonnet?");
   assert.equal(tildePath(HOME), "~");
+});
+
+test("auditEvent writes one line to the audit log (a lets-code cap)", async () => {
+  const dir = newDir();
+  const s = await open(dir);
+  try {
+    s.actions.auditEvent(lcCapAuditEvent({ sid: "dur-x", label: "looper", message: "lets-code run stopped after 40 turns (cap)", reason: "turns", turns: 40, cap: 40 }));
+    const lines = readFileSync(join(dir, "overseer-actions.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const cap = lines.filter((l) => l.event === "lc_cap");
+    assert.equal(cap.length, 1);
+    assert.deepEqual({ ...cap[0], ts: 0 }, { ts: 0, event: "lc_cap", sid: "dur-x", label: "looper", reason: "turns", turns: 40, cap: 40, summary: "lets-code run stopped after 40 turns (cap)", by: "bridge" });
+  } finally {
+    await s.close();
+  }
 });
 
 test("a proposal never executes without a confirm", async () => {

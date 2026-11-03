@@ -53,6 +53,7 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_LC_BIN` | `EVEN_BRIDGE_PI_BIN`, else `lets-code` | the lets-code launcher (`pi-inference` works too) |
 | `EVEN_BRIDGE_LC_MAX_LIVE` | `1` | live lets-code children at once (an idle-kept child makes room; otherwise 429) |
 | `EVEN_BRIDGE_LC_MEMORY_MAX` | `500M` | `MemoryMax` (plus `MemorySwapMax=0`) of `even-lc-<sid>.scope`, applied only when `/sys/fs/cgroup/cgroup.controllers` lists `memory` (borealis has it since 2026-11-03: banner `mem`; without it one startup warning and banner `nomem`) |
+| `EVEN_BRIDGE_LC_MAX_TURNS` | `40` | turns per lets-code run (one prompt and its steers, a crash retry included); at most `200` (a larger value is clamped, a non-positive-integer one keeps 40, each with a startup warning). An agent's own lower `maxTurns` wins for that agent. At the cap the turn is aborted (the child is not killed) and the run fails with `lets-code run stopped after N turns (cap)`; see *Per-run caps* below |
 | `EVEN_BRIDGE_LC_SANDBOX` | on | `0` drops lets-code's `--sandbox` (tests only); on and without `bwrap`+`socat`, every lets-code start answers 503 |
 | `EVEN_BRIDGE_OVERSEER_ENABLE` | off | `1` adds the overseer (needs `EVEN_BRIDGE_DURABLE_ENABLE=1`; it does not need the lets-code engine): the root conversation `dur-overseer`, `/api/overseer/*`, `overseer: true` on `GET /api/agents`; banner `, overseer=on` / `, overseer=failed: …` (the part is absent while the flag is unset). See *The overseer* below |
 | `EVEN_BRIDGE_OVERSEER_AUDIT` | `~/.even-terminal/overseer-actions.log` | the action audit file (JSONL, 0600); throwaway instances point it at their own dir |
@@ -63,7 +64,8 @@ are those of `main` (tests assert that no `src/providers/durable/lc/` or `src/ov
 
 ## Limits
 
-- `maxTurns` 1–60 per run (default 60); `name` ≤ 24 chars; `model` ≤ 32 chars.
+- `maxTurns` 1–60 per run (default 60); `name` ≤ 24 chars; `model` ≤ 32 chars. A lets-code agent's
+  cap is `EVEN_BRIDGE_LC_MAX_TURNS` (default 40), or its own `maxTurns` when lower (see *Per-run caps*).
 - The cwd must be strictly below a configured root; `~` and `/` are always
   refused; symlinks are resolved (on the deepest existing ancestor) and checked
   before anything is created; a missing dir below a root is created. A cwd
@@ -193,6 +195,21 @@ five factory experts stay off in `~/.pi/agent/lets-code-state.json`, so every fa
   kept `LC_IDLE_KEEP_MS` = 120 s after a run and then stopped; the next prompt re-spawns it with
   `--session <file>`. At most `EVEN_BRIDGE_LC_MAX_LIVE` children live at once (an idle-kept one is
   stopped to make room, otherwise 429).
+- **Per-run caps.** A run (one `even.lc-run` task) stops at the first of:
+  - `EVEN_BRIDGE_LC_MAX_TURNS` turns (default 40, at most 200; the agent's own `maxTurns` when lower;
+    a turn is one `turn_end` of the child) → `lets-code run stopped after N turns (cap)`;
+  - the same tool with the same args `LC_REPEAT_MAX` = 8 times in a row → `lets-code run stopped:
+    repeated tool call (<tool>, 8 times in a row)`.
+
+  Both take the same path: one `error` frame with that text, `record.lastError = {text, at, reason:
+  "cap"}` (the agent row's `lastError`, and a `last error:` line in the overseer's `session_read`),
+  an `lc_cap` line in the overseer audit log (`{event, sid, label, reason, turns, cap, tool,
+  repeats, summary, by: "bridge"}`, no tool args; only with the overseer on, otherwise the bridge log
+  has the warning), then the turn is aborted (open dialogs cancelled, RPC `abort`). The child stays
+  (idle-kept); the task ends `failed`; a prompt while the turn is still ending gets a 409. A child
+  that does not end the turn within 10 s is stopped. The next prompt starts a new run with fresh
+  counters and clears the cap's `lastError` (a refused factory start's `lastError` is left alone).
+  The counters are in memory: a bridge restart mid-run starts them again.
 - **Dialog policy.** What lets-code asks reaches the phone and glasses as frames on the agent's
   session; nothing is auto-approved:
   - a mandate `ask` (e.g. a write outside the project) → one `permission_request` Yes/No (Yes =
@@ -540,9 +557,10 @@ asks, and whether a `session_message` cut off mid-execute reached its target.
 - The tmux allowlist (`inputReady`) is rebuilt from sources, not captured; it fails closed. Claude
   Code's placeholder is ASSUMED dim (SGR 2): if it is not, every message to a Claude Code terminal is
   refused ("has unsent text") until the fixtures are corrected from real captures.
-- A lets-code agent can loop: in the Task 7 QA run a "write hi to hi.txt" agent wrote the file 68
-  times in ~35 s (one prompt, 69 assistant turns) until it was stopped. lets-code children have no
-  turn cap from the bridge; stop works (`POST /api/agents/:sid/stop`, or the overseer's gated stop).
+- A lets-code loop is stopped by the per-run caps, not prevented: the Task 7 QA loop ("write hi to
+  hi.txt", 68 identical writes in ~35 s) now ends at the 8th identical call; a loop with varying
+  calls runs up to `EVEN_BRIDGE_LC_MAX_TURNS` turns (40) first. The caps do not see inside a
+  subagent or a factory stage (separate pi processes), and a bridge restart mid-run resets the counts.
 - The overseer's root store grows forever (no pruning yet; see *Store growth*).
 
 ## Backup

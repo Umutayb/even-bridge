@@ -39,6 +39,9 @@
 //   CONFIRM  a plain `confirm` dialog ("Proceed?")
 //   EXPERTS  lets-code's factory "Enable the factory's experts?" confirm
 //   TOOLS25  25 bash tool calls, then "ok: TOOLS25"
+//   LOOP     a write loop: every 10 ms one turn with the same `write hi.txt` call, until `abort`
+//   LOOPVARY the same, each call with other args (only the turn cap stops it)
+//   Each loop turn is logged as `{loopTurn: n}`; `abort` logs `{aborted: true, loopTurns: n}`.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -207,6 +210,22 @@ function onPrompt(cmd) {
       out({ type: "tool_execution_end", toolCallId: `t${i}`, toolName: "bash", result: { content: [{ type: "text", text: String(i) }] } });
     }
   }
+  if (text === "LOOP" || text === "LOOPVARY") {
+    const mine = run;
+    mine.loopTurns = 0;
+    const tick = () => {
+      if (run !== mine) return;
+      const n = ++mine.loopTurns;
+      const args = text === "LOOP" ? { path: "hi.txt", content: "hi" } : { path: "hi.txt", content: `hi ${n}` };
+      out({ type: "tool_execution_start", toolCallId: `w${n}`, toolName: "write", args });
+      out({ type: "tool_execution_end", toolCallId: `w${n}`, toolName: "write", result: { content: [{ type: "text", text: "written" }] } });
+      out({ type: "turn_end", message: { usage: { input: 10, output: 3, totalTokens: 13, cost: { total: 0 } } } });
+      log({ loopTurn: n });
+      if (n < 1000) setTimeout(tick, 10);
+    };
+    setTimeout(tick, 10);
+    return;
+  }
   if (text === "HANG") return;
   if (text === "ASK") {
     ask({ method: "select", title: "mandate (ask): write outside the project: /x/out.txt\n\nAllow?", options: ["Allow once", "Allow for this session", "Deny"] }, (r) => {
@@ -270,6 +289,7 @@ process.stdin.on("data", (chunk) => {
         break;
       case "abort":
         out({ type: "response", id: cmd.id, command: "abort", success: true });
+        if (run?.loopTurns != null) log({ aborted: true, loopTurns: run.loopTurns });
         if (run) {
           for (const [id] of dialogs) dialogs.delete(id);
           endRun();

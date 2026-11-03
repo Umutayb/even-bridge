@@ -14,7 +14,19 @@ import { fakeModelsJson } from "./helpers/fake-openai.mjs";
 import { LcSessionDoc } from "../src/providers/durable/lc/record.mjs";
 import { LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_RESTART_LIMIT, LC_RUN_TASK } from "../src/providers/durable/lc/task.mjs";
 import { FACTORY_EXPERTS } from "../src/providers/durable/lc/launch.mjs";
-import { LC_IDLE_KEEP_MS, LC_MAX_LIVE_DEFAULT, LC_MODE_ACK_MS } from "../src/providers/durable/lc/engine.mjs";
+import {
+  LC_IDLE_KEEP_MS,
+  LC_MAX_LIVE_DEFAULT,
+  LC_MAX_TURNS_CEILING,
+  LC_MAX_TURNS_DEFAULT,
+  LC_MODE_ACK_MS,
+  LC_REPEAT_MAX,
+  lcRepeatCapMessage,
+  lcTurnCap,
+  lcTurnCapMessage,
+} from "../src/providers/durable/lc/engine.mjs";
+import { createOverseerHost } from "../src/overseer/host.mjs";
+import { createAuditLog, lcCapAuditEvent } from "../src/overseer/actions.mjs";
 
 const FAKE = fileURLToPath(new URL("./helpers/fake-pi-rpc.mjs", import.meta.url));
 chmodSync(FAKE, 0o755);
@@ -1078,4 +1090,191 @@ test("a cwd whose .pi cannot be sealed gets no child: error frame, failed run", 
   await until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && /could not seal .*lets-code was not started/.test(f.message)), 5000, "seal error");
   await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
   assert.equal(c.spawns().length, 0, "no child");
+});
+
+// ── per-run caps: turns (EVEN_BRIDGE_LC_MAX_TURNS / the agent's maxTurns) and identical consecutive tool calls ──
+
+test("the turn cap: default 40, at most 200, a bad value keeps the default", () => {
+  assert.equal(LC_MAX_TURNS_DEFAULT, 40);
+  assert.equal(LC_MAX_TURNS_CEILING, 200);
+  assert.equal(LC_REPEAT_MAX, 8);
+  const bad = [];
+  const warn = (m) => bad.push(m);
+  assert.equal(lcTurnCap(undefined, warn), 40);
+  assert.equal(lcTurnCap("", warn), 40);
+  assert.equal(lcTurnCap("12", warn), 12);
+  assert.equal(lcTurnCap(" 7 ", warn), 7);
+  assert.equal(bad.length, 0);
+  assert.equal(lcTurnCap("0", warn), 40);
+  assert.equal(lcTurnCap("x", warn), 40);
+  assert.equal(lcTurnCap("-3", warn), 40);
+  assert.equal(lcTurnCap("2.5", warn), 40);
+  assert.equal(lcTurnCap("201", warn), 200);
+  assert.equal(lcTurnCap("5000", warn), 200);
+  assert.equal(bad.length, 6);
+  assert.equal(lcTurnCapMessage(40), "lets-code run stopped after 40 turns (cap)");
+});
+
+/** The run of `sid` stopped at a cap: its error frame and the end of the run (idle). */
+const cappedRun = (c, p, sid, re) =>
+  until(() => c.frames.some((f) => f.sid === sid && f.type === "error" && re.test(f.message)) && p.getStatus(sid).state === "idle", 8000, "capped run");
+const lcTasks = async (p) => {
+  const { ctx } = await p.ready;
+  return (await p._harness.inspect(ctx)).tasks.filter((x) => x.record.kind === LC_RUN_TASK);
+};
+
+test("a looping child is stopped at exactly the turn cap: aborted (not killed), error frame, record, agent row, session_read, audit", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { maxTurns: "6" } });
+  const audit = createAuditLog(join(c.dir, "audit.log"));
+  const caps = [];
+  p.onLcCap = (ev) => (caps.push(ev), audit.write(lcCapAuditEvent(ev)));
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "LOOPVARY", c.work, { engine: "lets-code", name: "looper" });
+  const msg = lcTurnCapMessage(6);
+  assert.equal(msg, "lets-code run stopped after 6 turns (cap)");
+  await cappedRun(c, p, sid, /stopped after 6 turns \(cap\)/);
+  const mine = c.frames.filter((f) => f.sid === sid);
+  assert.deepEqual(mine.filter((f) => f.type === "error").map((f) => f.message), [msg], "one error frame");
+  // The bridge counted exactly 6 turns, then aborted the turn once; the child was not killed.
+  const aborts = c.log().filter((l) => l.type === "abort");
+  assert.equal(aborts.length, 1);
+  const aborted = c.log().find((l) => l.aborted);
+  assert.ok(aborted.loopTurns >= 6 && aborted.loopTurns <= 8, `abort after ${aborted.loopTurns} loop turns`);
+  assert.equal(caps.length, 1);
+  assert.equal(caps[0].turns, 6);
+  assert.equal(caps[0].cap, 6);
+  assert.equal(caps[0].reason, "turns");
+  assert.equal(caps[0].label, "looper");
+  assert.equal(c.spawns().length, 1);
+  assert.ok(p._lc._states.get(sid).session?.running, "the child stays (idle-kept)");
+  // record, agent row, task outcome
+  await until(async () => (await recordOf(p, sid)).lastError?.text === msg, 5000, "lastError");
+  assert.equal((await recordOf(p, sid)).lastError.reason, "cap");
+  const row = (await p.listAgents()).find((a) => a.sid === sid);
+  assert.equal(row.lastError.text, msg);
+  assert.equal(row.state, "idle");
+  await until(async () => (await lcTasks(p)).length === 0, 5000, "task terminal");
+  // the overseer's session_read
+  const host = createOverseerHost({ durable: p, log: QUIET });
+  const read = await host.sessionRead(sid, 5);
+  assert.match(read, /\nstatus: idle\nlast error: lets-code run stopped after 6 turns \(cap\)\n/);
+  // the audit line
+  const lines = readFileSync(join(c.dir, "audit.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.deepEqual(
+    { ...lines[0], ts: 0 },
+    { ts: 0, event: "lc_cap", sid, label: "looper", reason: "turns", turns: 6, cap: 6, summary: msg, by: "bridge" },
+  );
+});
+
+test("an agent's own lower maxTurns wins; a higher one does not raise the cap", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { maxTurns: "5" } });
+  t.after(c.closeAll);
+  const { sessionId: low } = await p.prompt(undefined, "LOOPVARY", c.work, { engine: "lets-code", maxTurns: 3 });
+  await cappedRun(c, p, low, /stopped after 3 turns \(cap\)/);
+  await until(async () => (await lcTasks(p)).length === 0, 5000, "task terminal");
+  await p.stopSession(low).catch(() => {});
+  const { sessionId: high } = await p.prompt(undefined, "LOOPVARY", c.work, { engine: "lets-code", maxTurns: 50 });
+  await cappedRun(c, p, high, /stopped after 5 turns \(cap\)/);
+  assert.equal(p._map.get(high).max_turns, 50);
+});
+
+test("the default turn cap is 40; a lets-code row without its own maxTurns keeps none", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  await p.ready;
+  assert.equal(p._lc.turnCap, 40);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.equal(p._map.get(sid).max_turns, null);
+});
+
+test("identical consecutive tool calls stop the run at the 8th, through the same abort path", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { maxTurns: "100" } });
+  const caps = [];
+  p.onLcCap = (ev) => caps.push(ev);
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "LOOP", c.work, { engine: "lets-code" });
+  const msg = lcRepeatCapMessage("write", 8);
+  assert.equal(msg, "lets-code run stopped: repeated tool call (write, 8 times in a row)");
+  await cappedRun(c, p, sid, /repeated tool call/);
+  assert.deepEqual(c.frames.filter((f) => f.sid === sid && f.type === "error").map((f) => f.message), [msg]);
+  assert.equal(c.log().filter((l) => l.type === "abort").length, 1);
+  assert.equal(caps.length, 1);
+  assert.equal(caps[0].reason, "repeat");
+  assert.equal(caps[0].tool, "write");
+  assert.equal(caps[0].repeats, 8);
+  await until(async () => (await recordOf(p, sid)).lastError?.text === msg, 5000, "lastError");
+  assert.equal(c.spawns().length, 1);
+  await until(async () => (await lcTasks(p)).length === 0, 5000, "task terminal");
+});
+
+test("varying args never trip the repeat cap", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { maxTurns: "12" } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "LOOPVARY", c.work, { engine: "lets-code" });
+  await cappedRun(c, p, sid, /stopped after 12 turns/);
+  assert.ok(!c.frames.some((f) => f.sid === sid && /repeated tool call/.test(f.message ?? "")));
+});
+
+test("both caps leave the record resumable: the next prompt starts a new run on the same child and clears the cap error", async (t) => {
+  for (const [loop, re] of [
+    ["LOOPVARY", /stopped after 4 turns/],
+    ["LOOP", /repeated tool call/],
+  ]) {
+    const c = makeCase();
+    const p = c.open({ lc: { maxTurns: loop === "LOOP" ? "50" : "4" } });
+    t.after(c.closeAll);
+    const { sessionId: sid } = await p.prompt(undefined, loop, c.work, { engine: "lets-code" });
+    await cappedRun(c, p, sid, re);
+    await until(async () => (await lcTasks(p)).length === 0, 5000, "task terminal");
+    await until(async () => (await recordOf(p, sid)).lastError?.reason === "cap", 5000, "lastError");
+    const results = c.frames.filter((f) => f.sid === sid && f.type === "result").length;
+    await p.prompt(sid, "hello again");
+    await idleAfter(c, sid, results + 1);
+    const rec = await recordOf(p, sid);
+    assert.equal(rec.lastError, null, `${loop}: the new run cleared the cap error`);
+    assert.equal(rec.lastLine, "ok: hello again");
+    assert.equal(rec.runs, 2);
+    assert.equal(c.spawns().length, 1, `${loop}: same child`);
+    assert.equal(c.frames.filter((f) => f.sid === sid && f.type === "error").length, 1, `${loop}: no second error`);
+    // a new loop gets the full budget again (the counters are per run)
+    const before = c.frames.filter((f) => f.sid === sid && f.type === "error").length;
+    await p.prompt(sid, loop);
+    await until(() => c.frames.filter((f) => f.sid === sid && f.type === "error").length === before + 1, 8000, "second cap");
+    assert.match(c.frames.filter((f) => f.sid === sid && f.type === "error").at(-1).message, re);
+  }
+});
+
+test("a factory refusal's lastError is not cleared by the next run (only a cap's is)", async (t) => {
+  const c = makeCase();
+  const p = c.open({ lc: { childEnv: { FAKE_PI_LOG: c.logFile, FAKE_PI_FACTORY_REFUSE: "1" } } });
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  await p.setFactory(sid, true, { ticket: "Fix the CI" });
+  await until(async () => /factory needs these experts/.test((await recordOf(p, sid)).lastError?.text ?? ""), 5000, "lastError");
+  await until(() => p.getStatus(sid).state === "idle", 5000, "idle");
+  const results = c.frames.filter((f) => f.sid === sid && f.type === "result").length;
+  await p.prompt(sid, "hello");
+  await idleAfter(c, sid, results + 1);
+  assert.match((await recordOf(p, sid)).lastError.text, /factory needs these experts/);
+});
+
+test("session_read of an agent without a last error is unchanged; native rows have none", async (t) => {
+  const c = makeCase();
+  const p = c.open();
+  t.after(c.closeAll);
+  const { sessionId: sid } = await p.prompt(undefined, "hello", c.work, { engine: "lets-code" });
+  await idleAfter(c, sid);
+  assert.equal(await p.lastError(sid), null);
+  const host = createOverseerHost({ durable: p, log: QUIET });
+  const read = await host.sessionRead(sid, 5);
+  assert.doesNotMatch(read, /last error/);
+  assert.match(read, /\nstatus: idle\n/);
 });

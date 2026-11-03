@@ -18,7 +18,10 @@
 //
 // Limits: at most `maxLive` live children (idle-kept ones make room); the
 // sandbox must be available unless switched off; MemoryMax only with a memory
-// cgroup controller (ruling 14).
+// cgroup controller (ruling 14). Per run (one task): at most `maxTurns` turns
+// (EVEN_BRIDGE_LC_MAX_TURNS, or the agent's own lower maxTurns) and fewer than
+// LC_REPEAT_MAX identical consecutive tool calls; either cap aborts the turn
+// (the child stays, idle-kept), fails the task and sets `record.lastError`.
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -53,7 +56,7 @@ import {
 } from "./launch.mjs";
 import { LC_ANSWER, LC_ANSWER_MAX, LC_TOOL, LC_USER, LcSessionDoc, lcSessionInitial } from "./record.mjs";
 import { LcSession } from "./session.mjs";
-import { LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_EXIT, LC_RESTART_LIMIT, LC_RUN_TASK, createLcRunTask } from "./task.mjs";
+import { LC_CAP, LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_EXIT, LC_RESTART_LIMIT, LC_RUN_TASK, createLcRunTask } from "./task.mjs";
 
 // What the provider needs besides the engine (it imports only this module, lazily).
 export { stopLcScopes } from "./launch.mjs";
@@ -78,6 +81,36 @@ export const LC_FACTORY_WATCH_MS = 1000;
 /** How often the `.pi` dirs of a session with a live child are sealed (besides every pi's own tool_result seal). */
 export const LC_SEAL_MS = 1000;
 export const LC_REPO_TRACKS_PI = "this repo tracks a .pi dir; lets-code agents can't run here";
+/** Per-run turn cap (EVEN_BRIDGE_LC_MAX_TURNS): default and hard maximum. */
+export const LC_MAX_TURNS_DEFAULT = 40;
+export const LC_MAX_TURNS_CEILING = 200;
+/** The same tool with the same args this many times in a row stops the run. */
+export const LC_REPEAT_MAX = 8;
+/** A capped run whose child does not end the turn after its abort this long: the child is stopped. */
+export const LC_CAP_ABORT_MS = 10_000;
+/** `record.lastError.reason` of a capped run (cleared when the next run starts; a factory refusal has none). */
+export const LC_CAP_REASON = "cap";
+export const lcTurnCapMessage = (n) => `lets-code run stopped after ${n} turns (cap)`;
+export const lcRepeatCapMessage = (tool, n) => `lets-code run stopped: repeated tool call (${tool}, ${n} times in a row)`;
+
+/**
+ * EVEN_BRIDGE_LC_MAX_TURNS as the engine's turn cap: unset → the default; not a positive integer → the
+ * default (with `onBad`); above the ceiling → the ceiling (with `onBad`).
+ */
+export function lcTurnCap(raw, onBad = () => {}) {
+  if (raw == null || String(raw).trim() === "") return LC_MAX_TURNS_DEFAULT;
+  const t = String(raw).trim();
+  const n = /^\d+$/.test(t) ? Number(t) : NaN;
+  if (!Number.isInteger(n) || n < 1) {
+    onBad(`EVEN_BRIDGE_LC_MAX_TURNS=${JSON.stringify(t)} is not a positive integer; using ${LC_MAX_TURNS_DEFAULT}`);
+    return LC_MAX_TURNS_DEFAULT;
+  }
+  if (n > LC_MAX_TURNS_CEILING) {
+    onBad(`EVEN_BRIDGE_LC_MAX_TURNS=${n} is above ${LC_MAX_TURNS_CEILING}; using ${LC_MAX_TURNS_CEILING}`);
+    return LC_MAX_TURNS_CEILING;
+  }
+  return n;
+}
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 const lastLineOf = (text) => String(text ?? "").split("\n").filter((l) => l.trim()).at(-1)?.trim() ?? "";
@@ -136,7 +169,12 @@ export function createLcEngine({
   trustFile = LC_TRUST_FILE,
   factoryWatchMs = LC_FACTORY_WATCH_MS,
   sealMs = LC_SEAL_MS,
+  maxTurns,
+  repeatMax = LC_REPEAT_MAX,
+  capAbortMs = LC_CAP_ABORT_MS,
+  onCap = () => {},
 } = {}) {
+  const turnCap = lcTurnCap(maxTurns, (m) => log.warn?.(`[durable:lc] ${m}`));
   const mem = memoryController ?? lcMemoryControllerAvailable();
   if (!mem) log.warn?.(LC_NO_MEMORY_WARNING);
   const effectiveCaps = { ...caps, memoryMax: mem ? caps?.memoryMax ?? null : null };
@@ -174,6 +212,12 @@ export function createLcEngine({
         factoryStart: null, // { at, file }: a `/factory start` sent, not yet accepted (a refusal is reported)
         factoryWatch: null, // the timer guarding new factory worktrees while a run may create them
         guarded: new Set(), // factory worktrees already guarded by this process
+        capTask: null, // the run task the counters below belong to (a crash retry keeps counting)
+        turns: 0, // turns of that run
+        lastCall: null, // "<tool>\0<args JSON>" of the last tool call of that run
+        repeats: 0, // how many times in a row lastCall was made
+        capped: null, // { message, reason, ... }: the run hit a cap; its turn is being aborted
+        capTimer: null,
       };
       states.set(sid, s);
     }
@@ -536,6 +580,8 @@ export function createLcEngine({
           sealAll(sid); // a plant that does not name .pi (tar, git checkout) is caught before the next subagent
         },
         onActivity: () => markSent(sid),
+        onTurnEnd: (sess) => countTurn(sid, sess),
+        onToolStart: (name, args) => countCall(sid, session, name, args),
         onExit: (sess, info) => onChildExit(sid, sess, info),
       });
       s.session = session;
@@ -592,8 +638,88 @@ export function createLcEngine({
     s.crashed = false;
     const w = s.waiter;
     s.waiter = null;
-    w?.resolve({ lastLine });
+    const capped = s.capped;
+    s.capped = null;
+    clearTimeout(s.capTimer);
+    s.capTimer = null;
+    if (capped) w?.reject(capError(capped.message));
+    else w?.resolve({ lastLine });
     armIdle(sid);
+  }
+
+  const capError = (message) => Object.assign(new Error(message), { code: LC_CAP });
+
+  /** The turn cap of `sid`: EVEN_BRIDGE_LC_MAX_TURNS, or the agent's own maxTurns when lower. */
+  function turnCapOf(sid) {
+    const own = map.get(sid)?.max_turns;
+    return Number.isInteger(own) && own >= 1 ? Math.min(own, turnCap) : turnCap;
+  }
+
+  /** A turn of the running run ended: at the cap, the run is stopped. */
+  function countTurn(sid, session) {
+    const s = S(sid);
+    if (s.session !== session || !s.busy || s.capped) return;
+    s.turns += 1;
+    const cap = turnCapOf(sid);
+    if (s.turns >= cap) capRun(sid, { message: lcTurnCapMessage(s.turns), reason: "turns", turns: s.turns, cap });
+  }
+
+  /** A tool call of the running run: the same tool with the same args `repeatMax` times in a row stops it. */
+  function countCall(sid, session, name, args) {
+    const s = S(sid);
+    if (s.session !== session || !s.busy || s.capped) return;
+    let key;
+    try {
+      key = `${name}\0${JSON.stringify(args ?? {})}`;
+    } catch {
+      key = `${name}\0?${Math.random()}`; // unserializable args never count as a repeat
+    }
+    if (key === s.lastCall) s.repeats += 1;
+    else {
+      s.lastCall = key;
+      s.repeats = 1;
+    }
+    if (s.repeats >= repeatMax) capRun(sid, { message: lcRepeatCapMessage(name, s.repeats), reason: "repeat", tool: name, repeats: s.repeats, turns: s.turns });
+  }
+
+  /**
+   * Stop the run at a cap, cleanly: say why (error frame, `record.lastError`, `onCap` for the audit),
+   * then abort the turn (open dialogs cancelled). The child stays; its agent_end ends the run in
+   * finish(), which fails the task (LC_CAP). A child that never ends the turn is stopped after capAbortMs.
+   */
+  function capRun(sid, info) {
+    const s = S(sid);
+    const session = s.session;
+    s.capped = info;
+    const row = map.get(sid);
+    log.warn?.(`[durable:lc] ${sid}: ${info.message}`);
+    emitTo(sid, { type: "error", message: info.message });
+    updateRecord(sid, (d) => {
+      d.lastError = { text: info.message, at: now(), reason: LC_CAP_REASON };
+    });
+    try {
+      const { message, ...rest } = info;
+      onCap({ sid, label: row?.name ?? null, message, ...rest });
+    } catch (err) {
+      log.warn?.(`[durable:lc] ${sid}: cap hook failed: ${err.message}`);
+    }
+    session?.interrupt();
+    clearTimeout(s.capTimer);
+    s.capTimer = setTimeout(() => {
+      s.capTimer = null;
+      if (s.capped !== info || s.session !== session) return;
+      // The child did not end the turn: end the run here, then stop the child.
+      s.capped = null;
+      const w = s.waiter;
+      s.waiter = null;
+      s.busy = false;
+      s.queued = [];
+      w?.reject(capError(info.message));
+      emitTo(sid, { type: "status", state: "idle", sessionId: sid });
+      log.warn?.(`[durable:lc] ${sid}: no turn end ${capAbortMs} ms after the cap abort; stopping the child`);
+      stopChild(sid).catch(() => {});
+    }, capAbortMs);
+    s.capTimer.unref?.();
   }
 
   /** lets-code accepted the running task's prompt (a response or any event after it): a restart now sends the cut-off prompt. */
@@ -617,6 +743,8 @@ export function createLcEngine({
 
   const engine = {
     banner,
+    /** The per-run turn cap from EVEN_BRIDGE_LC_MAX_TURNS (an agent's own lower maxTurns wins for it). */
+    turnCap,
     memoryController: mem,
     sandboxOk,
     admit,
@@ -629,6 +757,8 @@ export function createLcEngine({
       const id = convIdOf(sid);
       if (id == null) throw httpError(404, "Session not found");
       if (s.busy) {
+        // A capped run is ending: a steer would land in the aborted turn.
+        if (s.capped) throw httpError(409, `${s.capped.message}; send the prompt again once it is idle`);
         const rec = await readRecord(sid);
         if (requestId && rec.lastRequestId === requestId) return { deduped: true };
         if (s.session?.running && !s.starting && s.waiter) await s.session.steer(text);
@@ -655,6 +785,7 @@ export function createLcEngine({
           const d = await tx.doc(LcSessionDoc, id);
           if (requestId && d.lastRequestId === requestId) return null;
           d.lastRequestId = requestId ?? null;
+          if (d.lastError?.reason === LC_CAP_REASON) d.lastError = null; // a new run: the old cap is history
           await tx.appendEntry(id, { kind: LC_USER, data: { text } });
           return tx.createTask(task, { sid, text, requestId: requestId ?? null }, { ownership: { kind: "conversation" }, conversationId: id, background: true });
         }, ctx);
@@ -680,6 +811,15 @@ export function createLcEngine({
       clearTimeout(s.idleTimer);
       s.idleTimer = null;
       s.tools = s.toolsDropped = 0;
+      s.capped = null;
+      clearTimeout(s.capTimer);
+      s.capTimer = null;
+      if (s.capTask !== (taskId ?? null) || taskId == null) {
+        // A new run (a crash retry of the same task keeps its counts).
+        s.capTask = taskId ?? null;
+        s.turns = s.repeats = 0;
+        s.lastCall = null;
+      }
       let send = text;
       if (attempt > 1) {
         const rec = await readRecord(sid);
@@ -762,6 +902,9 @@ export function createLcEngine({
       s.busy = false;
       s.taskId = null;
       s.queued = [];
+      s.capped = null;
+      clearTimeout(s.capTimer);
+      s.capTimer = null;
       if (s.session?.running) {
         s.session.interrupt();
         await stopChild(sid);
@@ -967,6 +1110,8 @@ export function createLcEngine({
       for (const s of states.values()) {
         clearTimeout(s.idleTimer);
         s.idleTimer = null;
+        clearTimeout(s.capTimer);
+        s.capTimer = null;
         stopFactoryWatch(s.sid);
         clearInterval(s.sealTimer);
         s.sealTimer = null;

@@ -161,9 +161,13 @@ The live shim (old code) ignores `engines`; nothing changes for the glasses unti
   hi.txt". Hear "Shall I start agent 'glass-lc' in ~/sandbox/agents/glass-lc on qwen with lets-code
   to …? Say yes to confirm." Say "yes": "Started agent 'glass-lc'. Say 'open terminal' to watch it."
   Then `cat ~/sandbox/agents/glass-lc/hi.txt` → `hi`, and `systemctl --user list-units 'even-lc-*'`
-  shows `even-lc-dur-….scope` while the child lives (≈ 2 min after the run). Watch for a write loop
-  (see *Accepted limits*: in QA one agent rewrote hi.txt 68 times); stop it ("stop agent glass-lc")
-  if it keeps going.
+  shows `even-lc-dur-….scope` while the child lives (≈ 2 min after the run). A write loop (in QA one
+  agent rewrote hi.txt 68 times) now stops by itself: at the 8th identical tool call or after
+  `EVEN_BRIDGE_LC_MAX_TURNS` turns (default 40). If it happens, the phone Terminal shows the error
+  `lets-code run stopped: repeated tool call (write, 8 times in a row)` (or `… after N turns (cap)`),
+  `GET /api/agents` shows it as the agent's `lastError`, and
+  `grep lc_cap ~/.even-terminal/overseer-actions.log` has one line for it. The agent goes idle and
+  takes the next prompt. Stop it ("stop agent glass-lc") if it does not.
 - [ ] **[GLASSES] G2, kill mid-turn.** Say "start an agent called glass-kill that runs sleep 30 and
   then writes done to done.txt", "yes". About 5 s later: `sudo systemctl restart even-bridge`. After
   the restart the run resumes by itself: `cat ~/sandbox/agents/glass-kill/done.txt` → `done`, and the
