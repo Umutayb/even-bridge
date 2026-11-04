@@ -40,8 +40,12 @@ export class PiRpcClient extends EventEmitter {
     if (this.opts.model) args.push("--model", this.opts.model);
     for (const a of this.opts.extraArgs ?? []) args.push(a);
 
-    const env = { ...process.env, ...(this.opts.env ?? {}) };
-    const child = spawn(this.opts.bin ?? "pi", args, {
+    // envExact: the child gets exactly opts.env (an allowlisted env), nothing inherited.
+    const env = this.opts.envExact ? { ...(this.opts.env ?? {}) } : { ...process.env, ...(this.opts.env ?? {}) };
+    // wrap: spawn wrap[0] with [...wrap.slice(1), bin, ...args] (e.g. a systemd-run scope).
+    const bin = this.opts.bin ?? "pi";
+    const wrap = this.opts.wrap?.length ? this.opts.wrap : null;
+    const child = spawn(wrap ? wrap[0] : bin, wrap ? [...wrap.slice(1), bin, ...args] : args, {
       cwd: this.opts.cwd || process.cwd(),
       env,
       stdio: ["pipe", "pipe", "pipe"],

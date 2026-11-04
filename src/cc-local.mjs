@@ -38,6 +38,10 @@ import {
   capturePane,
   findClaudeTmuxPane,
   findExternalClaude,
+  paneRunsPid,
+  inputReady,
+  notReady,
+  screenWord,
   screenShowsFragments,
   tmuxDeliver,
 } from "./providers/pi/detect.mjs";
@@ -118,6 +122,29 @@ export function createCcLocalProvider(
   async function driversOf(sessionId, cwd) {
     const external = await findExternalClaude(cwd, { procRoot, sessionsDir });
     return external.filter((p) => p.sessionId == null || p.sessionId === sessionId);
+  }
+
+  /**
+   * The tmux pane of the terminal claude that runs THIS conversation, bound to its pid (its own record, else the one
+   * pane whose screen shows this conversation): `{ pane, pid }` or null.
+   */
+  async function terminalTarget(sessionId, file) {
+    const meta = ccMeta(file);
+    const external = await driversOf(sessionId, meta.cwd);
+    const owner = external.find((p) => p.sessionId === sessionId);
+    if (owner) {
+      const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner.pid }).catch(() => null);
+      return pane ? { pane, pid: owner.pid } : null;
+    }
+    const frags = recentCcPromptFragments(file);
+    const shows = [];
+    for (const p of external) {
+      const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: p.pid }).catch(() => null);
+      if (!pane) continue;
+      const screen = await capturePane(pane, { tmuxBin }).catch(() => null);
+      if (screenShowsFragments(screen, frags)) shows.push({ pane, pid: p.pid });
+    }
+    return shows.length === 1 ? shows[0] : null;
   }
 
   async function stateOf(sessionId, file) {
@@ -289,6 +316,44 @@ export function createCcLocalProvider(
     },
 
     /**
+     * The overseer's route (tmux only): type ONE literal line into the pane of the terminal claude that runs
+     * THIS conversation, then Enter. The pane is bound to that claude's pid (its own record, else the one pane
+     * whose screen shows this conversation), and right before typing it must still run claude with that pid.
+     * Never the official router, never a resume (EVEN_BRIDGE_CC_RESUME_RC), never a watcher change: when the
+     * terminal is gone it returns `{ blocked: true }` with no side effects.
+     */
+    async deliverToTerminal(sessionId, text) {
+      const file = fileOf(sessionId);
+      if (!file) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+      const blocked = { sessionId, provider: "claude", blocked: true };
+      const target = await terminalTarget(sessionId, file);
+      if (!target) return blocked;
+      if (!(await paneRunsPid(target.pane, target.pid, { commands: ["claude"], tmuxBin, procRoot }))) return blocked;
+      // Allowlist (I6): only Claude Code's own idle input box ("❯ " between two rules) at the bottom of the pane
+      // takes typing; a permission menu, the trust prompt or any dialog would be answered by the text and Enter. A
+      // draft (I7: text outside the dim placeholder, or a continuation line; a styled `-e` capture) would be
+      // submitted with it: `{ draft: true }`.
+      const ready = inputReady(await capturePane(target.pane, { tmuxBin, styled: true }).catch(() => null), "claude");
+      if (!ready.ready) return { ...blocked, ...notReady(ready) };
+      await tmuxDeliver(target.pane, text, { tmuxBin, singleLine: true });
+      claim(sessionId, CC_LOCAL_NAME);
+      log?.(`[bridge] cc-local overseer message -> tmux pane ${target.pane} (claude ${target.pid})`);
+      return { sessionId, provider: "claude" };
+    },
+
+    /**
+     * What the terminal claude of this session shows: "input" (its idle input box), "draft" (unsent text in it),
+     * "menu" (anything else), or null (no bound tmux pane).
+     */
+    async terminalScreen(sessionId) {
+      const file = fileOf(sessionId);
+      if (!file) return null;
+      const target = await terminalTarget(sessionId, file);
+      if (!target) return null;
+      return screenWord(inputReady(await capturePane(target.pane, { tmuxBin, styled: true }).catch(() => null), "claude"));
+    },
+
+    /**
      * History in the official wire shape ({role, text} only — the phone's
      * history view renders clean conversation; tool activity is a live-feed
      * feature, same as official sessions).
@@ -303,6 +368,28 @@ export function createCcLocalProvider(
         else if (m.type === "text_delta") out.push({ role: "assistant", text: m.text });
       }
       return out.slice(-limit);
+    },
+
+    /** Recent sessions from the disk scan (the overseer's list; the phone's list has its own slot). */
+    recentSessions(limit = 10) {
+      return listCcSessions({ limit, base: ccBase });
+    },
+
+    /**
+     * Who drives this session (the overseer's single-writer check): "bridge" when the official
+     * provider holds it live, "terminal-tmux" / "terminal" when a terminal claude drives this
+     * conversation (with or without a reachable tmux pane), else "none".
+     */
+    async driverOf(sessionId) {
+      if (officialStatus(sessionId)) return "bridge";
+      const file = fileOf(sessionId);
+      if (!file) return "none";
+      const meta = ccMeta(file);
+      const drivers = await driversOf(sessionId, meta.cwd);
+      if (drivers.length === 0) return "none";
+      const owner = drivers.find((p) => p.sessionId === sessionId);
+      const pane = await findClaudeTmuxPane(meta.cwd, { tmuxBin, procRoot, pid: owner?.pid }).catch(() => null);
+      return pane ? "terminal-tmux" : "terminal";
     },
 
     async interrupt(sessionId) {

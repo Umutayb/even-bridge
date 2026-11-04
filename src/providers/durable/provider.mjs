@@ -25,16 +25,17 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import { createRegistry, LiveDoc } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, LiveDoc, ROOT_CONVERSATION_ID } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
-import { loadPiModels, thinkingLevelFor } from "./models.mjs";
+import { expandHome, loadPiModels, thinkingLevelFor } from "./models.mjs";
 import { openDurable } from "./harness.mjs";
 import { SessionMap } from "./sessions.mjs";
 import { ViewTranslator } from "./wire.mjs";
-import { createGuardExtension, detectWrapper, probeWrapper, runSync, scopeUnit, shellEnv as guardShellEnv, stopScopes, wrapperEnv } from "./guard.mjs";
+import { detectWrapper, probeWrapper, runSync, scopeUnit, shellEnv as guardShellEnv, stopScopes, wrapperEnv } from "./guard.mjs";
+import { createGuardExtension } from "./guard-ext.mjs";
 import { fileURLToPath } from "node:url";
 import { loadAgentFiles } from "./agent-files.mjs";
 import { allowedAgentsFrom, createSubagentExtension } from "./subagent.mjs";
@@ -158,7 +159,23 @@ export function usableRoots(allowedCwds = [], { home = homedir(), forbidden = []
  * missing cwd below a root is then created (e.g. `~/sandbox/agents/<label>`).
  * @returns {string} the real path
  */
-export function resolveAgentCwd(want, { allowedCwds = [], home = homedir(), forbidden = [] } = {}) {
+export function resolveAgentCwd(want, opts = {}) {
+  const target = checkAgentCwd(want, opts);
+  const { allowedCwds = [], home = homedir(), forbidden = [] } = opts;
+  if (!isDir(target)) {
+    if (existsSync(target)) throw httpError(400, `Working directory ${target} is not a directory`);
+    mkdirSync(target, { recursive: true });
+  }
+  const real = realpathSync(target);
+  checkAgentCwd(real, { allowedCwds, home, forbidden }); // a race may have swapped a component for a symlink
+  return real;
+}
+
+/**
+ * The checks of resolveAgentCwd without creating anything: the target path (symlinks of the deepest
+ * existing ancestor resolved) or a 400. The overseer's proposals use it (a proposal creates nothing).
+ */
+export function checkAgentCwd(want, { allowedCwds = [], home = homedir(), forbidden = [] } = {}) {
   if (!want) throw httpError(400, "No working directory given for the new agent");
   if (allowedCwds === null) throw httpError(400, "No usable agent root is configured (see the bridge's startup warnings)");
   const configured = allowedCwds.filter(Boolean);
@@ -174,13 +191,7 @@ export function resolveAgentCwd(want, { allowedCwds = [], home = homedir(), forb
   };
   const target = realish(resolve(expandWith(String(want), home)));
   check(target);
-  if (!isDir(target)) {
-    if (existsSync(target)) throw httpError(400, `Working directory ${target} is not a directory`);
-    mkdirSync(target, { recursive: true });
-  }
-  const real = realpathSync(target);
-  check(real); // a race may have swapped a component for a symlink
-  return real;
+  return target;
 }
 
 function parseMaxTurns(v) {
@@ -214,7 +225,20 @@ function parseMaxTurns(v) {
  * @param {number} [o.pruneEveryMs] how often stale requestId rows are pruned (default 6 h).
  * @param {Function} [o.scopeRunner] runs systemd-run/systemctl argv synchronously (tests inject a fake).
  * @param {string[]} [o.forbidden] dirs agents may not use (default forbiddenDirs()).
+ * @param {object} [o.lc] the lets-code engine (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1): `{ bin, caps, maxLive, sandbox }`
+ *   plus test seams (see lc/engine.mjs). Unset: no lets-code module is loaded and nothing changes.
+ * @param {object} [o.overseer] the overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1; src/overseer/overseer.mjs
+ *   `overseerProviderOptions`): `{ extension, sid, title, maxTurns, instructions }`. The root conversation is
+ *   created (or reconfigured) with only that extension before anything resumes, and is served as the virtual
+ *   session `sid`. Unset: nothing changes.
+ * @param {{ now?: () => number, setTimer?: Function }} [o.clock] test seam: the Harness clock and timers.
  */
+/** The TTL an overseer-started agent may carry (stored in the row; the shim reaper adopts it). */
+export const AGENT_TTL_S = Object.freeze({ min: 300, max: 43200 });
+
+/** A factory flag on a prompt to an existing agent (the toggle has its own route). */
+export const FACTORY_ON_START = "'factory' is set when an agent starts; use /api/agents/:sid/factory";
+
 export function createDurableProvider(
   emitRaw,
   {
@@ -239,6 +263,9 @@ export function createDurableProvider(
     pruneEveryMs = PRUNE_EVERY_MS,
     scopeRunner = runSync,
     forbidden = forbiddenDirs({ env }),
+    lc,
+    overseer,
+    clock,
   } = {},
 ) {
   const backoff = { ...REATTACH, ...reattach };
@@ -261,6 +288,39 @@ export function createDurableProvider(
   const stale = new Set();
   const map = new SessionMap(storePath);
   const { models, refs, default: defaultRef } = loadPiModels(modelsPath, env);
+  // The overseer: the root conversation as a virtual row of the map (never stored, never in
+  // listAgents/rows, so the shim's reaper never sees it). Every lookup by sid or conversation
+  // id finds it, so the watcher, history, seed, prompt and restart paths serve it unchanged.
+  const ov = overseer ?? null;
+  const startedS = Math.floor(Date.now() / 1000);
+  const overseerRow = () => ({
+    sid: ov.sid,
+    conversation_id: ROOT_CONVERSATION_ID,
+    name: ov.title,
+    cwd: defaultCwd ?? "",
+    model_provider: defaultRef.provider,
+    model_id: defaultRef.modelId,
+    created_at: startedS,
+    last_seen: Math.floor(Date.now() / 1000),
+    origin: "overseer",
+    archived: 0,
+    max_turns: ov.maxTurns,
+    engine: "native",
+    ttl_s: null,
+  });
+  let overseerError = null; // the root could not be created/configured (the overseer stays off)
+  if (ov) {
+    // After a failed root setup the root is unknown again: no prompt reaches it (404) and a live
+    // root run is abort-marked as stale at resume instead of being resumed.
+    const get = map.get.bind(map);
+    const byConversation = map.byConversation.bind(map);
+    map.get = (sid) => (sid === ov.sid ? (overseerError ? undefined : overseerRow()) : get(sid));
+    map.byConversation = (id) => (id === ROOT_CONVERSATION_ID ? (overseerError ? undefined : overseerRow()) : byConversation(id));
+  }
+  const isOverseer = (sid) => Boolean(ov) && sid === ov.sid;
+  const notTheOverseer = (sid) => {
+    if (isOverseer(sid)) throw httpError(403, "The overseer cannot be stopped or archived");
+  };
   // Subagent children are owned conversations the sessions table does not know:
   // child conversation id → parent conversation id, and child → agent role.
   // Filled when the subagent tool creates (or, on a rerun, reuses) a child,
@@ -329,6 +389,7 @@ export function createDurableProvider(
   registry.install(CodingTools);
   registry.install(guardExt); // after CodingTools: the guard's bash (with resource caps) wins
   registry.install(subagentExt); // children keep the guard and drop this one
+  if (ov) registry.install(ov.extension); // selected by the root only (every other conversation names its own)
   const EXTENSIONS = [CodingTools, guardExt, subagentExt];
 
   /**
@@ -370,7 +431,21 @@ export function createDurableProvider(
   let durable; // { harness, ctx, close }
   // `opened`: the harness is usable. `ready`: also re-attached after a restart.
   // Internal paths await `opened` (the resume step itself needs them).
-  const opened = openDurable({ storePath, storage, models, registry, envFor, settings, resume: false }).then(
+  // The lets-code engine's modules load only when it is on (flag off: byte-identical to before).
+  let lcMods = null;
+  let lcBox = null;
+  let lcEngine = null;
+  const isLc = (row) => Boolean(lc) && row?.engine === "lets-code";
+  const opened = (async () => {
+    if (lc) {
+      lcMods = await import("./lc/engine.mjs");
+      const made = lcMods.createLcTaskBox();
+      lcBox = made.box;
+      lcBox.task = made.task;
+      registry.install(defineExtension({ name: "even-lc", tasks: [made.task] }));
+    }
+    return openDurable({ storePath, storage, models, registry, envFor, settings, resume: false, clock });
+  })().then(
     (d) => (durable = d),
     (err) => {
       throw httpError(503, `durable store failed to open: ${err.message}`, err);
@@ -379,6 +454,44 @@ export function createDurableProvider(
   const ready = (async () => {
     try {
       await opened;
+      if (lc) {
+        const { bin, caps, maxLive, sandbox, ...seams } = lc;
+        lcEngine = lcMods.createLcEngine({
+          harness: durable.harness,
+          ctx: durable.ctx,
+          map,
+          emit: (sid, frame) => onLcFrame(sid, frame),
+          storeDir: dirname(expandHome(storePath)),
+          task: lcBox.task,
+          bin,
+          caps,
+          maxLive,
+          sandbox,
+          wrapper: seams.wrapper ?? wrapper,
+          run: seams.run ?? scopeRunner,
+          log,
+          baseEnv: toolEnv,
+          clientCount: (sid) => clientsOf(sid) + (hub?.clientCount?.(sid) ?? 0),
+          defaultModel: `${defaultRef.provider}/${defaultRef.modelId}`,
+          // A run stopped at its turn / repeated-call cap: the server writes the overseer's audit line.
+          onCap: (ev) => provider.onLcCap?.(ev),
+          ...seams,
+        });
+        lcBox.engine = lcEngine;
+      }
+      if (ov) {
+        // The root with the overseer's agent, before anything resumes (a resumed root run needs its tools).
+        const agent = overseerAgent(defaultRef);
+        try {
+          if (ov.failSetup) throw new Error(String(ov.failSetup)); // test seam: a root that cannot be set up
+          const root = await durable.harness.root(durable.ctx, { agent });
+          await root.configure(agent, durable.ctx); // an existing root follows this build's agent
+        } catch (err) {
+          // Fail closed: createOverseer refuses to start and dur-overseer is not listed.
+          overseerError = err;
+          log.warn?.(`[durable] overseer root: ${err.message}`);
+        }
+      }
       // After a restart, BEFORE anything runs (openDurable did not resume):
       // 1. scopes left by the last process are stopped (they outlive the unit);
       // 2. child edges of rows seen in the 7-day window (older ones pruned);
@@ -390,6 +503,11 @@ export function createDurableProvider(
       // 4. resume. Rows outside the window are not read and report idle.
       clearScopes();
       const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
+      if (lcEngine) {
+        // Scopes of this store's lets-code rows only (never a glob: ruling 3).
+        const lcSids = [...map.rows({ seenSince: since })].filter((r) => r.engine === "lets-code").map((r) => r.sid);
+        lcMods.stopLcScopes(lcSids, { env: shellEnv, run: lc.run ?? scopeRunner });
+      }
       map.pruneChildren(since);
       loadChildren();
       const recent = new Map(); // sid → row
@@ -403,9 +521,14 @@ export function createDurableProvider(
       for (const t of inspection.tasks) {
         const convId = t.record.conversationId;
         const row = rootRowOf(convId);
+        // The overseer's own background tasks (sleeping check-ins, the nightly reset) are not a run:
+        // they resume on their own and never make dur-overseer busy.
+        if (ov && row?.sid === ov.sid && t.record.background && String(t.record.kind).startsWith("even.overseer-")) continue;
         if (row && !row.archived && row.last_seen >= since) {
           states.set(row.sid, "busy");
-          recent.set(row.sid, row);
+          if (isLc(row)) {
+            if (t.record.kind === lcMods.LC_RUN_TASK) lcEngine.noteRunning(row.sid, t.record.id);
+          } else recent.set(row.sid, row);
         } else {
           staleTasks.push(t.record.id);
           staleConvs.add(row?.conversation_id ?? convId);
@@ -445,6 +568,17 @@ export function createDurableProvider(
 
   const ctx = () => durable.ctx;
 
+  /** The overseer's agent with `ref` as its model (the default model except during a confirmed model switch). */
+  function overseerAgent(ref) {
+    return {
+      model: ref,
+      thinkingLevel: thinkingLevelFor(ref, settingsPath),
+      maxTurns: ov.maxTurns,
+      instructions: ov.instructions,
+      extensions: [ov.extension],
+    };
+  }
+
   // requestId rows only matter for retries; keep the table small in a long-lived bridge.
   const pruneTimer = setInterval(() => {
     try {
@@ -473,6 +607,16 @@ export function createDurableProvider(
         queueMicrotask(() => maybeStop(sid));
       }
     }
+    try {
+      emitRaw(sid, frame);
+    } catch (err) {
+      log.warn?.(`[durable] emit for ${sid} failed: ${err.message}`);
+    }
+  }
+
+  /** Frames of a lets-code child: the same ring + hub feed; the status cache follows them. */
+  function onLcFrame(sid, frame) {
+    if (frame.type === "status" && (frame.state === "busy" || frame.state === "idle")) states.set(sid, frame.state);
     try {
       emitRaw(sid, frame);
     } catch (err) {
@@ -620,11 +764,25 @@ export function createDurableProvider(
 
   function createSession(phoneCwd, opts) {
     const origin = opts.origin ?? "phone";
-    if (origin !== "evenai" && origin !== "phone") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
+    if (origin !== "evenai" && origin !== "phone" && origin !== "overseer") throw httpError(400, `Invalid origin ${JSON.stringify(origin)}`);
+    let ttlS = null;
+    if (opts.ttlS != null) {
+      if (!Number.isInteger(opts.ttlS) || opts.ttlS < AGENT_TTL_S.min || opts.ttlS > AGENT_TTL_S.max) {
+        throw httpError(400, `ttlS must be an integer from ${AGENT_TTL_S.min} to ${AGENT_TTL_S.max}`);
+      }
+      ttlS = opts.ttlS;
+    }
+    const engine = opts.engine ?? "native";
+    if (engine !== "native" && engine !== "lets-code") throw httpError(400, `Invalid engine ${JSON.stringify(engine)}`);
+    if (engine === "lets-code" && !lcEngine) throw httpError(400, "the lets-code engine is off");
+    if (opts.factory && engine !== "lets-code") throw httpError(400, "'factory' needs engine lets-code");
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
     const cwd = resolveAgentCwd(phoneCwd ?? defaultCwd, { allowedCwds: roots, forbidden });
-    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns });
+    if (engine === "lets-code") lcEngine.checkCwd(cwd); // 409 for a repo that tracks a .pi dir, before any row
+    // lets-code: only an agent's own maxTurns is kept (it lowers EVEN_BRIDGE_LC_MAX_TURNS for that agent).
+    const rowTurns = engine === "lets-code" && (opts.maxTurns == null || opts.maxTurns === "") ? null : maxTurns;
+    const sid = map.create({ name: opts.name, cwd, modelRef: ref, origin, maxTurns: rowTurns, ...(engine === "lets-code" ? { engine } : {}), ...(ttlS != null ? { ttlS } : {}) });
     if (opts.requestId) map.noteRequest(opts.requestId, sid);
     return sid;
   }
@@ -643,6 +801,15 @@ export function createDurableProvider(
   async function createConversationFor(sid) {
     const row = map.get(sid);
     await opened;
+    if (isLc(row)) {
+      // A record only: it never runs a model (ruling 1); the child does the work.
+      const conv = await durable.harness.createConversation(
+        { ownership: { kind: "ownerless" }, agent: { model: defaultRef, maxTurns: 1, instructions: "lets-code session record", extensions: [], cwd: row.cwd } },
+        ctx(),
+      );
+      map.setConversation(sid, conv.id);
+      return;
+    }
     const ref = { provider: row.model_provider, modelId: row.model_id };
     // From the row, validated when it was created: a repair after a crash uses the same budget.
     const maxTurns = parseMaxTurns(row.max_turns);
@@ -679,6 +846,12 @@ export function createDurableProvider(
     wrapper,
     /** cwd of a prompt that names none. */
     defaultCwd,
+    /** Engines a new agent may ask for (Task 3 advertises them on GET /api/agents). */
+    engines: lc ? ["native", "lets-code"] : ["native"],
+    /** The startup banner's lets-code part: on(sandbox|nosandbox|sandbox-missing,mem|nomem), or off. */
+    get lcBanner() {
+      return lcEngine?.banner ?? (lc ? "starting" : "off");
+    },
 
     /** Sync ownership probe: a "dur-" id the session map knows. */
     probe(sessionId) {
@@ -690,13 +863,23 @@ export function createDurableProvider(
     },
 
     listSessions(limit = 10, cwd) {
-      return map
+      const rows = map
         .list({ limit, cwd })
         .filter((r) => r.conversation_id != null)
         .map((r) => ({ id: r.sid, title: r.name, timestamp: r.last_seen * 1000, cwd: r.cwd, provider: WIRE_PROVIDER, status: null }));
+      if (!ov || overseerError || (cwd && cwd !== defaultCwd)) return rows;
+      // The overseer first (the phone Terminal opens it like any session).
+      return [{ id: ov.sid, title: ov.title, timestamp: Date.now(), cwd: defaultCwd ?? "", provider: WIRE_PROVIDER, status: null }, ...rows].slice(0, limit);
+    },
+
+    /** The last error of a lets-code agent (a cap, a refused factory start): `{text, at, reason?}` or null. */
+    async lastError(sessionId) {
+      if (!isLc(map.get(sessionId)) || !lcEngine) return null;
+      return (await lcEngine.record(sessionId)).lastError ?? null;
     },
 
     async getSessionStatus(sessionId) {
+      if (isLc(map.get(sessionId))) return lcEngine?.status(sessionId) ?? "idle";
       try {
         const { conv } = await conversationOf(sessionId);
         if (!conv) return "idle";
@@ -716,6 +899,13 @@ export function createDurableProvider(
     },
 
     async getHistory(sessionId, limit = 10) {
+      const lcRow = map.get(sessionId);
+      if (isLc(lcRow)) {
+        if (lcRow.archived) return [];
+        await ready;
+        claim(sessionId, NAME);
+        return lcEngine.history(sessionId, limit);
+      }
       const { conv } = await conversationOf(sessionId);
       if (!conv) return [];
       claim(sessionId, NAME);
@@ -734,6 +924,15 @@ export function createDurableProvider(
     async seedTranscript(sessionId) {
       if (!sessionId || live.has(sessionId)) return;
       if (getMessages(sessionId, 0).length > 0) return;
+      const lcRow = map.get(sessionId);
+      if (isLc(lcRow)) {
+        if (lcRow.archived) return;
+        await ready.catch(() => {});
+        if (!lcEngine || getMessages(sessionId, 0).length > 0 || lcEngine.status(sessionId) !== "idle") return; // a live run feeds the ring
+        await lcEngine.seed(sessionId);
+        claim(sessionId, NAME);
+        return;
+      }
       const { conv } = await conversationOf(sessionId).catch(() => ({}));
       if (!conv) return;
       const page = await conv.entries({}, historyWindow, undefined, ctx());
@@ -753,8 +952,10 @@ export function createDurableProvider(
     },
 
     watchTranscript(sessionId) {
-      if (!map.get(sessionId)) return;
+      const row = map.get(sessionId);
+      if (!row) return;
       clientCounts.set(sessionId, clientsOf(sessionId) + 1);
+      if (isLc(row)) return; // the child feeds the ring itself; only the client count matters (dialog sweep)
       ensureWatcher(sessionId).catch(() => {});
     },
 
@@ -776,14 +977,39 @@ export function createDurableProvider(
       await ready;
       let sid = sessionId;
       if (!sid && opts.requestId) sid = map.sidForRequest(opts.requestId);
+      // A new lets-code agent: 503 without the sandbox, 429 at the live limit (an idle-kept child is
+      // stopped first, awaited), all before any row exists. The requestId is checked again after it.
+      if (!sid && opts.engine === "lets-code" && lcEngine) {
+        await lcEngine.admit(null);
+        if (opts.requestId) sid = map.sidForRequest(opts.requestId);
+      }
+      let created = false;
+      if (sessionId && opts.factory != null) throw httpError(400, FACTORY_ON_START);
       if (sid) {
         const row = map.get(sid);
         if (!row || row.archived) throw notFound();
       } else {
+        if (opts.factory === true && opts.engine === "lets-code") lcEngine?.checkFactoryExperts(); // 409 before any row
         sid = createSession(cwd, opts);
+        created = true;
       }
       await ensureConversation(sid);
       claim(sid, NAME);
+      if (isLc(map.get(sid))) {
+        // A new session started with the factory on: recorded before the first spawn, which then
+        // sends `/mode orchestration` before the text (no child yet, so nothing is sent here).
+        let r;
+        try {
+          if (created && opts.factory === true) await lcEngine.setFactory(sid, true);
+          r = await lcEngine.prompt(sid, text, { requestId: opts.requestId });
+        } catch (err) {
+          // A new session refused at its first prompt (a concurrent start took the last slot): no empty row stays.
+          if (created) provider.forgetSession(sid);
+          throw err;
+        }
+        map.touch(sid);
+        return { sessionId: sid, provider: WIRE_PROVIDER, ...(r.taskId != null ? { submissionId: r.taskId } : {}) };
+      }
       // Watch before submitting: the first view is the history, so the new
       // input arrives as a change and is reported exactly once.
       const w = await ensureWatcher(sid);
@@ -791,7 +1017,7 @@ export function createDurableProvider(
       let submission;
       try {
         submission = await w.conv.submit(
-          { type: "input", content: text, requestId: opts.requestId ?? randomUUID(), whenBusy: "steer" },
+          { type: "input", content: text, requestId: opts.requestId ?? randomUUID(), whenBusy: opts.whenBusy === "followUp" ? "followUp" : "steer" },
           ctx(),
         );
         const rec = await submission.status(ctx());
@@ -806,18 +1032,27 @@ export function createDurableProvider(
       return { sessionId: sid, provider: WIRE_PROVIDER, submissionId: submission.id };
     },
 
-    respondPermission() {
-      return false; // Durable has no permission dialogs
+    respondPermission(sessionId, decision) {
+      // The overseer's proposals reach the phone as permission requests on dur-overseer (actions.mjs answers).
+      if (isOverseer(sessionId)) return !overseerError && provider.onOverseerPermission ? provider.onOverseerPermission(decision) : false;
+      if (isLc(map.get(sessionId))) return lcEngine?.respondPermission(sessionId, decision) ?? false;
+      return false; // native Durable has no permission dialogs
     },
 
-    /** A question ends the run (the agent stops); the answer is the next input. */
+    /** A question ends the run (the agent stops); the answer is the next input. lets-code: answers its open dialog. */
     respondQuestion(sessionId, answer) {
+      const row = map.get(sessionId);
+      if (isLc(row)) {
+        if (row.archived) throw notFound();
+        return lcEngine.respondQuestion(sessionId, answer);
+      }
       return provider.prompt(sessionId, answer);
     },
 
     interrupt(sessionId) {
       const row = map.get(sessionId);
       if (!row || row.archived || row.conversation_id == null) throw notFound();
+      if (isLc(row)) return lcEngine?.interrupt(sessionId);
       conversationOf(sessionId)
         .then(({ conv }) => conv?.abort(ctx()))
         .catch((err) => log.warn?.(`[durable] interrupt ${sessionId} failed: ${err.message}`));
@@ -831,6 +1066,7 @@ export function createDurableProvider(
     getStatus(sessionId) {
       const row = map.get(sessionId);
       if (!row || row.archived) return null;
+      if (isLc(row)) return { state: lcEngine ? lcEngine.status(sessionId) : "busy", provider: WIRE_PROVIDER };
       const state = states.get(sessionId) ?? (resumed ? "idle" : "busy");
       return { state, provider: WIRE_PROVIDER };
     },
@@ -841,8 +1077,11 @@ export function createDurableProvider(
      * conversation is aborted first (fire and forget).
      */
     forgetSession(sessionId) {
+      notTheOverseer(sessionId);
       const row = map.get(sessionId);
-      if (states.get(sessionId) === "busy" && row?.conversation_id != null && durable) {
+      if (isLc(row)) {
+        lcEngine?.forget(sessionId).catch((err) => log.warn?.(`[durable] forget ${sessionId} failed: ${err.message}`));
+      } else if (states.get(sessionId) === "busy" && row?.conversation_id != null && durable) {
         durable.harness
           .conversation(row.conversation_id, ctx())
           .then((conv) => conv?.abort(ctx()))
@@ -857,6 +1096,16 @@ export function createDurableProvider(
 
     /** Abort and archive (the shim's reaper / stop endpoint). */
     async stopSession(sessionId) {
+      notTheOverseer(sessionId);
+      const lcRow = map.get(sessionId);
+      if (isLc(lcRow)) {
+        if (lcRow.archived) throw notFound();
+        await ready;
+        await lcEngine.stop(sessionId);
+        states.set(sessionId, "idle");
+        provider.forgetSession(sessionId);
+        return;
+      }
       const { row, conv } = await conversationOf(sessionId);
       if (!row || row.archived) throw notFound();
       if (conv) {
@@ -873,6 +1122,7 @@ export function createDurableProvider(
      */
     async listAgents({ all = false } = {}) {
       await opened;
+      if (lc) await ready.catch(() => {}); // the lets-code engine is built after the store opens
       const seenSince = all ? 0 : Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
       const rows = [...map.rows({ seenSince })].filter((r) => r.conversation_id != null).reverse(); // newest first
       const out = [];
@@ -882,6 +1132,20 @@ export function createDurableProvider(
       return out;
 
       async function agentRow(r) {
+        if (isLc(r)) {
+          let rec = { factory: false, lastLine: "" };
+          try {
+            rec = await lcEngine.record(r.sid);
+          } catch (err) {
+            log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
+          }
+          return {
+            ...baseRow(r, lcEngine.status(r.sid), rec.lastLine ?? ""),
+            engine: "lets-code",
+            factory: Boolean(rec.factory),
+            lastError: rec.lastError ?? null, // a refused factory start or a capped run (the shim speaks it)
+          };
+        }
         let state = states.get(r.sid) ?? "idle";
         let lastLine = "";
         try {
@@ -898,6 +1162,11 @@ export function createDurableProvider(
         } catch (err) {
           log.warn?.(`[durable] listAgents ${r.sid}: ${err.message}`);
         }
+        const out = baseRow(r, state, lastLine);
+        return lc ? { ...out, engine: "native", factory: false } : out; // flag off: rows as before
+      }
+
+      function baseRow(r, state, lastLine) {
         return {
           sid: r.sid,
           name: r.name,
@@ -908,6 +1177,7 @@ export function createDurableProvider(
           createdAt: r.created_at * 1000,
           lastSeen: r.last_seen * 1000,
           lastLine,
+          ...(ov ? { ttlS: r.ttl_s ?? null } : {}), // the overseer's builds only (flag off: rows as before)
         };
       }
     },
@@ -930,19 +1200,83 @@ export function createDurableProvider(
       if (abort) {
         const busy = [...states].filter(([, s]) => s === "busy").map(([sid]) => sid);
         await Promise.all(
-          busy.map(async (sid) => {
+          busy.filter((sid) => isLc(map.get(sid))).map((sid) => lcEngine?.stop(sid).catch(() => {})),
+        );
+        await Promise.all(
+          busy.filter((sid) => !isLc(map.get(sid))).map(async (sid) => {
             const { conv } = await conversationOf(sid).catch(() => ({}));
             await conv?.abort(durable.ctx).catch(() => {});
           }),
         );
       }
       for (const sid of [...live.keys()]) stopWatcher(sid);
-      await durable.close();
+      await durable.close(); // signals the lets-code run tasks first: they stay pending for the next start
+      await lcEngine?.stopAll(); // then the children and their scopes
       clearScopes(); // bash still running in a scope would outlive the bridge
       map.close();
     },
 
+    /** Factory toggle of a lets-code agent (Task 3 routes it): `{ factory, mode }`. */
+    async setFactory(sessionId, on, opts = {}) {
+      const row = map.get(sessionId);
+      if (!row || row.archived) throw notFound();
+      if (!isLc(row)) throw httpError(409, "the factory needs the lets-code engine");
+      await ready;
+      return lcEngine.setFactory(sessionId, on, opts);
+    },
+
+    /** The overseer's actions answer permission responses on dur-overseer (set by the server). */
+    onOverseerPermission: null,
+
+    /** Told about a lets-code run stopped at a cap (`{sid, label, message, reason, …}`; set by the server for the audit). */
+    onLcCap: null,
+
+    /** Would a new agent be allowed in `cwd`? Its path, or a 400 (nothing is created). */
+    checkAgentCwd(cwd) {
+      return checkAgentCwd(cwd, { allowedCwds: roots, forbidden });
+    },
+
+    /** The live session a new-session requestId created, or null (a restart-cut overseer start is found by it). */
+    sidForRequest(requestId) {
+      const sid = map.sidForRequest(requestId);
+      const row = sid ? map.get(sid) : null;
+      return row && !row.archived ? sid : null;
+    },
+
+    /** Is `name` a model alias or provider/model this bridge can run? */
+    hasModel(name) {
+      try {
+        resolveModel(name);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    /** Switch the overseer's model (`null`: back to the default). A confirmed model_switch only. */
+    async setOverseerModel(name) {
+      if (!ov || overseerError) throw httpError(503, "the overseer is not running");
+      await ready;
+      const root = await durable.harness.root(ctx());
+      await root.configure(overseerAgent(name == null ? defaultRef : resolveModel(name)), ctx());
+    },
+
+    /** Is the overseer's root running or holding queued inputs? */
+    async overseerBusy() {
+      await ready;
+      const lv = await durable.harness.snapshot(LiveDoc, ROOT_CONVERSATION_ID, ctx());
+      return Boolean(lv?.run);
+    },
+
+    /** Why the overseer's root could not be set up, or null. */
+    get overseerError() {
+      return overseerError;
+    },
+
     _map: map,
+    get _lc() {
+      return lcEngine;
+    },
     get _harness() {
       return durable?.harness;
     },

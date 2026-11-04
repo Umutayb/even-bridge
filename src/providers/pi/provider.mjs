@@ -29,7 +29,7 @@ import { claim, forget } from "../../ownership.mjs";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { transcriptEntriesToWire } from "./wire.mjs";
 import { TranscriptWatcher, defaultFindFile } from "./watcher.mjs";
-import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments } from "./detect.mjs";
+import { findExternalPi, findPiTmuxPane, tmuxDeliver, capturePane, screenShowsFragments, paneRunsPid, inputReady, screenWord, notReady } from "./detect.mjs";
 
 const NAME = "pi";
 const WIRE_PROVIDER = "claude";
@@ -50,7 +50,8 @@ export function defaultPiBin(env = process.env) {
   }
   return "pi";
 }
-export const isLetsCode = (bin) => /^lets-code$/.test(basename(String(bin ?? "")));
+// pi-inference only `exec`s lets-code, so it takes lets-code's model ids too.
+export const isLetsCode = (bin) => /^(?:lets-code|pi-inference)$/.test(basename(String(bin ?? "")));
 // lets-code's --model is a model id on its own server: a "lets-code/<id>"
 // (pi's provider/id form) is given as <id>
 export function launcherModel(bin, model) {
@@ -170,6 +171,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
   const recentInCwd = pi.recentInCwd ?? ((c) => recentSessionsInCwd(c, cfg.agentDir));
   const paneScreen = pi.paneScreenProbe ?? ((pane) => capturePane(pane));
   const screenShows = pi.screenShowsProbe ?? screenShowsFragments;
+  const paneCheck = pi.paneCheckProbe ?? ((pane, pid) => paneRunsPid(pane, pid, { commands: ["pi"] }));
 
   /**
    * Is the external terminal driver for `cwd0` the one running THIS session?
@@ -223,6 +225,39 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
   const paneLastDelivery = new Map(); // paneId -> ts
   const PANE_DELIVERY_GAP_MS = 1500;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * The tmux pane of the terminal pi that runs THIS session, bound to its pid: `{ pane, pid }` or null. With several
+   * pi terminals in the session's folder, only the single pane whose screen shows this conversation (two terminals
+   * in one folder never cross).
+   */
+  async function terminalTarget(sessionId, file) {
+    if (!cfg.tmuxEnabled) return null;
+    const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
+    let ext = [];
+    try {
+      ext = await probeExternal(cwd0, { excludePids: childPids() });
+    } catch {
+      return null;
+    }
+    if (!ext.length || !(await externalOwnsSession(sessionId, file, cwd0))) return null;
+    const cands = [];
+    for (const e of ext) {
+      const pane = await probeTmuxPane(cwd0, { pid: e.pid }).catch(() => null);
+      if (pane) cands.push({ pane, pid: e.pid });
+    }
+    if (cands.length === 1) return cands[0];
+    if (cands.length < 2) return null;
+    let fr = [];
+    try {
+      fr = recentPromptFragments(sessionId, cfg.agentDir);
+    } catch {
+      fr = [];
+    }
+    const shows = [];
+    for (const c of cands) if (screenShows(await paneScreen(c.pane).catch(() => null), fr)) shows.push(c);
+    return shows.length === 1 ? shows[0] : null;
+  }
 
   async function probeExternalCached(cwd) {
     const hit = extCache.get(cwd);
@@ -419,7 +454,7 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
      *  2. Otherwise a live bridge child (sole writer) gets steer/run.
      *  3. Otherwise spawn/resume our own `pi --mode rpc --session <file>`.
      */
-    async prompt(sessionId, text, phoneCwd) {
+    async prompt(sessionId, text, phoneCwd, { noTerminal = false } = {}) {
       let session = null;
       let file = null;
       const directEmit = (sid, msg) => {
@@ -438,6 +473,9 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
         // this session is safe alongside it.
         const ext = file ? await probeExternalCached(cwd0) : [];
         if (ext.length > 0 && (await externalOwnsSession(sessionId, file, cwd0))) {
+          // The overseer's pi-RPC route: a terminal took the session over since the probe. Nothing is typed,
+          // nothing is stopped, nothing is emitted: the caller reports it as not delivered.
+          if (noTerminal) return { sessionId, provider: WIRE_PROVIDER, blocked: true };
           if (session) {
             // Drop our wedged/superseded child (it would eat prompts).
             console.log(`[pi] ${sessionId}: external pi pid ${ext[0].pid} active — dropping bridge child`);
@@ -468,7 +506,8 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
               "session under tmux (tmux new; pi --resume) to send prompts from the glasses.",
           });
           console.log(`[bridge] prompt -> BLOCKED (external pi pid ${ext[0].pid} in non-tmux terminal) session=${sessionId}`);
-          return { sessionId, provider: WIRE_PROVIDER };
+          // `blocked` never reaches the phone (the router builds its own body); the overseer reads it as 409.
+          return { sessionId, provider: WIRE_PROVIDER, blocked: true };
         }
 
         if (!session && file) {
@@ -517,6 +556,49 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
       return { sessionId: sid ?? "", provider: WIRE_PROVIDER };
     },
 
+    /**
+     * The overseer's tmux route: type ONE literal line into the pane of the terminal pi that runs THIS session,
+     * then Enter. The pane is bound to the external pi's pid (two pi terminals in one folder never cross: with
+     * several, the one whose screen shows this conversation, else none), and right before typing (after the
+     * per-pane gap) the pane must still run pi with that pid. Anything else: `{ blocked: true }`, with no side
+     * effects (no child stopped or spawned, nothing emitted).
+     */
+    async deliverToTerminal(sessionId, text) {
+      const file = findSessionFile(sessionId, cfg.agentDir);
+      if (!file) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+      const blocked = { sessionId, provider: WIRE_PROVIDER, blocked: true };
+      const target = await terminalTarget(sessionId, file);
+      if (!target) return blocked;
+      const last = paneLastDelivery.get(target.pane);
+      const wait = last ? PANE_DELIVERY_GAP_MS - (Date.now() - last) : 0;
+      if (wait > 0) await sleep(wait);
+      if (!(await paneCheck(target.pane, target.pid).catch(() => false))) return blocked;
+      // Allowlist (I6): only pi's own idle editor + footer at the bottom of the pane takes typing; a selector,
+      // confirm, input or submenu (they replace the editor) would be answered by the text and the Enter; a draft in
+      // the editor (I7) would be submitted together with the text: `{ draft: true }`.
+      const ready = inputReady(await paneScreen(target.pane).catch(() => null), "pi");
+      if (!ready.ready) return { ...blocked, ...notReady(ready) };
+      await deliverTmux(target.pane, text, { singleLine: true });
+      paneLastDelivery.set(target.pane, Date.now());
+      noteDelivered(sessionId, text);
+      emit(sessionId, { type: "user_prompt", text });
+      console.log(`[bridge] overseer message -> tmux pane ${target.pane} (pi pid ${target.pid}) session=${sessionId}`);
+      return { sessionId, provider: WIRE_PROVIDER };
+    },
+
+    /**
+     * What the terminal pi of this session shows (the inventory's state, Task 6b n5): "input" (its idle editor:
+     * typing is allowed), "draft" (unsent text in the editor, I7), "menu" (anything else: a selector, confirm,
+     * dialog), or null (no bound tmux pane).
+     */
+    async terminalScreen(sessionId) {
+      const file = findSessionFile(sessionId, cfg.agentDir);
+      if (!file) return null;
+      const target = await terminalTarget(sessionId, file);
+      if (!target) return null;
+      return screenWord(inputReady(await paneScreen(target.pane).catch(() => null), "pi"));
+    },
+
     respondPermission(sessionId, decision) {
       const s = sessions.get(sessionId);
       if (!s) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
@@ -542,6 +624,23 @@ export function createPiProvider(emitRaw, { hub, pi = {}, cwd, defaultCwd } = {}
         return { state: "idle", provider: WIRE_PROVIDER };
       }
       return null;
+    },
+
+    /**
+     * Who drives this session (the overseer's single-writer check): "bridge" (our own child),
+     * "terminal-tmux" / "terminal" (a terminal pi runs THIS conversation, with or without a tmux
+     * pane), else "none". A durable lets-code child (an `even-lc-*` scope) is never a terminal:
+     * findExternalPi skips it.
+     */
+    async driverOf(sessionId) {
+      if (sessions.has(sessionId)) return "bridge";
+      const file = findSessionFile(sessionId, cfg.agentDir);
+      if (!file) return "none";
+      const cwd0 = readSessionCwd(sessionId, cfg.agentDir) ?? cwd ?? defaultCwd;
+      const ext = await probeExternalCached(cwd0);
+      if (ext.length === 0 || !(await externalOwnsSession(sessionId, file, cwd0))) return "none";
+      if (cfg.tmuxEnabled && (await probeTmuxPane(cwd0).catch(() => null))) return "terminal-tmux";
+      return "terminal";
     },
 
     /** Release a dead subprocess for a session (call after pi exits). */

@@ -20,14 +20,15 @@
 import { Router } from "express";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
 import { getOwner } from "./ownership.mjs";
-import { findBridgeSessionId } from "./rc-transcripts.mjs";
+import { dropRcTwins } from "./session-twins.mjs";
 import { listCcSessions, ccProjectsBase } from "./cc-transcripts.mjs";
 
 const STATUS_CHECK_COUNT = 10; // mirrors core.js
 
 // Durable prompt fields (POST /api/prompt): limits per the plan's rulings.
 export const AGENT_LIMITS = Object.freeze({ nameMax: 24, maxTurns: 60, requestIdMax: 128, modelMax: 32 });
-export const AGENT_ORIGINS = Object.freeze(["evenai", "phone"]);
+export const AGENT_ORIGINS = Object.freeze(["evenai", "phone", "overseer"]);
+export const AGENT_ENGINES = Object.freeze(["native", "lets-code"]);
 const NAME_RE = /^[\w .-]+$/;
 
 /**
@@ -35,7 +36,7 @@ const NAME_RE = /^[\w .-]+$/;
  * out; `maxTurns` may be a number or a digit-only string and comes back a number.
  * @returns {{ opts: object } | { error: string }}
  */
-export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
+export function agentOpts({ name, model, maxTurns, requestId, origin, engine, factory } = {}) {
   const opts = {};
   const L = AGENT_LIMITS;
   if (name != null) {
@@ -70,7 +71,48 @@ export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
     }
     opts.origin = origin;
   }
+  if (engine != null) {
+    if (!AGENT_ENGINES.includes(engine)) {
+      return { error: `'engine' must be one of ${AGENT_ENGINES.join(", ")}` };
+    }
+    opts.engine = engine;
+  }
+  if (factory != null) {
+    if (typeof factory !== "boolean") return { error: "'factory' must be true or false" };
+    if (factory && opts.engine !== "lets-code") return { error: "'factory' needs engine lets-code" };
+    opts.factory = factory;
+  }
   return { opts };
+}
+
+// POST /api/agents/:sid/factory body limits. The how-to-run goes to lets-code unquoted
+// (ruling 4: it splits on whitespace), so it is one line without quotes.
+export const FACTORY_LIMITS = Object.freeze({ ticketMax: 8000, howToRunMax: 200 });
+
+/**
+ * Validate a factory toggle body.
+ * @returns {{ on: boolean, opts: { ticket?: string, howToRun?: string } } | { error: string }}
+ */
+export function factoryOpts({ on, ticket, howToRun } = {}) {
+  const L = FACTORY_LIMITS;
+  if (typeof on !== "boolean") return { error: "'on' must be true or false" };
+  const opts = {};
+  if (ticket != null) {
+    if (typeof ticket !== "string" || ticket.length < 1 || ticket.length > L.ticketMax) {
+      return { error: `'ticket' must be a string of 1-${L.ticketMax} characters` };
+    }
+    if (!on) return { error: "'ticket' needs on true" };
+    opts.ticket = ticket;
+  }
+  if (howToRun != null) {
+    if (typeof howToRun !== "string" || howToRun.trim().length < 1 || howToRun.length > L.howToRunMax) {
+      return { error: `'howToRun' must be a string of 1-${L.howToRunMax} characters` };
+    }
+    if (/[\r\n"'`]/.test(howToRun)) return { error: "'howToRun' must be one line without quotes" };
+    if (opts.ticket == null) return { error: "'howToRun' needs a ticket" };
+    opts.howToRun = howToRun.trim();
+  }
+  return { on, opts };
 }
 
 /**
@@ -81,7 +123,54 @@ export function agentOpts({ name, model, maxTurns, requestId, origin } = {}) {
  *   rcTranscriptBase?: string,             // ~/.claude/projects base (tests)
  * }} deps
  */
-export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase } = {}) {
+/** POST /api/overseer/ask limits (the overseer's wait is capped at 15 s). */
+export const OVERSEER_LIMITS = Object.freeze({ questionMax: 2000, requestIdMax: 128, waitMsMax: 15000 });
+
+export const OVERSEER_ASK_MODES = Object.freeze(["ask", "tell"]);
+export const ACTION_BY = Object.freeze(["evenai", "http"]);
+
+/**
+ * Validate an overseer ask body: `{ question, requestId, waitMs, mode, handoff? }` or `{ error }`.
+ * `handoff` (`{tag, label, ttlS}`, tell only) is checked further by the overseer (400 while hand-offs are off).
+ */
+export function overseerAskOpts({ question, requestId, waitMs, mode, handoff } = {}) {
+  if (typeof question !== "string" || !question.trim()) return { error: "Missing 'question'" };
+  if (question.length > OVERSEER_LIMITS.questionMax) return { error: `'question' must be 1-${OVERSEER_LIMITS.questionMax} characters` };
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > OVERSEER_LIMITS.requestIdMax) {
+    return { error: `'requestId' must be 1-${OVERSEER_LIMITS.requestIdMax} characters` };
+  }
+  if (waitMs != null && (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > OVERSEER_LIMITS.waitMsMax)) {
+    return { error: `'waitMs' must be 0-${OVERSEER_LIMITS.waitMsMax}` };
+  }
+  if (mode != null && !OVERSEER_ASK_MODES.includes(mode)) return { error: `'mode' must be one of ${OVERSEER_ASK_MODES.join(", ")}` };
+  const out = { question, requestId, waitMs: waitMs ?? OVERSEER_LIMITS.waitMsMax, mode: mode ?? "ask" };
+  if (handoff != null) {
+    if (typeof handoff !== "object" || Array.isArray(handoff)) return { error: "'handoff' must be an object" };
+    if (out.mode !== "tell") return { error: "a hand-off needs mode tell" };
+    out.handoff = handoff;
+  }
+  return out;
+}
+
+/** Validate a POST /api/overseer/actions body (the shim's one gate): `{ kind, args, requestId }` or `{ error }`. */
+export function overseerActionOpts({ kind, args, origin, requestId } = {}) {
+  if (typeof kind !== "string" || !kind) return { error: "Missing 'kind'" };
+  if (args != null && (typeof args !== "object" || Array.isArray(args))) return { error: "'args' must be an object" };
+  // Only Even AI proposes over HTTP; the overseer's own proposals come from its tools in this process.
+  if (origin !== "evenai") return { error: "'origin' must be evenai" };
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > OVERSEER_LIMITS.requestIdMax) {
+    return { error: `'requestId' must be 1-${OVERSEER_LIMITS.requestIdMax} characters` };
+  }
+  return { kind, args: args ?? {}, requestId };
+}
+
+const seqParam = (v) => {
+  if (v == null || v === "") return 0;
+  const n = typeof v === "number" ? v : /^\d+$/.test(String(v)) ? Number(v) : NaN;
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+};
+
+export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null } = {}) {
   const ext = providers.filter(Boolean); // [{name, probe, listSessions, ...}]
   const router = Router();
 
@@ -179,41 +268,11 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       extLists.set(p.name, list);
     }
 
-    // RC transcripts: the claude-remote fork runs the real `claude
-    // --remote-control` CLI, so each live RC session ALSO exists as a local
-    // transcript file under ~/.claude/projects/. The same conversation would
-    // therefore appear twice (once as the cse_… RC session, once as a local
-    // claude session). We keep the RC entry (the phone must interact by its
-    // cse_ id — the upstream only knows that) and hide the local duplicate,
-    // borrowing the local entry's real title + cwd for a better list row.
+    // RC transcripts: each live RC session also exists as a local transcript; the local
+    // duplicate is hidden and the RC row borrows its title + cwd (src/session-twins.mjs, the
+    // same function the overseer's session inventory uses).
     const rcList = extLists.get("claude-remote") || [];
-    if (rcList.length > 0 && local.length > 0) {
-      const rcIds = new Set(rcList.map((s) => s.id));
-      const rcByTwin = new Map(); // local session id -> rc entry
-      const dropLocal = new Set();
-      for (const s of local) {
-        let rcId = null;
-        try {
-          rcId = findBridgeSessionId(s.cwd, s.id, rcTranscriptBase);
-        } catch {
-          /* ignore */
-        }
-        if (rcId && rcIds.has(rcId)) {
-          dropLocal.add(s.id);
-          rcByTwin.set(s.id, rcId);
-        }
-      }
-      if (dropLocal.size > 0) {
-        for (const rc of rcList) {
-          const twin = local.find((l) => rcByTwin.get(l.id) === rc.id);
-          if (twin) {
-            rc.title = twin.title || rc.title;
-            rc.cwd = twin.cwd || rc.cwd;
-          }
-        }
-        local = local.filter((s) => !dropLocal.has(s.id));
-      }
-    }
+    local = dropRcTwins(local, rcList, { base: rcTranscriptBase });
 
     // Honor the phone's project filter on the extended lists too (the RC
     // upstream ignores cwd; pi entries already carry their real cwd).
@@ -226,7 +285,14 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
     out.push(...local);
     for (const p of ext) out.push(...(extLists.get(p.name) || []));
-    out.sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+    // Durable rows carry epoch ms, CC/RC/pi rows ISO strings: compare as ms (the wire values stay as they are).
+    const ms = (t) => (typeof t === "number" ? t : Date.parse(t ?? "") || 0);
+    out.sort((a, b) => ms(b.timestamp) - ms(a.timestamp));
+    if (overseer?.sid) {
+      // The overseer is pinned first (plan ruling 6), whatever the other rows' timestamps.
+      const i = out.findIndex((s) => s.id === overseer.sid);
+      if (i > 0) out.unshift(...out.splice(i, 1));
+    }
     res.json({ sessions: out.slice(0, limit) });
   });
 
@@ -244,7 +310,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
 
   // ── POST /api/prompt ───────────────────────────────────────────────────────
   router.post("/prompt", async (req, res, next) => {
-    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin } = req.body ?? {};
+    const { text, sessionId, provider, cwd, name, model, maxTurns, requestId, origin, engine, factory } = req.body ?? {};
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "Missing 'text' field" });
     }
@@ -272,7 +338,10 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       let result;
       if (p.name === "durable") {
         // Agent fields: validated, and only the ones the caller sent.
-        const checked = agentOpts({ name, model, maxTurns, requestId, origin });
+        if (sessionId && factory != null) {
+          return res.status(400).json({ error: "'factory' is set when an agent starts; use /api/agents/:sid/factory" });
+        }
+        const checked = agentOpts({ name, model, maxTurns, requestId, origin, engine, factory });
         if (checked.error) return res.status(400).json({ error: checked.error });
         result = await p.prompt(sessionId, text, effectiveCwd, checked.opts);
       } else {
@@ -410,7 +479,12 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
   router.get("/agents", async (req, res, next) => {
     if (!durable) return next();
     try {
-      res.json({ agents: await durable.listAgents() });
+      const agents = await durable.listAgents();
+      // `engines` only when there is a choice (ruling 9); with the lets-code flag off the body is as before.
+      const engines = Array.isArray(durable.engines) && durable.engines.includes("lets-code") ? durable.engines : null;
+      const body = engines ? { agents, engines } : { agents };
+      if (overseer) body.overseer = true; // the shim offers overseer_ask only then (flag off: the body of before)
+      res.json(body);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -424,6 +498,140 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     } catch (err) {
       const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
       res.status(statusCode).json({ error: err.message });
+    }
+  });
+
+  // Factory toggle of a lets-code agent (ruling 4): 409 native, 504 without the mode notify.
+  router.post("/agents/:sid/factory", async (req, res, next) => {
+    // Without the lets-code engine the route does not exist (as on main).
+    if (!durable || !(Array.isArray(durable.engines) && durable.engines.includes("lets-code"))) return next();
+    const checked = factoryOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      const r = await durable.setFactory(req.params.sid, checked.on, checked.opts);
+      res.json({ ok: true, sessionId: req.params.sid, factory: r?.factory, mode: r?.mode });
+    } catch (err) {
+      const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
+      res.status(statusCode).json({ error: err.message, ...(err.reason ? { reason: err.reason } : {}) });
+    }
+  });
+
+  // ── /api/overseer — the overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1) ───────────
+  // Without it every route falls through (next()), as before they existed.
+  const fail = (res, err) => {
+    const statusCode = typeof err.statusCode === "number" ? err.statusCode : 500;
+    res.status(statusCode).json({ error: err.message });
+  };
+
+  router.post("/overseer/ask", async (req, res, next) => {
+    if (!overseer) return next();
+    const checked = overseerAskOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      const opts = { requestId: checked.requestId, waitMs: checked.waitMs };
+      if (checked.mode === "tell") opts.mode = "tell";
+      if (checked.handoff) opts.handoff = checked.handoff;
+      res.json(await overseer.ask(checked.question, opts));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.get("/overseer/outbox", async (req, res, next) => {
+    if (!overseer) return next();
+    const since = seqParam(req.query.since);
+    if (since == null) return res.status(400).json({ error: "'since' must be a non-negative integer" });
+    try {
+      res.json(await overseer.outbox({ since }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/outbox/read", async (req, res, next) => {
+    if (!overseer) return next();
+    const upTo = req.body?.upTo;
+    if (!Number.isSafeInteger(upTo) || upTo < 0) return res.status(400).json({ error: "'upTo' must be a non-negative integer" });
+    try {
+      res.json(await overseer.markRead(upTo));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // Every active session of both harnesses (durable agents, pi, local Claude Code, Remote Control) with a
+  // host-built label, a normalized state and whether it can receive a message: the same inventory the
+  // overseer's sessions_list reads (src/overseer/host.mjs). Titles and last lines are not sent. `all=1`: also
+  // sessions idle and undriven for longer than the active window.
+  router.get("/overseer/sessions", async (req, res, next) => {
+    const h = overseer?.host;
+    if (typeof h?.inventory !== "function") return next();
+    const all = req.query.all === "1" || req.query.all === "true";
+    try {
+      res.json({ sessions: await h.inventory({ all }) });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // Gated actions (src/overseer/actions.mjs). Only a confirm executes; the phone answers through
+  // /api/permission-response on dur-overseer instead.
+  const actionsOf = () => overseer?.actions ?? null;
+  /** Who answered over HTTP, for the audit: the shim says evenai; any other bearer holder is "http". */
+  const actionBy = (body) => {
+    const by = body?.by ?? "http";
+    return ACTION_BY.includes(by) ? by : null;
+  };
+
+  router.get("/overseer/actions", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    if (req.query.state != null && req.query.state !== "pending") return res.status(400).json({ error: "'state' must be pending" });
+    try {
+      res.json({ actions: await a.pending() });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/actions", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    const checked = overseerActionOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      res.json(await a.propose(checked.kind, checked.args, { origin: "evenai", requestId: checked.requestId }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/actions/:id/confirm", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    const confirmFrameId = req.body?.confirmFrameId;
+    // The confirm names the frame the user's yes answered (spec): required.
+    if (typeof confirmFrameId !== "string" || confirmFrameId.length < 1 || confirmFrameId.length > 128) {
+      return res.status(400).json({ error: "'confirmFrameId' must be a string of 1-128 characters" });
+    }
+    const by = actionBy(req.body);
+    if (!by) return res.status(400).json({ error: `'by' must be one of ${ACTION_BY.join(", ")}` });
+    try {
+      res.json(await a.confirm(req.params.id, { confirmFrameId, by }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/overseer/actions/:id/deny", async (req, res, next) => {
+    const a = actionsOf();
+    if (!a) return next();
+    const by = actionBy(req.body);
+    if (!by) return res.status(400).json({ error: `'by' must be one of ${ACTION_BY.join(", ")}` });
+    try {
+      res.json(await a.deny(req.params.id, { by }));
+    } catch (err) {
+      fail(res, err);
     }
   });
 

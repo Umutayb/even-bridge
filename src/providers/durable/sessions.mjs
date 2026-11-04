@@ -8,8 +8,25 @@ import { mkdirSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { expandHome } from "./models.mjs";
 
-const ORIGINS = new Set(["evenai", "phone"]);
-const COLUMNS = "sid, conversation_id, name, cwd, model_provider, model_id, created_at, last_seen, origin, archived, max_turns";
+const ORIGINS = new Set(["evenai", "phone", "overseer"]);
+const ENGINES = new Set(["native", "lets-code"]);
+const COLUMNS = "sid, conversation_id, name, cwd, model_provider, model_id, created_at, last_seen, origin, archived, max_turns, engine, ttl_s";
+// Schema v2: origin 'overseer', the session's engine and an optional TTL.
+const SESSIONS_DDL = (table) => `CREATE TABLE ${table} (
+      sid TEXT PRIMARY KEY,
+      conversation_id INTEGER,
+      name TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      model_provider TEXT,
+      model_id TEXT,
+      created_at INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      origin TEXT NOT NULL CHECK (origin IN ('evenai', 'phone', 'overseer')),
+      archived INTEGER NOT NULL DEFAULT 0,
+      max_turns INTEGER,
+      engine TEXT NOT NULL DEFAULT 'native',
+      ttl_s INTEGER
+    )`;
 export const REQUEST_TTL_S = 7 * 86400;
 const PAGE = 200;
 
@@ -30,22 +47,9 @@ export class SessionMap {
     this.db = new DatabaseSync(this.path);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA busy_timeout = 5000");
-    this.db.exec(`CREATE TABLE IF NOT EXISTS sessions (
-      sid TEXT PRIMARY KEY,
-      conversation_id INTEGER,
-      name TEXT NOT NULL,
-      cwd TEXT NOT NULL,
-      model_provider TEXT,
-      model_id TEXT,
-      created_at INTEGER NOT NULL,
-      last_seen INTEGER NOT NULL,
-      origin TEXT NOT NULL CHECK (origin IN ('evenai', 'phone')),
-      archived INTEGER NOT NULL DEFAULT 0,
-      max_turns INTEGER
-    )`);
-    // Maps created before max_turns existed.
-    const cols = this.db.prepare("PRAGMA table_info(sessions)").all().map((c) => c.name);
-    if (!cols.includes("max_turns")) this.db.exec("ALTER TABLE sessions ADD COLUMN max_turns INTEGER");
+    const existing = this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get();
+    if (!existing) this.db.exec(SESSIONS_DDL("sessions"));
+    else this.migrate(existing.sql);
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_conversation ON sessions (conversation_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_created ON sessions (archived, created_at)");
     // Which session a new-session request created, so a retried prompt with the
@@ -65,7 +69,7 @@ export class SessionMap {
     )`);
     this.requestTtlS = requestTtlS;
     this.stmt = {
-      insert: this.db.prepare(`INSERT INTO sessions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`),
+      insert: this.db.prepare(`INSERT INTO sessions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`),
       page: this.db.prepare(`SELECT rowid AS _rowid, ${COLUMNS} FROM sessions WHERE archived = 0 AND last_seen >= ? AND rowid > ? ORDER BY rowid LIMIT ?`),
       get: this.db.prepare(`SELECT ${COLUMNS} FROM sessions WHERE sid = ?`),
       byConversation: this.db.prepare(`SELECT ${COLUMNS} FROM sessions WHERE conversation_id = ? ORDER BY rowid DESC LIMIT 1`),
@@ -86,13 +90,41 @@ export class SessionMap {
     this.pruneRequests();
   }
 
+  /**
+   * v1 → v2 in place. A v1 table's CHECK lacks 'overseer', which SQLite cannot ALTER: the table is
+   * rebuilt in one transaction (rows kept, both indexes recreated by the caller). Maps that predate a
+   * column get it by ALTER TABLE.
+   */
+  migrate(sql) {
+    const cols = () => this.db.prepare("PRAGMA table_info(sessions)").all().map((c) => c.name);
+    if (!cols().includes("max_turns")) this.db.exec("ALTER TABLE sessions ADD COLUMN max_turns INTEGER");
+    if (!cols().includes("engine")) this.db.exec("ALTER TABLE sessions ADD COLUMN engine TEXT NOT NULL DEFAULT 'native'");
+    if (!cols().includes("ttl_s")) this.db.exec("ALTER TABLE sessions ADD COLUMN ttl_s INTEGER");
+    if (String(sql).includes("'overseer'")) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec("DROP TABLE IF EXISTS sessions_v2");
+      this.db.exec(SESSIONS_DDL("sessions_v2"));
+      this.db.exec(`INSERT INTO sessions_v2 (${COLUMNS}) SELECT ${COLUMNS} FROM sessions`);
+      this.db.exec("DROP TABLE sessions");
+      this.db.exec("ALTER TABLE sessions_v2 RENAME TO sessions");
+      this.db.exec("CREATE INDEX IF NOT EXISTS sessions_conversation ON sessions (conversation_id)");
+      this.db.exec("CREATE INDEX IF NOT EXISTS sessions_created ON sessions (archived, created_at)");
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   /** @returns {string} the new sid ("dur-" + uuid). */
-  create({ name, cwd, modelRef, origin, conversationId = null, maxTurns = null }) {
-    if (!ORIGINS.has(origin)) throw new Error(`invalid origin ${JSON.stringify(origin)}: expected evenai|phone`);
+  create({ name, cwd, modelRef, origin, conversationId = null, maxTurns = null, engine = "native", ttlS = null }) {
+    if (!ORIGINS.has(origin)) throw new Error(`invalid origin ${JSON.stringify(origin)}: expected evenai|phone|overseer`);
+    if (!ENGINES.has(engine)) throw new Error(`invalid engine ${JSON.stringify(engine)}: expected native|lets-code`);
     const sid = "dur-" + randomUUID();
     if (!name) name = (cwd && basename(cwd)) || "agent";
     const t = this.now();
-    this.stmt.insert.run(sid, conversationId, name, cwd, modelRef?.provider ?? null, modelRef?.modelId ?? null, t, t, origin, maxTurns);
+    this.stmt.insert.run(sid, conversationId, name, cwd, modelRef?.provider ?? null, modelRef?.modelId ?? null, t, t, origin, maxTurns, engine, ttlS);
     return sid;
   }
 

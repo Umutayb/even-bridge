@@ -74,7 +74,36 @@ export function durableOptions(env = process.env) {
   };
   if (env.EVEN_BRIDGE_DURABLE_STORE) opts.storePath = env.EVEN_BRIDGE_DURABLE_STORE;
   if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
+  const lc = lcOptions(env);
+  if (lc) opts.lc = lc;
   return opts;
+}
+
+/**
+ * The lets-code engine of durable sessions (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1), or null.
+ * The bin defaults to the pi provider's (the live bridge runs lets-code directly); MemoryMax
+ * applies only where the kernel has a memory controller; at most EVEN_BRIDGE_LC_MAX_LIVE
+ * children at once (default 1); EVEN_BRIDGE_LC_SANDBOX=0 drops lets-code's sandbox (tests only).
+ * EVEN_BRIDGE_LC_MAX_TURNS caps each run's turns (the engine parses it: default 40, at most 200).
+ */
+export function lcOptions(env = process.env) {
+  if (String(env.EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE ?? "").trim() !== "1") return null;
+  const n = Number(env.EVEN_BRIDGE_LC_MAX_LIVE || 1);
+  return {
+    bin: env.EVEN_BRIDGE_LC_BIN || env.EVEN_BRIDGE_PI_BIN || "lets-code",
+    caps: { memoryMax: env.EVEN_BRIDGE_LC_MEMORY_MAX || "500M", cpuQuota: "200%" },
+    maxLive: Number.isInteger(n) && n >= 1 ? n : 1,
+    sandbox: env.EVEN_BRIDGE_LC_SANDBOX !== "0",
+    ...(env.EVEN_BRIDGE_LC_MAX_TURNS != null ? { maxTurns: env.EVEN_BRIDGE_LC_MAX_TURNS } : {}),
+  };
+}
+
+/**
+ * The overseer (the Durable root conversation as `dur-overseer`, /api/overseer/*):
+ * EVEN_BRIDGE_OVERSEER_ENABLE=1, and only with the durable provider on.
+ */
+export function overseerEnabled(env = process.env) {
+  return durableEnabled(env) && String(env.EVEN_BRIDGE_OVERSEER_ENABLE ?? "").trim() === "1";
 }
 
 /** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
@@ -156,17 +185,87 @@ export async function startServer({ flags = {}, cwd } = {}) {
   let durableProvider = null;
   let durableState = "off";
   const durableOpts = durableOptions(process.env);
+  // The overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1): its modules load only then. Its extension is in
+  // the durable registry from the start and its host is bound before the store resumes any run.
+  let overseer = null;
+  let overseerMods = null;
+  let overseerState = "off";
+  const overseerHost = {};
+  let checkinBox = null;
+  if (durableOpts && overseerEnabled(process.env)) {
+    try {
+      overseerMods = {
+        ...(await import("./overseer/overseer.mjs")),
+        ...(await import("./overseer/extension.mjs")),
+        ...(await import("./overseer/host.mjs")),
+        ...(await import("./overseer/actions.mjs")),
+        ...(await import("./overseer/checkins.mjs")),
+      };
+      // Check-ins and the nightly reset are tasks of the root: registered now, bound once the overseer runs.
+      checkinBox = overseerMods.createCheckinBox();
+      const extension = overseerMods.createOverseerExtension({ host: overseerHost, checkins: checkinBox });
+      durableOpts.overseer = overseerMods.overseerProviderOptions({ extension });
+    } catch (err) {
+      overseerMods = null;
+      overseerState = `failed: ${err.message}`;
+    }
+  }
   if (durableOpts) {
     let p = null;
     try {
       const { createDurableProvider } = await import("./providers/durable/provider.mjs");
       p = createDurableProvider(emit, { hub, ...durableOpts });
+      if (overseerMods) {
+        Object.assign(overseerHost, overseerMods.createOverseerHost({ durable: p, pi: piProvider, cc: ccProvider, rc: rcProvider }));
+      }
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
-      durableState = `on wrapper=${p.wrapper ?? "none"}`;
+      durableState = `on wrapper=${p.wrapper ?? "none"} lc=${p.lcBanner ?? "off"}`;
     } catch (err) {
       durableState = `failed: ${err.message}`;
       p?.stopAll().catch(() => {});
+    }
+    if (durableProvider && overseerMods) {
+      try {
+        const o = overseerMods.createOverseer({
+          durable: durableProvider,
+          host: overseerHost,
+          // Item kinds and numbers only: the texts may carry session output.
+          emit: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+          // Hand-offs (the Ideate overnight hand-off, gated): a told ask may carry {tag, label, ttlS}.
+          handoffs: String(process.env.EVEN_BRIDGE_OVERSEER_HANDOFF ?? "").trim() === "1",
+        });
+        await o.ready;
+        overseerHost.handoffTag = (tag) => o.handoffTag(tag);
+        // Gated actions: proposals, the confirm endpoint, the phone's permission prompt on dur-overseer.
+        const actions = overseerMods.createOverseerActions({
+          durable: durableProvider,
+          host: overseerHost,
+          overseer: o,
+          emit,
+          onOutbox: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+          // A throwaway instance (smoke) keeps its audit next to its store; the live one uses ~/.even-terminal.
+          ...(process.env.EVEN_BRIDGE_OVERSEER_AUDIT ? { auditPath: process.env.EVEN_BRIDGE_OVERSEER_AUDIT } : {}),
+        });
+        await actions.ready;
+        overseerHost.actions = actions;
+        o.bindActions(actions);
+        const checkins = overseerMods.createOverseerCheckins({
+          durable: durableProvider,
+          box: checkinBox,
+          onOutbox: (item) => console.log(`[overseer] outbox +${item.kind} #${item.seq}`),
+        });
+        await checkins.ready;
+        durableProvider.onOverseerPermission = (decision) => actions.respond(decision);
+        // A lets-code run stopped at its turn / repeated-call cap: one audit line.
+        durableProvider.onLcCap = (ev) => actions.auditEvent(overseerMods.lcCapAuditEvent(ev));
+        overseer = o;
+        overseerState = "on";
+      } catch (err) {
+        overseerState = `failed: ${err.message}`;
+      }
+    } else if (overseerMods) {
+      overseerState = "failed: durable is not running";
     }
     if (durableProvider && !cwdAllowed(durableOpts.defaultCwd, durableOpts.allowedCwds)) {
       console.warn(
@@ -194,13 +293,15 @@ export async function startServer({ flags = {}, cwd } = {}) {
   }
 
   console.log(
-    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}, durable=${durableState}`
+    `[bridge] extensions: claude-remote=${rcProvider ? "on (" + rcCfg.baseUrl + ")" : "off"}, pi=${piProvider ? "on (" + piCfg.bin + ")" : "off"}, cc-local=${ccProvider ? "on" : "off"}, durable=${durableState}` +
+      (overseerEnabled(process.env) ? `, overseer=${overseerState}` : ""),
   );
 
   const extRouter = createExtRouter({
     hub,
     providers: [rcProvider, piProvider, durableProvider, ccProvider],
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
+    overseer,
   });
 
   // ── App (mirrors dist/index.js) ───────────────────────────────────────────
@@ -288,6 +389,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
   function shutdown() {
     stopCodexAppServer();
     piProvider?.stopAll().catch(() => {});
+    overseer?.close();
     // No abort: unfinished durable runs stay pending and resume on the next start.
     durableClosing ??= durableProvider?.stopAll();
     durableClosing?.catch(() => {});

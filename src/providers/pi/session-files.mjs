@@ -12,6 +12,7 @@
 import { readFileSync, readdirSync, statSync, existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { summarizePiToolCall } from "./summarize.mjs";
 
 // The provider label sent on the wire to the Even app. The app only knows its
 // own providers ("claude"/"codex") and FILTERS the session list to the provider
@@ -298,6 +299,16 @@ export function readSessionCwd(sessionId, agentDir) {
 export function readHistory(sessionId, limit, agentDir) {
   const file = findSessionFile(sessionId, agentDir);
   if (!file) return [];
+  return readHistoryFile(file, limit);
+}
+
+/**
+ * Read user/assistant text turns from a session file given by path (latest
+ * `limit`). A tool call at the very end of the file that never got its result
+ * (the child was killed mid-call) is kept as its one-line summary, so the
+ * history shows what was running when it stopped.
+ */
+export function readHistoryFile(file, limit) {
   let raw;
   try {
     raw = readFileSync(file, "utf8");
@@ -305,6 +316,7 @@ export function readHistory(sessionId, limit, agentDir) {
     return [];
   }
   const items = [];
+  let last = null; // the last message entry, if it is an assistant one
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
     let entry;
@@ -315,9 +327,17 @@ export function readHistory(sessionId, limit, agentDir) {
     }
     if (entry.type !== "message") continue;
     const m = entry.message;
+    last = m?.role === "assistant" ? m : null;
     if (!m || (m.role !== "user" && m.role !== "assistant")) continue;
     const text = textOf(m.content);
     if (text) items.push({ role: m.role, text });
+  }
+  const dangling = Array.isArray(last?.content) ? last.content.filter((b) => b?.type === "toolCall" && b.name) : [];
+  if (dangling.length) {
+    const lines = dangling.map((b) => summarizePiToolCall(b.name, b.arguments ?? {}));
+    const text = textOf(last.content);
+    if (text && items.at(-1)?.text === text) items.pop();
+    items.push({ role: "assistant", text: [text, ...lines].filter(Boolean).join("\n") });
   }
   return items.slice(-limit);
 }

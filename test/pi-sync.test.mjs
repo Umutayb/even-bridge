@@ -138,8 +138,9 @@ test("findPiTmuxPane matches command+path; tmuxDeliver sends keys", async () => 
   await tmuxDeliver("%2", "hello glasses", { tmuxBin: bin });
   const { readFile } = await import("node:fs/promises");
   const calls = (await readFile(join(dir, "tmux-calls.log"), "utf8")).trim().split("\n");
+  // one literal line (-l --: never a key name or an option), then Enter as its own key
   assert.ok(
-    calls.includes("tmux send-keys -t %2 hello glasses Enter"),
+    calls.includes("tmux send-keys -t %2 -l -- hello glasses") && calls.includes("tmux send-keys -t %2 Enter"),
     `send-keys recorded; got: ${JSON.stringify(calls)}`
   );
 

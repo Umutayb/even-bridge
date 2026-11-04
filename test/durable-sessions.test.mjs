@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, mkdirSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionMap, sessionMapPath } from "../src/providers/durable/sessions.mjs";
@@ -34,7 +35,7 @@ test("create then get round-trips the row", () => {
   assert.deepEqual(row, {
     sid, conversation_id: 7, name: "fix-tests", cwd: "/home/ay/github/x",
     model_provider: "lets-code", model_id: "qwen3.8-27b",
-    created_at: 5000, last_seen: 5000, origin: "evenai", archived: 0, max_turns: null,
+    created_at: 5000, last_seen: 5000, origin: "evenai", archived: 0, max_turns: null, engine: "native", ttl_s: null,
   });
   assert.equal(map.get("dur-missing"), undefined);
   map.close();
@@ -208,4 +209,51 @@ test("rows() pages through live rows seen since a cutoff, and max_turns is store
   assert.deepEqual([...map.rows({ seenSince: 102, pageSize: 2 })].map((r) => r.sid), sids.slice(2, 4));
   assert.equal(map.get(sids[2]).max_turns, 3);
   map.close();
+});
+
+test("a v1 map migrates to v2 keeping rows", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dur-sessions-v1-"));
+  const storePath = join(dir, "durable.sqlite");
+  // The v1 DDL as main had it (max_turns added by ALTER on older maps).
+  const db = new DatabaseSync(sessionMapPath(storePath));
+  db.exec(`CREATE TABLE sessions (
+      sid TEXT PRIMARY KEY,
+      conversation_id INTEGER,
+      name TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      model_provider TEXT,
+      model_id TEXT,
+      created_at INTEGER NOT NULL,
+      last_seen INTEGER NOT NULL,
+      origin TEXT NOT NULL CHECK (origin IN ('evenai', 'phone')),
+      archived INTEGER NOT NULL DEFAULT 0,
+      max_turns INTEGER
+    )`);
+  db.exec("CREATE INDEX sessions_conversation ON sessions (conversation_id)");
+  db.exec("CREATE INDEX sessions_created ON sessions (archived, created_at)");
+  db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)").run("dur-old", 3, "old", "/w", "lets-code", "qwen3.8-27b", 10, 20, "evenai", 7);
+  db.close();
+
+  const map = new SessionMap(storePath);
+  const old = map.get("dur-old");
+  assert.equal(old.name, "old");
+  assert.equal(old.conversation_id, 3);
+  assert.equal(old.max_turns, 7);
+  assert.equal(old.engine, "native");
+  assert.equal(old.ttl_s, null);
+  assert.equal(map.byConversation(3).sid, "dur-old");
+  const sid = map.create({ name: "o", cwd: "/w", modelRef: QWEN, origin: "overseer", engine: "lets-code", ttlS: 3600 });
+  assert.equal(map.get(sid).engine, "lets-code");
+  assert.equal(map.get(sid).ttl_s, 3600);
+  assert.equal(map.get(sid).origin, "overseer");
+  assert.throws(() => map.create({ name: "x", cwd: "/w", modelRef: QWEN, origin: "x" }), /origin/);
+  assert.throws(() => map.create({ name: "x", cwd: "/w", modelRef: QWEN, origin: "phone", engine: "docker" }), /engine/);
+  const idx = map.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'sessions' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((r) => r.name);
+  assert.deepEqual(idx, ["sessions_conversation", "sessions_created"]);
+  map.close();
+  // Reopening a v2 map changes nothing.
+  const again = new SessionMap(storePath);
+  assert.equal(again.get(sid).engine, "lets-code");
+  assert.equal(again.get("dur-old").engine, "native");
+  again.close();
 });

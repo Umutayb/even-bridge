@@ -498,3 +498,26 @@ test("ext router: disk CC rows in /sessions, prompt guard (in-stream refusal) + 
   assert.ok(mb.messages.length > 0);
   assert.equal(mb.provider, "claude");
 });
+
+test("driverOf: official provider = bridge, a terminal claude = terminal, nobody = none; recentSessions lists the disk", async (t) => {
+  const base = makeBase(t);
+  writeCcSession(base, "/proj/drv", "cc-term", { prompts: ["driven"] });
+  writeCcSession(base, "/proj/drv", "cc-idle", { prompts: ["old"] });
+  writeCcSession(base, "/proj/drv", "cc-live", { prompts: ["glasses"] });
+  const procRoot = fakeProc(t, [{ pid: 501, comm: "claude", cmdline: "claude", state: "S", ppid: 4000, cwd: "/proj/drv" }]);
+  const sessionsDir = fakeSessionsDir(t, [{ pid: 501, sessionId: "cc-term", cwd: "/proj/drv", status: "busy" }]);
+  const live = { "cc-live": { state: "busy", provider: "claude" } };
+  const prov = createCcLocalProvider(() => {}, {
+    base,
+    procRoot,
+    sessionsDir,
+    tmuxBin: "definitely-not-a-tmux-bin",
+    official: () => ({ getStatus: (sid) => live[sid] ?? null }),
+  });
+  assert.equal(await prov.driverOf("cc-live"), "bridge");
+  assert.equal(await prov.driverOf("cc-term"), "terminal", "no reachable tmux pane");
+  assert.equal(await prov.driverOf("cc-idle"), "none", "another conversation's claude does not drive it");
+  assert.equal(await prov.driverOf("cc-missing"), "none");
+  assert.deepEqual(prov.recentSessions(10).map((r) => r.id).sort(), ["cc-idle", "cc-live", "cc-term"]);
+  assert.deepEqual(await prov.listSessions(), [], "the phone's list is unchanged");
+});

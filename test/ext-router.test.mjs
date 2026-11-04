@@ -72,7 +72,7 @@ function stubPi() {
 /** Build an app with ONLY the ext router + a fall-through sentinel.
  *  The official default provider is injected (hermetic — never touches
  *  the user's ~/.claude or ~/.codex). */
-async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase }) {
+async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase, overseer }) {
   const { createExtRouter } = await import("../src/ext-router.mjs");
   const hub = new Hub();
   const app = express();
@@ -85,6 +85,7 @@ async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscrip
       providers: [rc, pi, durable],
       getDefaultLocalProvider: () => local,
       rcTranscriptBase,
+      overseer,
     })
   );
   app.use((req, res) => {
@@ -495,6 +496,19 @@ test("/prompt validates the durable agent fields (400 with a clear error)", asyn
   });
 });
 
+test("/prompt passes a validated engine to the durable provider", async (t) => {
+  const durable = stubDurable();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", engine: "docker" });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error, "'engine' must be one of native, lets-code");
+  assert.equal(durable.calls.prompt.length, 0);
+  const ok = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", engine: "lets-code" });
+  assert.equal(ok.status, 202);
+  assert.deepEqual(durable.calls.prompt[0].opts, { engine: "lets-code" });
+});
+
 test("GET /agents returns the durable provider's listAgents()", async (t) => {
   const durable = stubDurable();
   const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
@@ -537,4 +551,437 @@ test("a durable prompt without a cwd reaches the provider with no cwd (never PRO
   const r = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go" });
   assert.equal(r.status, 202);
   assert.equal(durable.calls.prompt[0].cwd, undefined);
+});
+
+// ── Task 3: engine selection and the factory toggle ────────────────────────
+
+/** A durable stub with the lets-code engine: `engines` and `setFactory`. */
+function stubDurableLc({ engines = ["native", "lets-code"] } = {}) {
+  const d = stubDurable();
+  d.calls.factory = [];
+  d.engines = engines;
+  d.listAgents = async () => [];
+  d.setFactory = async (sid, on, opts) => {
+    if (!sid.startsWith("dur-")) throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+    if (sid === "dur-native") throw Object.assign(new Error("the factory needs the lets-code engine"), { statusCode: 409 });
+    if (sid === "dur-mute") throw Object.assign(new Error("lets-code did not confirm the mode"), { statusCode: 504 });
+    if (sid === "dur-noexperts") throw Object.assign(new Error("factory experts must be enabled by the operator (missing: tester)"), { statusCode: 409, reason: "experts_disabled" });
+    d.calls.factory.push([sid, on, opts]);
+    return { factory: on };
+  };
+  return d;
+}
+
+test("engine and factory are validated", async () => {
+  const { agentOpts } = await import("../src/ext-router.mjs");
+  assert.equal(agentOpts({ engine: "docker" }).error, "'engine' must be one of native, lets-code");
+  assert.deepEqual(agentOpts({ engine: "lets-code", factory: true }).opts, { engine: "lets-code", factory: true });
+  assert.equal(agentOpts({ factory: true }).error, "'factory' needs engine lets-code");
+  assert.equal(agentOpts({ engine: "native", factory: true }).error, "'factory' needs engine lets-code");
+  assert.equal(agentOpts({ factory: "yes" }).error, "'factory' must be true or false");
+  assert.deepEqual(agentOpts({ factory: false }).opts, { factory: false });
+  assert.deepEqual(agentOpts({}).opts, {});
+});
+
+test("/prompt passes factory to the durable provider", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", factory: true });
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error, "'factory' needs engine lets-code");
+  const ok = await postJson(`${base}/api/prompt`, { provider: "durable", text: "go", cwd: "/w", engine: "lets-code", factory: true });
+  assert.equal(ok.status, 202);
+  assert.deepEqual(durable.calls.prompt.map((c) => c.opts), [{ engine: "lets-code", factory: true }]);
+});
+
+test("GET /agents lists engines", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc() });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/agents`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { agents: [], engines: ["native", "lets-code"] });
+});
+
+test("GET /agents without the lets-code engine is unchanged (no engines field)", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc({ engines: ["native"] }) });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [] }));
+});
+
+test("POST /agents/:sid/factory forwards on and ticket", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true, ticket: "Fix the CI" });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true, sessionId: "dur-1", factory: true });
+  r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true, ticket: "Add hello.txt", howToRun: "test -f hello.txt" });
+  assert.equal(r.status, 200);
+  r = await postJson(`${base}/api/agents/dur-1/factory`, { on: false });
+  assert.equal(r.status, 200);
+  assert.deepEqual(durable.calls.factory, [
+    ["dur-1", true, { ticket: "Fix the CI" }],
+    ["dur-1", true, { ticket: "Add hello.txt", howToRun: "test -f hello.txt" }],
+    ["dur-1", false, {}],
+  ]);
+});
+
+test("POST /agents/:sid/factory validates the body", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const bad = [
+    [{}, "'on' must be true or false"],
+    [{ on: "yes" }, "'on' must be true or false"],
+    [{ on: true, ticket: "" }, "'ticket' must be a string of 1-8000 characters"],
+    [{ on: true, ticket: "x".repeat(8001) }, "'ticket' must be a string of 1-8000 characters"],
+    [{ on: true, ticket: 5 }, "'ticket' must be a string of 1-8000 characters"],
+    [{ on: false, ticket: "Fix it" }, "'ticket' needs on true"],
+    [{ on: true, ticket: "t", howToRun: "npm test\nrm -rf /" }, "'howToRun' must be one line without quotes"],
+    [{ on: true, ticket: "t", howToRun: "bash -c 'npm test'" }, "'howToRun' must be one line without quotes"],
+    [{ on: true, ticket: "t", howToRun: 'say "hi"' }, "'howToRun' must be one line without quotes"],
+    [{ on: true, ticket: "t", howToRun: "x".repeat(201) }, "'howToRun' must be a string of 1-200 characters"],
+    [{ on: true, ticket: "t", howToRun: "  " }, "'howToRun' must be a string of 1-200 characters"],
+    [{ on: true, howToRun: "npm test" }, "'howToRun' needs a ticket"],
+  ];
+  for (const [body, error] of bad) {
+    const r = await postJson(`${base}/api/agents/dur-1/factory`, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(await r.json(), { error }, JSON.stringify(body));
+  }
+  assert.equal(durable.calls.factory.length, 0);
+  const ok = await postJson(`${base}/api/agents/dur-1/factory`, { on: true, ticket: "x".repeat(8000), howToRun: "x".repeat(200) });
+  assert.equal(ok.status, 200);
+});
+
+test("factory on a native agent is 409", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc() });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/agents/dur-native/factory`, { on: true });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "the factory needs the lets-code engine" });
+  r = await postJson(`${base}/api/agents/dur-mute/factory`, { on: true });
+  assert.equal(r.status, 504);
+  assert.deepEqual(await r.json(), { error: "lets-code did not confirm the mode" });
+  r = await postJson(`${base}/api/agents/nope/factory`, { on: true });
+  assert.equal(r.status, 404);
+  r = await postJson(`${base}/api/agents/dur-noexperts/factory`, { on: true, ticket: "Fix the CI" });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "factory experts must be enabled by the operator (missing: tester)", reason: "experts_disabled" });
+});
+
+test("/agents/:sid/factory falls through without the durable provider", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi() });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
+  assert.equal(fellThrough.length, 1);
+});
+
+
+test("/prompt with a sessionId and a factory flag is 400 (the toggle has its own route)", async (t) => {
+  const durable = stubDurableLc();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  claim("dur-1", "durable");
+  const r = await postJson(`${base}/api/prompt`, { sessionId: "dur-1", text: "go", factory: true });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: "'factory' is set when an agent starts; use /api/agents/:sid/factory" });
+  assert.equal(durable.calls.prompt.length, 0);
+});
+
+test("/agents/:sid/factory falls through when the durable provider has no lets-code engine (as on main)", async (t) => {
+  const durable = stubDurableLc({ engines: ["native"] });
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
+  assert.equal(fellThrough.length, 1);
+  assert.equal(durable.calls.factory.length, 0);
+});
+
+test("a 409 experts_disabled keeps its reason on the wire", async (t) => {
+  const durable = stubDurableLc();
+  durable.setFactory = async () => {
+    throw Object.assign(new Error("factory experts must be enabled by the operator (missing: tester)"), { statusCode: 409, reason: "experts_disabled" });
+  };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const base = await listen(t, app);
+  const r = await postJson(`${base}/api/agents/dur-1/factory`, { on: true });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "factory experts must be enabled by the operator (missing: tester)", reason: "experts_disabled" });
+});
+
+// ── /api/overseer ─────────────────────────────────────────────────────────────
+
+function stubOverseer() {
+  const calls = { ask: [], outbox: [], read: [] };
+  return {
+    calls,
+    ask: async (question, opts) => {
+      calls.ask.push([question, opts]);
+      return { status: "done", answer: "two agents run" };
+    },
+    outbox: async (opts) => {
+      calls.outbox.push(opts);
+      return { seq: 3, readUpTo: 0, items: [{ seq: 3, at: 1, kind: "notify", text: "hi" }] };
+    },
+    markRead: async (upTo) => {
+      calls.read.push(upTo);
+      return { seq: 3, readUpTo: upTo };
+    },
+  };
+}
+
+test("POST /overseer/ask validates question and waitMs", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  const bad = async (body, error) => {
+    const r = await postJson(`${base}/api/overseer/ask`, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(await r.json(), { error });
+  };
+  await bad({ question: "", requestId: "r1" }, "Missing 'question'");
+  await bad({ requestId: "r1" }, "Missing 'question'");
+  await bad({ question: "x".repeat(2001), requestId: "r1" }, "'question' must be 1-2000 characters");
+  await bad({ question: "what runs?" }, "'requestId' must be 1-128 characters");
+  await bad({ question: "what runs?", requestId: "r".repeat(129) }, "'requestId' must be 1-128 characters");
+  await bad({ question: "what runs?", requestId: "r1", waitMs: 20000 }, "'waitMs' must be 0-15000");
+  await bad({ question: "what runs?", requestId: "r1", waitMs: -1 }, "'waitMs' must be 0-15000");
+  await bad({ question: "what runs?", requestId: "r1", waitMs: "5" }, "'waitMs' must be 0-15000");
+  assert.deepEqual(overseer.calls.ask, []);
+  let r = await postJson(`${base}/api/overseer/ask`, { question: "what runs?", requestId: "r1", waitMs: 0 });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { status: "done", answer: "two agents run" });
+  r = await postJson(`${base}/api/overseer/ask`, { question: "and now?", requestId: "r2" });
+  assert.equal(r.status, 200);
+  assert.deepEqual(overseer.calls.ask, [
+    ["what runs?", { requestId: "r1", waitMs: 0 }],
+    ["and now?", { requestId: "r2", waitMs: 15000 }],
+  ]);
+});
+
+test("GET /overseer/outbox passes since; POST /overseer/outbox/read passes upTo", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  let r = await fetch(`${base}/api/overseer/outbox?since=2`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { seq: 3, readUpTo: 0, items: [{ seq: 3, at: 1, kind: "notify", text: "hi" }] });
+  r = await fetch(`${base}/api/overseer/outbox`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(overseer.calls.outbox, [{ since: 2 }, { since: 0 }]);
+  r = await fetch(`${base}/api/overseer/outbox?since=-1`);
+  assert.equal(r.status, 400);
+  r = await fetch(`${base}/api/overseer/outbox?since=abc`);
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/overseer/outbox/read`, { upTo: 3 });
+  assert.deepEqual(await r.json(), { seq: 3, readUpTo: 3 });
+  r = await postJson(`${base}/api/overseer/outbox/read`, { upTo: "3" });
+  assert.equal(r.status, 400);
+  assert.deepEqual(overseer.calls.read, [3]);
+});
+
+test("overseer errors keep their status code", async (t) => {
+  const overseer = { ...stubOverseer(), ask: async () => { throw Object.assign(new Error("durable store failed"), { statusCode: 503 }); } };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  const r = await postJson(`${base}/api/overseer/ask`, { question: "q", requestId: "r" });
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), { error: "durable store failed" });
+});
+
+test("/overseer routes fall through without the overseer", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable() });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/overseer/ask`, { question: "q", requestId: "r" });
+  await fetch(`${base}/api/overseer/outbox?since=0`);
+  await postJson(`${base}/api/overseer/outbox/read`, { upTo: 1 });
+  assert.deepEqual(fellThrough, ["POST /api/overseer/ask", "GET /api/overseer/outbox", "POST /api/overseer/outbox/read"]);
+});
+
+test("GET /overseer/sessions serves the host inventory; all=1 passes on; without the overseer it falls through", async (t) => {
+  const calls = [];
+  const row = { id: "p1", kind: "pi", label: "notes-p1", state: "idle", driver: "none", lastActivity: 5, ageS: 1, canMessage: true, via: "pi-rpc" };
+  const overseer = { ...stubOverseer(), host: { inventory: async (o) => (calls.push(o), [row]) } };
+  const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, on.app);
+  let r = await fetch(`${base}/api/overseer/sessions`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { sessions: [row] });
+  r = await fetch(`${base}/api/overseer/sessions?all=1`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(calls, [{ all: false }, { all: true }]);
+  const failing = { ...stubOverseer(), host: { inventory: async () => { throw Object.assign(new Error("store"), { statusCode: 503 }); } } };
+  const bad = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer: failing });
+  r = await fetch(`${await listen(t, bad.app)}/api/overseer/sessions`);
+  assert.equal(r.status, 503);
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable() });
+  await fetch(`${await listen(t, off.app)}/api/overseer/sessions`);
+  assert.deepEqual(off.fellThrough, ["GET /api/overseer/sessions"]);
+});
+
+test("dropRcTwins is the phone list's own twin rule (one function for both lists)", async () => {
+  const { dropRcTwins } = await import("../src/session-twins.mjs");
+  const local = [{ id: "l1", cwd: "/a", title: "real title" }, { id: "l2", cwd: "/b", title: "other" }];
+  const rcList = [{ id: "cse_1", cwd: "", title: "" }];
+  const kept = dropRcTwins(local, rcList, { twinOf: (cwd, id) => (id === "l1" ? "cse_1" : id === "l2" ? "cse_gone" : null) });
+  assert.deepEqual(kept.map((s) => s.id), ["l2"], "only a twin of a LISTED rc session is dropped");
+  assert.deepEqual(rcList, [{ id: "cse_1", cwd: "/a", title: "real title" }]);
+  assert.equal(dropRcTwins(local, [], {}), local);
+});
+
+test("GET /agents advertises the overseer only when it is on", async (t) => {
+  const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc(), overseer: stubOverseer() });
+  let r = await fetch(`${await listen(t, on.app)}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [], engines: ["native", "lets-code"], overseer: true }));
+  const nat = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc({ engines: ["native"] }), overseer: stubOverseer() });
+  r = await fetch(`${await listen(t, nat.app)}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [], overseer: true }));
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurableLc({ engines: ["native"] }) });
+  r = await fetch(`${await listen(t, off.app)}/api/agents`);
+  assert.equal(await r.text(), JSON.stringify({ agents: [] }), "overseer off: the body of before");
+});
+
+test("GET /sessions pins the overseer first", async (t) => {
+  const durable = { ...stubDurable(), listSessions: async () => [
+    { id: "dur-overseer", title: "Overseer", timestamp: 1, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-1", title: "a", timestamp: 2, cwd: "/w", provider: "claude", status: null },
+  ] };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, overseer: { ...stubOverseer(), sid: "dur-overseer" } });
+  const base = await listen(t, app);
+  const ids = (await (await fetch(`${base}/api/sessions?limit=3`)).json()).sessions.map((s) => s.id);
+  assert.equal(ids[0], "dur-overseer");
+  assert.equal(ids.length, 3);
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable });
+  const ids2 = (await (await fetch(`${await listen(t, off.app)}/api/sessions?limit=10`)).json()).sessions.map((s) => s.id);
+  assert.notEqual(ids2[0], "dur-overseer", "without the overseer nothing is pinned");
+});
+
+test("GET /sessions sorts durable (ms) and CC/RC/pi (ISO) rows by time; the overseer stays pinned", async (t) => {
+  const newer = Date.parse("2025-07-01T00:00:00Z");
+  const durable = { ...stubDurable(), listSessions: async () => [
+    { id: "dur-overseer", title: "Overseer", timestamp: 5, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-new", title: "a", timestamp: newer, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-old", title: "b", timestamp: Date.parse("2025-01-01T00:00:00Z"), cwd: "/w", provider: "claude", status: null },
+  ] };
+  // local 2025-04-01, rc 2025-05-01, pi 2025-06-01 (ISO strings); an empty CC dir, so the local stub answers
+  const rcTranscriptBase = mkdtempSync(join(tmpdir(), "er-cc-"));
+  t.after(() => rmSync(rcTranscriptBase, { recursive: true, force: true }));
+  const off = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, rcTranscriptBase });
+  let base = await listen(t, off.app);
+  let ids = (await (await fetch(`${base}/api/sessions?limit=1`)).json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids, ["dur-new"], "a durable row newer than every ISO row comes first");
+  ids = (await (await fetch(`${base}/api/sessions?limit=10`)).json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids, ["dur-new", "pi-1", "rc-1", "local-1", "dur-old", "dur-overseer"]);
+  const on = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, rcTranscriptBase, overseer: { ...stubOverseer(), sid: "dur-overseer" } });
+  base = await listen(t, on.app);
+  ids = (await (await fetch(`${base}/api/sessions?limit=3`)).json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids, ["dur-overseer", "dur-new", "pi-1"]);
+});
+
+// ── /api/overseer/actions (Task 5) ───────────────────────────────────────────
+
+function stubActions() {
+  const calls = { propose: [], confirm: [], deny: [], pending: 0 };
+  return {
+    calls,
+    propose: async (kind, args, opts) => {
+      calls.propose.push([kind, args, opts]);
+      return { id: "act-1", kind, summary: "Stop agent 'docs'?", expiresAt: 5, args };
+    },
+    confirm: async (id, opts) => {
+      calls.confirm.push([id, opts]);
+      if (id === "old") throw Object.assign(new Error("action expired"), { statusCode: 410 });
+      return { ok: true, result: { sessionId: "dur-9" } };
+    },
+    deny: async (id, opts) => {
+      calls.deny.push([id, opts]);
+      return { ok: true };
+    },
+    pending: async () => {
+      calls.pending += 1;
+      return [{ id: "act-1", kind: "session_stop", summary: "Stop agent 'docs'?", expiresAt: 5 }];
+    },
+  };
+}
+
+test("overseer action routes: one gate for Even AI, confirm, deny, pending", async (t) => {
+  const actions = stubActions();
+  const overseer = { ...stubOverseer(), actions };
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/overseer/actions`, { kind: "session_stop", args: { id: "dur-1" }, origin: "evenai", requestId: "tok" });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).id, "act-1");
+  assert.deepEqual(actions.calls.propose, [["session_stop", { id: "dur-1" }, { origin: "evenai", requestId: "tok" }]]);
+  r = await postJson(`${base}/api/overseer/actions`, { kind: "session_stop", args: { id: "dur-1" }, origin: "overseer", requestId: "tok" });
+  assert.equal(r.status, 400, "HTTP callers never propose as the overseer");
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, { confirmFrameId: "q-1" });
+  assert.deepEqual(await r.json(), { ok: true, result: { sessionId: "dur-9" } });
+  assert.deepEqual(actions.calls.confirm, [["act-1", { confirmFrameId: "q-1", by: "http" }]], "a bearer holder that does not say who it is");
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, { confirmFrameId: "q-2", by: "evenai" });
+  assert.deepEqual(actions.calls.confirm[1], ["act-1", { confirmFrameId: "q-2", by: "evenai" }]);
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, { confirmFrameId: "q-2", by: "phone" });
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, {});
+  assert.equal(r.status, 400, "the confirm names the frame the yes answered");
+  r = await postJson(`${base}/api/overseer/actions/old/confirm`, { confirmFrameId: "q-3" });
+  assert.equal(r.status, 410);
+  assert.deepEqual(await r.json(), { error: "action expired" });
+  r = await postJson(`${base}/api/overseer/actions/act-1/confirm`, { confirmFrameId: 7 });
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/overseer/actions/act-1/deny`, { by: "evenai" });
+  assert.deepEqual(await r.json(), { ok: true });
+  assert.deepEqual(actions.calls.deny, [["act-1", { by: "evenai" }]]);
+  r = await fetch(`${base}/api/overseer/actions?state=pending`);
+  assert.equal((await r.json()).actions[0].id, "act-1");
+  r = await fetch(`${base}/api/overseer/actions?state=all`);
+  assert.equal(r.status, 400);
+});
+
+test("POST /overseer/ask passes mode tell only when asked", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/overseer/ask`, { question: "start one", requestId: "r1", waitMs: 0, mode: "tell" });
+  await postJson(`${base}/api/overseer/ask`, { question: "what runs", requestId: "r2", waitMs: 0, mode: "ask" });
+  const r = await postJson(`${base}/api/overseer/ask`, { question: "q", requestId: "r3", mode: "yell" });
+  assert.equal(r.status, 400);
+  assert.deepEqual(overseer.calls.ask, [
+    ["start one", { requestId: "r1", waitMs: 0, mode: "tell" }],
+    ["what runs", { requestId: "r2", waitMs: 0 }],
+  ]);
+});
+
+test("POST /overseer/ask passes a hand-off on a told ask only", async (t) => {
+  const overseer = stubOverseer();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer });
+  const base = await listen(t, app);
+  const handoff = { tag: "ideate:bees", label: "ideate-bees", ttlS: 27000 };
+  let r = await postJson(`${base}/api/overseer/ask`, { question: "work on it", requestId: "r1", waitMs: 0, handoff });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: "a hand-off needs mode tell" });
+  r = await postJson(`${base}/api/overseer/ask`, { question: "work on it", requestId: "r1", waitMs: 0, mode: "tell", handoff: [1] });
+  assert.deepEqual(await r.json(), { error: "'handoff' must be an object" });
+  r = await postJson(`${base}/api/overseer/ask`, { question: "work on it", requestId: "r1", waitMs: 0, mode: "tell", handoff });
+  assert.equal(r.status, 200);
+  assert.deepEqual(overseer.calls.ask, [["work on it", { requestId: "r1", waitMs: 0, mode: "tell", handoff }]]);
+});
+
+test("/overseer/actions routes fall through without the overseer's actions", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), overseer: stubOverseer() });
+  const base = await listen(t, app);
+  await postJson(`${base}/api/overseer/actions`, { kind: "session_stop", args: {}, origin: "evenai", requestId: "r" });
+  await postJson(`${base}/api/overseer/actions/a/confirm`, {});
+  await postJson(`${base}/api/overseer/actions/a/deny`, {});
+  await fetch(`${base}/api/overseer/actions?state=pending`);
+  assert.deepEqual(fellThrough, ["POST /api/overseer/actions", "POST /api/overseer/actions/a/confirm", "POST /api/overseer/actions/a/deny", "GET /api/overseer/actions"]);
+});
+
+test("the agent origins include overseer", async () => {
+  const { agentOpts, AGENT_ORIGINS } = await import("../src/ext-router.mjs");
+  assert.deepEqual(AGENT_ORIGINS, ["evenai", "phone", "overseer"]);
+  assert.deepEqual(agentOpts({ origin: "overseer" }).opts, { origin: "overseer" });
 });
