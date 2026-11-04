@@ -44,6 +44,7 @@ import { createExtRouter } from "./ext-router.mjs";
 import { resolveRcConfig, createClaudeRemoteProvider } from "./providers/claude-remote.mjs";
 import { resolvePiConfig, createPiProvider } from "./providers/pi/provider.mjs";
 import { createCcLocalProvider } from "./cc-local.mjs";
+import { createInfoCache, infoCacheMs } from "./info-cache.mjs";
 import { getProvider } from "@evenrealities/even-terminal/dist/routes/core.js";
 import { getDefaultProvider } from "@evenrealities/even-terminal/dist/session.js";
 
@@ -297,11 +298,19 @@ export async function startServer({ flags = {}, cwd } = {}) {
       (overseerEnabled(process.env) ? `, overseer=${overseerState}` : ""),
   );
 
+  // GET /api/info from a cache of the official Claude provider's getInfo()
+  // (the phone's Terminal probe gives up after ~2 s). EVEN_BRIDGE_INFO_CACHE_MS=0
+  // leaves /api/info to the official route.
+  const infoTtlMs = infoCacheMs(process.env);
+  const infoCache =
+    infoTtlMs > 0 ? createInfoCache({ getInfo: () => getProvider("claude").getInfo(), ttlMs: infoTtlMs }) : null;
+
   const extRouter = createExtRouter({
     hub,
     providers: [rcProvider, piProvider, durableProvider, ccProvider],
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
     overseer,
+    infoCache,
   });
 
   // ── App (mirrors dist/index.js) ───────────────────────────────────────────
@@ -370,6 +379,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
     }
     startExposeProvider(PORT, TOKEN);
     installTimestampLogging();
+    infoCache?.prime(); // after the log file is attached, so the refresh line lands in it
     const configuredClaudeTools = process.env.EVEN_TERMINAL_CLAUDE_ALLOWED_TOOLS;
     if (configuredClaudeTools !== undefined) {
       const allowedTools = JSON.parse(configuredClaudeTools);

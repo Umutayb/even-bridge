@@ -1,7 +1,7 @@
 # Deploying the lets-code engine and the overseer (operator checklist)
 
 Plan Task 7. Everything below is done by the operator, by hand, on borealis. No implementer task
-restarts a live service. Flags go on in four stages; check the banner and the listed items after each
+restarts a live service. Flags go on in four stages; check `/api/agents` and the listed items after each
 stage, and keep at least the time it takes to run the [GLASSES] checks between stages. Items marked
 **[GLASSES]** need the phone and the glasses and stay a checklist for the user.
 
@@ -26,8 +26,12 @@ Helper used below (the bridge token, never printed):
 
 ```sh
 T=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.env.HOME+"/.even-terminal/config.json","utf8")).token)')
-banner() { grep -a '\[bridge\] extensions:' ~/.even-terminal/even-bridge.log | tail -1 | grep -o 'durable=.*'; }
+agents() { curl -s -H "authorization: Bearer $T" http://127.0.0.1:3456/api/agents | node -e 'let s="";process.stdin.on("data",(d)=>(s+=d)).on("end",()=>{const b=JSON.parse(s);console.log(JSON.stringify({engines:b.engines??null,overseer:b.overseer??false}))})'; }
 ```
+
+`agents` prints the `engines` and `overseer` fields of `GET /api/agents`. (The bridge's
+`[bridge] extensions:` startup line is printed before the log file is attached, so it never reaches
+`~/.even-terminal/even-bridge.log`; `/api/agents` is the check.)
 
 ## 0. Push and open the PRs
 
@@ -116,7 +120,7 @@ the same for the shim with `~/github/even-cloud-shim-overseer` and `overseer`).
 - [ ] Tools and kernel:
   ```sh
   command -v bwrap socat                       # both: /usr/bin/bwrap /usr/bin/socat
-  cat /sys/fs/cgroup/cgroup.controllers        # lists memory (banner will say mem)
+  cat /sys/fs/cgroup/cgroup.controllers        # lists memory (children then get MemoryMax)
   cat /proc/swaps                              # /dev/zram0 present (children get MemorySwapMax=0)
   ls -l ~/.local/bin/lets-code ~/.config/lets-code/config
   sudo grep -c LETS_CODE_TOKEN /etc/systemd/system/even-bridge.service.d/pi-lets-code.conf   # ≥ 1 (the overseer's model key)
@@ -161,11 +165,13 @@ the same for the shim with `~/github/even-cloud-shim-overseer` and `overseer`).
     | sudo tee /etc/systemd/system/even-bridge.service.d/overseer.conf
   sudo systemctl daemon-reload
   sudo systemctl start even-bridge      # (sudo systemctl restart even-bridge if it is already up)
-  sleep 5; banner
+  sleep 5; agents
   ```
-  Expected banner: `durable=on wrapper=systemd-run lc=on(sandbox,mem)`.
-  `lc=on(sandbox-missing,…)` → bwrap/socat not found by the unit (every lets-code start would be 503);
-  `wrapper=none` → the user manager was unreachable; either one: roll back this stage.
+  Expected: `{"engines":["native","lets-code"],"overseer":false}`. `"engines":null` → the engine is
+  off (drop-in not read); roll back this stage. The sandbox and wrapper state are only in the startup
+  line on the journal: `journalctl -u even-bridge -b | grep -a 'extensions:' | tail -1` →
+  `lc=on(sandbox-missing,…)` (bwrap/socat not found by the unit, every lets-code start would be 503)
+  or `wrapper=none` (the user manager was unreachable): either one, roll back this stage.
 - [ ] `curl -s -H "authorization: Bearer $T" http://127.0.0.1:3456/api/agents` → `{"agents":[…],"engines":["native","lets-code"]}`.
 - [ ] `systemctl --user list-units 'even-lc-*'` → nothing yet.
 
@@ -217,10 +223,11 @@ The live shim (old code) ignores `engines`; nothing changes for the glasses unti
   ```sh
   echo 'Environment=EVEN_BRIDGE_OVERSEER_ENABLE=1' | sudo tee -a /etc/systemd/system/even-bridge.service.d/overseer.conf
   sudo systemctl daemon-reload && sudo systemctl restart even-bridge
-  sleep 5; banner
+  sleep 5; agents
   ```
-  Expected: `durable=on wrapper=systemd-run lc=on(sandbox,mem), overseer=on`.
-  `overseer=failed: …` → the routes fall through and nothing else changes; read the reason, roll back.
+  Expected: `{"engines":["native","lets-code"],"overseer":true}`.
+  `"overseer":false` → the overseer failed to start; the routes fall through and nothing else
+  changes; read the reason (`journalctl -u even-bridge -b | grep -a 'overseer=failed'`), roll back.
 - [ ] `curl -s -H "authorization: Bearer $T" http://127.0.0.1:3456/api/agents` → also `"overseer":true`.
 - [ ] `curl -s -H "authorization: Bearer $T" 'http://127.0.0.1:3456/api/sessions' | head -c 300` →
   `dur-overseer` ("Overseer") first. It cannot be stopped or archived (403 from the provider).
@@ -301,19 +308,19 @@ The live shim (old code) ignores `engines`; nothing changes for the glasses unti
 
 ## Rollback
 
-Per stage, newest first; each is a drop-in or env edit plus a restart, then the banner check.
+Per stage, newest first; each is a drop-in or env edit plus a restart, then the `agents` check.
 
 - **Stage 4:** remove `SHIM_OVERSEER_ENABLE=1` from `~/.config/even-cloud-shim/env`,
   `systemctl --user restart even-cloud-shim`. Dispatches go to `POST /api/prompt` again.
 - **Stage 3:** delete the `EVEN_BRIDGE_OVERSEER_ENABLE=1` line from
   `/etc/systemd/system/even-bridge.service.d/overseer.conf`, `sudo systemctl daemon-reload && sudo
-  systemctl restart even-bridge`; banner without `overseer=`. The shim drops the overseer tools within
+  systemctl restart even-bridge`; `agents` → `"overseer":false`. The shim drops the overseer tools within
   60 s. Root conversation, notes, outbox, actions and the audit log stay on disk.
 - **Stage 2:** `git -C ~/github/even-cloud-shim checkout <previous main sha>` (or revert the merge),
   restart the shim. The new `agents.db` columns are additive; the old code ignores them.
 - **Stage 1:** first stop live lets-code agents (`POST /api/agents/<sid>/stop`), then remove
-  `overseer.conf` (or its `ENGINE_LETSCODE` line), `daemon-reload`, restart; banner `lc=off` /
-  without `lc=`. Check `systemctl --user list-units 'even-lc-*'` is empty (with the engine off the
+  `overseer.conf` (or its `ENGINE_LETSCODE` line), `daemon-reload`, restart; `agents` →
+  `"engines":null` (or, with durable off too, no `/api/agents` at all). Check `systemctl --user list-units 'even-lc-*'` is empty (with the engine off the
   startup cleanup of lets-code scopes does not run). Session files stay in
   `~/.even-terminal/lc-sessions/`.
 - **The code:** `git -C ~/github/even-bridge checkout <previous main sha>` and restart. main's code

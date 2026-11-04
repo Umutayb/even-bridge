@@ -162,6 +162,7 @@ Bridge flags:
 | `--no-pi-all-cwds` | `EVEN_BRIDGE_PI_ALL_CWDS=0` | all cwds | scope pi list to project dir |
 | `--pi-agent-dir <d>` | `EVEN_BRIDGE_PI_AGENT_DIR` | `~/.pi/agent` | pi agent dir |
 | — | `EVEN_BRIDGE_WEB_SEARCH_URL` | unset (web tools off) | even-search base URL (e.g. `https://evsearch.i-bora.com`) behind the durable agents' `web_search` / `web_fetch` tools; read once at bridge start |
+| — | `EVEN_BRIDGE_INFO_CACHE_MS` | `300000` | how long a cached `GET /api/info` answer counts as fresh (ms); older answers are still served while a background refresh runs. `0` turns the cache off (the official route answers every call) |
 
 ### Durable agents (opt-in, read at restart)
 
@@ -459,6 +460,7 @@ sessions, mirroring the pi architecture (`src/cc-local.mjs` provider +
 bin/even-bridge.mjs          CLI: official config machinery + bridge flags
 src/server.mjs               superserver entry (mirrors official dist/index.js)
 src/ext-router.mjs           ownership-intercepting router + merged /sessions
+src/info-cache.mjs           cached GET /api/info (the phone's Terminal probe)
 src/ownership.mjs            session-ID → provider registry (claim/probe/forget)
 src/hub.mjs                  phone-facing SSE for extended sessions
 src/upstream-pump.mjs        RC relay pump (upstream SSE → local ring + hub)
@@ -501,6 +503,20 @@ The wire protocol is the official even-terminal one (`/api/sessions`,
 `/api/sessions/:id/history`, `/api/permission-response`,
 `/api/question-response`, `/api/interrupt`, `/api/info`, …). Extended sessions
 flow through the same endpoints; the phone needs no changes.
+
+`GET /api/info` (no `provider`, or `provider=claude`) is answered from a
+cache. Before the phone opens the Terminal glasses app it probes the host with
+`/api/info` and gives up after about 2 s (`terminal_host_unavailable`). The
+official route calls the Claude provider's `getInfo()` on every request, which
+lists recent Claude sessions, reads their message files for the model and runs
+`claude --version` and `claude auth status`: 0.5–2 s per call, enough to miss
+that budget. The answer (account, model, version) only changes over minutes,
+so the bridge primes it at start and serves it from memory, refreshing in the
+background once it is older than `EVEN_BRIDGE_INFO_CACHE_MS` (a failed refresh
+keeps the old answer). Before the first refresh finishes, a call waits at most
+500 ms and then gets `Unknown` placeholders. The body is the official route's
+(`{account, model, version, provider, extra: {expose}}`); each refresh logs
+`[bridge] info cache refreshed in <ms> ms` (or `… refresh failed: <message>`).
 
 Bridge-only additions (durable; only with `EVEN_BRIDGE_DURABLE_ENABLE=1`):
 

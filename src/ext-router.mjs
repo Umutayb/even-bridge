@@ -19,6 +19,8 @@
 
 import { Router } from "express";
 import { getMessages } from "@evenrealities/even-terminal/dist/routes/events.js";
+import { getDefaultProvider } from "@evenrealities/even-terminal/dist/session.js";
+import { exposeType } from "./info-cache.mjs";
 import { getOwner } from "./ownership.mjs";
 import { dropRcTwins } from "./session-twins.mjs";
 import { listCcSessions, ccProjectsBase } from "./cc-transcripts.mjs";
@@ -170,7 +172,23 @@ const seqParam = (v) => {
   return Number.isSafeInteger(n) && n >= 0 ? n : null;
 };
 
-export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null } = {}) {
+/**
+ * Does a /api/info request with this `provider` param land on the official
+ * Claude provider (the object the info cache wraps)? No param → the official
+ * default provider (DEFAULT_PROVIDER, "claude" when unset).
+ */
+function infoTargetsClaude(param) {
+  if (param === undefined) {
+    try {
+      return getDefaultProvider() === "claude";
+    } catch {
+      return false; // invalid DEFAULT_PROVIDER: let the official route answer
+    }
+  }
+  return param === "claude";
+}
+
+export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null, infoCache = null } = {}) {
   const ext = providers.filter(Boolean); // [{name, probe, listSessions, ...}]
   const router = Router();
 
@@ -296,10 +314,19 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     res.json({ sessions: out.slice(0, limit) });
   });
 
-  // ── GET /api/info — extended provider info (explicit param only) ──────────
+  // ── GET /api/info — extended provider info (explicit param) or the cache ──
+  // Without an extended provider param the official Claude provider's info is
+  // served from the info cache (src/info-cache.mjs): the phone's Terminal
+  // readiness probe gives up after ~2 s, and the official route's getInfo()
+  // takes 0.5-2 s on every call. Body shape as the official route's. With the
+  // cache off (EVEN_BRIDGE_INFO_CACHE_MS=0) or another provider → official route.
   router.get("/info", async (req, res, next) => {
     const p = byName(req.query.provider);
-    if (!p) return next();
+    if (!p) {
+      if (!infoCache || !infoTargetsClaude(req.query.provider)) return next();
+      const info = await infoCache.get();
+      return res.json({ ...info, extra: { expose: exposeType() } });
+    }
     try {
       const info = await p.getInfo();
       res.json({ ...info, extra: {} });
