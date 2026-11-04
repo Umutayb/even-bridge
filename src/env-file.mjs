@@ -9,7 +9,7 @@
 //   EVEN_BRIDGE_NEW_SESSION_PROVIDER   claude | pi | claude-remote
 //   EVEN_BRIDGE_CC_MODEL               model for glasses-spawned Claude Code
 // Settings read once at startup (EVEN_TERMINAL_CLAUDE_CODE_EXECUTABLE,
-// EVEN_BRIDGE_CC_PERMISSION_MODE, EVEN_BRIDGE_PI_*) still need a restart: kill the bridge, systemd restarts it.
+// EVEN_BRIDGE_CC_PERMISSION_MODE, EVEN_BRIDGE_PI_*, EVEN_BRIDGE_WEB_SEARCH_URL) still need a restart: kill the bridge, systemd restarts it.
 import { readFileSync, watchFile } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

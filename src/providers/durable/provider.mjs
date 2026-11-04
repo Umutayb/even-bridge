@@ -7,7 +7,9 @@
 // session ids to Durable conversation ids. Every conversation runs CodingTools
 // behind the guard extension (path confinement, command vetting, resource caps)
 // and offers the `subagent` tool (lets-code agent files, owned child
-// conversations that keep the guard and work in the parent's cwd).
+// conversations that keep the guard and work in the parent's cwd). With
+// EVEN_BRIDGE_WEB_SEARCH_URL set it also offers `web_search` / `web_fetch`
+// (web.mjs, backed by even-search), children included.
 //
 // Wire frames come from `conversation.watch()` views through ViewTranslator.
 // A watcher runs while a conversation is busy (so the ring fills without any
@@ -39,6 +41,7 @@ import { createGuardExtension } from "./guard-ext.mjs";
 import { fileURLToPath } from "node:url";
 import { loadAgentFiles } from "./agent-files.mjs";
 import { allowedAgentsFrom, createSubagentExtension } from "./subagent.mjs";
+import { createWebExtension, webSearchUrlFrom } from "./web.mjs";
 
 const NAME = "durable";
 const WIRE_PROVIDER = "claude";
@@ -218,6 +221,8 @@ function parseMaxTurns(v) {
  *   provider start: edits to agent files (and EVEN_BRIDGE_DURABLE_AGENTS) apply at the next bridge start.
  * @param {Map<string, object>} [o.agents] ready agent definitions instead of `agentsDir` (tests).
  * @param {object} [o.subagent] extra options for createSubagentExtension (e.g. `defaultTimeoutS`).
+ * @param {object} [o.web] the `even-web` tools (web.mjs): `{ baseUrl, fetchImpl, timeouts }`. `baseUrl` defaults to
+ *   EVEN_BRIDGE_WEB_SEARCH_URL (read once, at provider start); empty = the tools are off.
  * @param {number} [o.maxChildEdges] subagent child edges kept in memory (oldest dropped first).
  * @param {string[]|null} [o.allowedAgents] agents the subagent tool offers (default: EVEN_BRIDGE_DURABLE_AGENTS or the
  *   built-in list; null = every loaded agent).
@@ -257,6 +262,7 @@ export function createDurableProvider(
     agentsDir = "~/.pi/agent/agents",
     agents,
     subagent = {},
+    web = {},
     maxChildEdges = MAX_CHILD_EDGES,
     allowedAgents = allowedAgentsFrom(env),
     reattach = {},
@@ -385,12 +391,16 @@ export function createDurableProvider(
       else log.warn?.(`[durable] subagent child ${childId}: parent conversation ${parentId} has no session; not persisted`);
     },
   });
+  // Web tools: not bash and no filesystem, so the guard does not vet them; even-search fetches every page.
+  const webExt = createWebExtension({ log, ...web, baseUrl: web.baseUrl ?? webSearchUrlFrom(env) });
+  if (!webExt) (log.log ?? log.info ?? console.log).call(log, "[durable] web tools off (EVEN_BRIDGE_WEB_SEARCH_URL unset)");
   const registry = createRegistry();
   registry.install(CodingTools);
   registry.install(guardExt); // after CodingTools: the guard's bash (with resource caps) wins
+  if (webExt) registry.install(webExt); // children keep it (subject to their agent file's tool list)
   registry.install(subagentExt); // children keep the guard and drop this one
   if (ov) registry.install(ov.extension); // selected by the root only (every other conversation names its own)
-  const EXTENSIONS = [CodingTools, guardExt, subagentExt];
+  const EXTENSIONS = [CodingTools, guardExt, ...(webExt ? [webExt] : []), subagentExt];
 
   /**
    * Rebuild the child → parent / role maps from the session map (on open, before

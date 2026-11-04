@@ -161,12 +161,18 @@ Bridge flags:
 | `--pi-model <m>` | `EVEN_BRIDGE_PI_MODEL` | pi's default | default pi model |
 | `--no-pi-all-cwds` | `EVEN_BRIDGE_PI_ALL_CWDS=0` | all cwds | scope pi list to project dir |
 | `--pi-agent-dir <d>` | `EVEN_BRIDGE_PI_AGENT_DIR` | `~/.pi/agent` | pi agent dir |
+| — | `EVEN_BRIDGE_WEB_SEARCH_URL` | unset (web tools off) | even-search base URL (e.g. `https://evsearch.i-bora.com`) behind the durable agents' `web_search` / `web_fetch` tools; read once at bridge start |
 
 ### Durable agents (opt-in, read at restart)
 
 Glasses-started agents run as Pi Durable conversations inside the bridge
 (`src/providers/durable/`). Off unless the flag is set; with it unset the
 bridge never loads pi-durable and every route behaves as before.
+
+Every durable conversation gets CodingTools (`read`, `write`, `edit`, `bash`)
+behind the even-guard, the `subagent` tool and, with
+`EVEN_BRIDGE_WEB_SEARCH_URL` set, `web_search` / `web_fetch` (backed by the
+private even-search service; see `docs/durable.md`, "Web tools").
 
 | env | default | meaning |
 | --- | --- | --- |
@@ -476,6 +482,7 @@ src/providers/durable/       Pi Durable agents (EVEN_BRIDGE_DURABLE_ENABLE=1)
   wire.mjs                   conversation views → the bridge's wire frames
   guard.mjs                  path confinement, command vetting, resource caps
   provider.mjs               durable provider (pi provider contract + agents)
+  web.mjs                    web_search / web_fetch via even-search (EVEN_BRIDGE_WEB_SEARCH_URL)
   lc/                        lets-code engine (EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE=1)
 src/overseer/                the overseer (EVEN_BRIDGE_OVERSEER_ENABLE=1)
 src/session-twins.mjs        the RC-twin rule shared by /api/sessions and the overseer inventory
