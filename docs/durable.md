@@ -468,6 +468,14 @@ thinking?}` → `{model, thinking}`; `POST /api/assistant/note {text}` → `{ok,
 /api/assistant/dialog`; `GET /api/assistant/state` → `{status: busy|idle|starting|down, model, thinking,
 toolsLoaded, toolsSource, sessionFile, lastResetAt, lost}`. Events: `GET /api/events?sessionId=dur-assistant`.
 
+Read routes for the shim's tool server (Task A3, ruling 26; same flag and same assistant API token):
+`GET /api/assistant/sessions` → `{sessions}` (the overseer host's inventory rows as `/api/overseer/sessions`
+sends them, `dur-assistant` left out); `GET /api/assistant/sessions/:id?n=1..20` (default 5) → `{text}`,
+the host's `sessionRead` (fenced as untrusted, capped at 4 KB; `dur-assistant` itself is 404);
+`GET /api/assistant/outbox?since=<seq>` → `{seq, items}` from the overseer, `{seq:0, items:[]}` when the
+overseer is off. With the assistant on and the overseer off, `src/server.mjs` builds the host alone
+(`src/overseer/host.mjs` only; `overseer.mjs` and the action/check-in modules are not loaded).
+
 ## The overseer (`EVEN_BRIDGE_OVERSEER_ENABLE=1`)
 
 Code: `src/overseer/` (`overseer.mjs` root and ask, `extension.mjs` tools, `host.mjs` inventory and

@@ -316,6 +316,14 @@ export async function startServer({ flags = {}, cwd } = {}) {
       p = createDurableProvider(emit, { hub, ...durableOpts });
       if (overseerMods) {
         Object.assign(overseerHost, overseerMods.createOverseerHost({ durable: p, pi: piProvider, cc: ccProvider, rc: rcProvider }));
+      } else if (durableOpts.assistant) {
+        // The assistant alone (ruling 26): its read tools need the host only, never the overseer itself.
+        try {
+          const { createOverseerHost } = await import("./overseer/host.mjs");
+          Object.assign(overseerHost, createOverseerHost({ durable: p, pi: piProvider, cc: ccProvider, rc: rcProvider }));
+        } catch (err) {
+          console.warn(`[bridge] assistant read routes unavailable: ${err.message}`);
+        }
       }
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
@@ -411,6 +419,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
     overseer,
     infoCache,
     assistant: durableProvider?.assistant ?? null,
+    assistantHost: durableProvider?.assistant && typeof overseerHost.inventory === "function" ? overseerHost : null,
   });
 
   // ── App (mirrors dist/index.js) ───────────────────────────────────────────

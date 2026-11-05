@@ -183,7 +183,7 @@ export function overseerActionOpts({ kind, args, origin, requestId } = {}) {
 }
 
 /** /api/assistant/* body limits (Task A1). */
-export const ASSISTANT_LIMITS = Object.freeze({ textMax: 4000, requestIdMax: 128, modelMax: 64, dialogIdMax: 128 });
+export const ASSISTANT_LIMITS = Object.freeze({ textMax: 4000, requestIdMax: 128, modelMax: 64, dialogIdMax: 128, readMax: 20 });
 export const ASSISTANT_WHEN_BUSY = Object.freeze(["steer", "followUp"]);
 export const ASSISTANT_THINKING = Object.freeze(["off", "minimal", "low", "medium", "high"]);
 
@@ -252,7 +252,7 @@ function infoTargetsClaude(param) {
   return param === "claude";
 }
 
-export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null, infoCache = null, assistant = null } = {}) {
+export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null, infoCache = null, assistant = null, assistantHost = null } = {}) {
   const ext = providers.filter(Boolean); // [{name, probe, listSessions, ...}]
   const router = Router();
 
@@ -787,6 +787,52 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (checked.error) return res.status(400).json({ error: checked.error });
     try {
       res.json(await assistant.answerDialog(checked.id, checked.answer));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // Read tools of the assistant (Task A3, ruling 26): the overseer host's inventory and session read, the
+  // outbox when the overseer runs. Read-only; every text a session wrote stays fenced as untrusted by the host.
+  const readHost = () => (assistant && typeof assistantHost?.inventory === "function" ? assistantHost : null);
+  const assistantSid = () => assistant?.sid ?? "dur-assistant";
+
+  router.get("/assistant/sessions", async (req, res, next) => {
+    const h = readHost();
+    if (!h) return next();
+    try {
+      const rows = await h.inventory({ all: false });
+      res.json({ sessions: rows.filter((r) => r.id !== assistantSid()) });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.get("/assistant/sessions/:id", async (req, res, next) => {
+    const h = readHost();
+    if (!h) return next();
+    const raw = req.query.n;
+    const n = raw == null || raw === "" ? 5 : /^\d+$/.test(String(raw)) ? Number(raw) : NaN;
+    if (!Number.isSafeInteger(n) || n < 1 || n > ASSISTANT_LIMITS.readMax) {
+      return res.status(400).json({ error: `'n' must be an integer 1-${ASSISTANT_LIMITS.readMax}` });
+    }
+    // The assistant does not read its own transcript through this route.
+    if (req.params.id === assistantSid()) return res.status(404).json({ error: `No session ${req.params.id}.` });
+    try {
+      res.json({ text: await h.sessionRead(req.params.id, n) });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.get("/assistant/outbox", async (req, res, next) => {
+    if (!readHost()) return next();
+    const since = seqParam(req.query.since);
+    if (since == null) return res.status(400).json({ error: "'since' must be a non-negative integer" });
+    if (!overseer) return res.json({ seq: 0, items: [] });
+    try {
+      const box = await overseer.outbox({ since });
+      res.json({ seq: box.seq ?? 0, items: box.items ?? [] });
     } catch (err) {
       fail(res, err);
     }

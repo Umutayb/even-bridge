@@ -512,3 +512,39 @@ test("a usable assistant token: only it passes; empty, wrong and bridge tokens a
   assert.equal(await st(`/api/assistant/state?token=${tok}`), 200);
   assert.equal(reached.length, 2);
 });
+
+test("the overseer host is built for the assistant alone", async (t) => {
+  const s = await startChild(t, (home) => {
+    mkdirSync(join(home, "x", "y"), { recursive: true });
+    writeFileSync(join(home, "models.json"), JSON.stringify(fakeModelsJson("http://127.0.0.1:9/v1")));
+    return {
+      EVEN_BRIDGE_DURABLE_ENABLE: "1",
+      EVEN_BRIDGE_ASSISTANT_ENABLE: "1",
+      EVEN_BRIDGE_LC_BIN: "/bin/false",
+      EVEN_BRIDGE_DURABLE_STORE: join(home, "durable.sqlite"),
+      EVEN_BRIDGE_DURABLE_MODELS: join(home, "models.json"),
+      EVEN_BRIDGE_DURABLE_CWDS: "~/x",
+    };
+  });
+  const asTok = readFileSync(join(s.home, ".even-terminal", "assistant-api.token"), "utf8").trim();
+  const asAuthed = { headers: { Authorization: `Bearer ${asTok}` } };
+  let r = await fetch(`${s.base}/api/assistant/sessions`, authed);
+  assert.equal(r.status, 403, "the read routes take the assistant API token too");
+  r = await fetch(`${s.base}/api/assistant/sessions`, asAuthed);
+  assert.equal(r.status, 200);
+  const { sessions } = await r.json();
+  assert.ok(Array.isArray(sessions));
+  assert.ok(!sessions.some((x) => x.id === "dur-assistant"), JSON.stringify(sessions));
+  r = await fetch(`${s.base}/api/assistant/sessions/dur-nope?n=3`, asAuthed);
+  assert.deepEqual(await r.json(), { text: "No session dur-nope." });
+  r = await fetch(`${s.base}/api/assistant/outbox?since=0`, asAuthed);
+  assert.deepEqual(await r.json(), { seq: 0, items: [] }, "no overseer: an empty outbox");
+  r = await fetch(`${s.base}/api/overseer/sessions`, authed);
+  assert.equal(r.status, 404, "the overseer routes stay off");
+  const { code, out } = await s.stop();
+  assert.equal(code, 0);
+  assert.match(out, /LOADED-OVERSEER .*\/overseer\/host\.mjs/);
+  assert.doesNotMatch(out, /LOADED-OVERSEER .*\/overseer\/overseer\.mjs/);
+  assert.doesNotMatch(out, /LOADED-OVERSEER .*\/overseer\/(?:actions|extension|checkins)\.mjs/);
+  assert.doesNotMatch(out, /overseer=/, "the banner is the one of before");
+});

@@ -72,7 +72,7 @@ function stubPi() {
 /** Build an app with ONLY the ext router + a fall-through sentinel.
  *  The official default provider is injected (hermetic — never touches
  *  the user's ~/.claude or ~/.codex). */
-async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase, overseer, assistant }) {
+async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase, overseer, assistant, assistantHost }) {
   const { createExtRouter } = await import("../src/ext-router.mjs");
   const hub = new Hub();
   const app = express();
@@ -87,6 +87,7 @@ async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscrip
       rcTranscriptBase,
       overseer,
       ...(assistant ? { assistant } : {}),
+      ...(assistantHost ? { assistantHost } : {}),
     })
   );
   app.use((req, res) => {
@@ -1127,4 +1128,75 @@ test("Even AI is listed right after the overseer", async (t) => {
   const r = await fetch(`${base}/api/sessions?limit=10`);
   const ids = (await r.json()).sessions.map((s) => s.id);
   assert.deepEqual(ids.slice(0, 2), ["dur-overseer", "dur-assistant"]);
+});
+
+// ── /api/assistant read routes (Task A3, ruling 26) ──────────────────────────
+
+function stubAssistantHost() {
+  const calls = { inventory: [], read: [] };
+  return {
+    calls,
+    inventory: async (o) => {
+      calls.inventory.push(o ?? {});
+      return [
+        { id: "dur-assistant", kind: "durable", engine: "lets-code", label: "agent assistant", state: "idle", driver: "bridge", lastActivity: 1, ageS: 1, canMessage: true, via: "durable" },
+        { id: "dur-1", kind: "durable", engine: "lets-code", label: "agent docs", state: "busy", driver: "bridge", lastActivity: 2, ageS: 3, canMessage: true, via: "durable" },
+        { id: "pi-a", kind: "pi", label: "pi session work", state: "idle", driver: "none", lastActivity: 4, ageS: 9, canMessage: true, via: "rpc" },
+      ];
+    },
+    sessionRead: async (id, n) => {
+      calls.read.push([id, n]);
+      return `<<untrusted session output: ${id}>>\nkind: durable\n(no history)\n<<end of untrusted output>>`;
+    },
+  };
+}
+
+test("assistant read routes use the overseer host", async (t) => {
+  const assistantHost = stubAssistantHost();
+  const outboxCalls = [];
+  const overseer = { ...stubOverseer(), outbox: async (o) => (outboxCalls.push(o), { seq: 7, readUpTo: 3, items: [{ seq: 7, kind: "answer", text: "done" }] }) };
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistant: stubAssistant(), assistantHost, overseer });
+  const base = await listen(t, app);
+  let r = await fetch(`${base}/api/assistant/sessions`);
+  assert.equal(r.status, 200);
+  const { sessions } = await r.json();
+  assert.deepEqual(sessions.map((s) => s.id), ["dur-1", "pi-a"], "dur-assistant itself is left out");
+  assert.deepEqual(assistantHost.calls.inventory, [{ all: false }]);
+  r = await fetch(`${base}/api/assistant/sessions/dur-1?n=5`);
+  assert.deepEqual(await r.json(), { text: "<<untrusted session output: dur-1>>\nkind: durable\n(no history)\n<<end of untrusted output>>" });
+  r = await fetch(`${base}/api/assistant/sessions/dur-1`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(assistantHost.calls.read, [["dur-1", 5], ["dur-1", 5]], "n defaults to 5");
+  for (const bad of ["0", "21", "x", "2.5"]) {
+    r = await fetch(`${base}/api/assistant/sessions/dur-1?n=${bad}`);
+    assert.equal(r.status, 400, bad);
+    assert.deepEqual(await r.json(), { error: "'n' must be an integer 1-20" });
+  }
+  r = await fetch(`${base}/api/assistant/sessions/dur-assistant`);
+  assert.equal(r.status, 404, "the assistant does not read itself");
+  r = await fetch(`${base}/api/assistant/outbox?since=2`);
+  assert.deepEqual(await r.json(), { seq: 7, items: [{ seq: 7, kind: "answer", text: "done" }] });
+  assert.deepEqual(outboxCalls, [{ since: 2 }]);
+  r = await fetch(`${base}/api/assistant/outbox?since=-1`);
+  assert.equal(r.status, 400);
+  assert.deepEqual(fellThrough, []);
+});
+
+test("assistant outbox without the overseer is empty", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistant: stubAssistant(), assistantHost: stubAssistantHost() });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/assistant/outbox?since=0`);
+  assert.deepEqual(await r.json(), { seq: 0, items: [] });
+});
+
+test("assistant read routes are 404 when the assistant is off", async (t) => {
+  const assistantHost = stubAssistantHost();
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistantHost });
+  const base = await listen(t, app);
+  for (const path of ["sessions", "sessions/dur-1?n=5", "outbox?since=0"]) {
+    const r = await fetch(`${base}/api/assistant/${path}`);
+    assert.equal((await r.json()).fellThrough, true, path);
+  }
+  assert.equal(fellThrough.length, 3);
+  assert.deepEqual(assistantHost.calls, { inventory: [], read: [] });
 });
