@@ -119,10 +119,16 @@ export function parseModelCommand(text) {
  * `emit`, and tracks the pending approval/question dialogs so the provider's
  * respondPermission / respondQuestion can answer them by RPC id.
  */
+/** Cadence of the `running_stats` frames during a turn (the official Claude/Codex sessions tick every 10 s). */
+export const STATS_INTERVAL_MS = 10_000;
+
 export class PiSession {
   constructor(emit, opts) {
     this.emit = emit;
     this.opts = opts;
+    /** Interval handle of the running_stats ticker (busy turns only). */
+    this.statsTimer = null;
+    this.statsIntervalMs = opts?.statsIntervalMs ?? STATS_INTERVAL_MS;
     this.client = null;
     this.sessionId = undefined;
     /** Epoch ms when the RPC child was spawned (external-write detection). */
@@ -164,6 +170,37 @@ export class PiSession {
     this.emit(this.sessionId ?? "", msg);
   }
 
+  /**
+   * The phone's "thinking" row only moves when `running_stats` frames arrive: the official sessions send one every
+   * 10 s of a turn (the duration + token counters tick), and our turn_end-only frame left the row frozen until the
+   * answer came. Same shape and cadence as the official `emitRunningStats`.
+   */
+  startStatsTimer() {
+    this.stopStatsTimer();
+    this.statsTimer = setInterval(() => this.emitRunningStats(), this.statsIntervalMs);
+    this.statsTimer.unref?.();
+  }
+
+  stopStatsTimer() {
+    if (this.statsTimer) {
+      clearInterval(this.statsTimer);
+      this.statsTimer = null;
+    }
+  }
+
+  emitRunningStats() {
+    if (!this._busy) {
+      this.stopStatsTimer();
+      return;
+    }
+    this.send({
+      type: "running_stats",
+      durationMs: this.turnStartMs ? Date.now() - this.turnStartMs : 0,
+      inputTokens: this.inputTokens,
+      outputTokens: this.outputTokens,
+    });
+  }
+
   async start() {
     const client = new PiRpcClient({
       ...this.opts,
@@ -177,6 +214,7 @@ export class PiSession {
     client.on("exit", ({ code, signal }) => {
       const wasBusy = this._busy;
       this._busy = false;
+      this.stopStatsTimer();
       console.log(`[pi] session ${this.sessionId ?? "?"} child exited (code=${code} signal=${signal})`);
       if (wasBusy) {
         // The turn is over and will never finish — say so instead of letting
@@ -233,6 +271,7 @@ export class PiSession {
     this.turns = 0;
     this.currentBlock = null;
     this.send({ type: "status", state: "busy", sessionId: this.sessionId });
+    this.startStatsTimer();
     await this.client.send({ type: "prompt", message: text });
   }
 
@@ -309,6 +348,7 @@ export class PiSession {
   }
 
   async stop() {
+    this.stopStatsTimer();
     await this.client?.stop();
     this.client = null;
   }
@@ -557,6 +597,7 @@ export class PiSession {
 
   onAgentEnd() {
     this._busy = false;
+    this.stopStatsTimer();
     this.send({
       type: "result",
       success: true,
