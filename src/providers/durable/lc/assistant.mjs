@@ -23,7 +23,7 @@
 // bridge writes the store while the child runs; the reset path (new_session) is the only point where a write
 // made outside the child is picked up. The one-time import (A5) runs while the assistant is off.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,12 @@ export const ASSISTANT_THINKING = "medium";
 export const ASSISTANT_THINKING_LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high"]);
 export const ASSISTANT_RESET_HOUR = 4;
 export const ASSISTANT_RESET_RETRY_MS = 600000;
-export const ASSISTANT_RESTART_NOTE = "(bridge restarted; your last answer was lost)";
+/**
+ * The note after a cut run (bridge restart or crash). The cut user message stays in the session and qwen went
+ * back to it on its own in the A1 real run, so the note says not to; A2's context hook also stubs that turn.
+ */
+export const ASSISTANT_RESTART_NOTE =
+  "(bridge restarted; your last answer was lost. Do not answer or continue that interrupted request unless the user asks for it again.)";
 export const ASSISTANT_LOST = "I lost that one, please ask again.";
 /**
  * The hand-off's compaction instructions (ruling 28 plus A0 finding 6: the summary copied calendar and
@@ -312,6 +317,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
   const tokenFile = o.tokenFile ? expandHome(o.tokenFile) : undefined;
   const st = { model: ASSISTANT_MODEL, thinking: ASSISTANT_THINKING };
   let tools = { n: 0, source: "none", seen: false };
+  let toolsWaitOver = false; // the wait for the tools line of this child is over (seen or timed out)
+  let synced = false; // afterStart (model + thinking) ran for this child
   let toolWaiters = [];
   let spawning = null;
   let respawnTimer = null;
@@ -333,11 +340,29 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
   };
 
   function prepareCwd() {
-    mkdirSync(cwd, { recursive: true });
+    // The cwd and its .pi are the bridge's: 0700 (with --approve pi trusts this project).
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+    chmodSync(cwd, 0o700);
     mkdirSync(notesDir, { recursive: true, mode: 0o700 });
     // The reset's compact needs a small kept tail (A0 4d); `--approve` makes pi read this project file.
     const piDir = join(cwd, ".pi");
-    mkdirSync(piDir, { recursive: true });
+    mkdirSync(piDir, { recursive: true, mode: 0o700 });
+    chmodSync(piDir, 0o700);
+    try {
+      const other = readdirSync(piDir).filter((n) => n !== "settings.json");
+      if (other.length) log.warn?.(`[assistant] ${piDir} holds ${other.join(", ")}: only the bridge's settings.json belongs there`);
+    } catch {
+      /* unreadable: the spawn will tell */
+    }
+    // Notes a previous process wrote but never sent (a hand-off summary among them): oldest first.
+    try {
+      for (const n of readdirSync(notesDir).filter((x) => x.endsWith(".txt")).sort((a, b) => parseInt(a, 10) - parseInt(b, 10))) {
+        const f = join(notesDir, n);
+        if (!queue.includes(f)) queue.push(f);
+      }
+    } catch {
+      /* none */
+    }
     const file = join(piDir, "settings.json");
     let cur = {};
     try {
@@ -377,7 +402,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
   function status() {
     if (handing) return "busy";
     if (engine.status(sid) !== "idle") return "busy";
-    if (running()) return "idle";
+    if (running()) return synced && (tools.seen || toolsWaitOver) ? "idle" : "starting";
     if (spawning) return "starting";
     return "down";
   }
@@ -406,6 +431,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
       try {
         await engine.ensureChild(sid);
         await waitTools(o.toolsWaitMs);
+        toolsWaitOver = true;
         if (!tools.seen) log.warn?.("[assistant] no `[even-assistant] tools:` line from the child; prompts are refused (assistant tools not loaded)");
         return true;
       } catch (err) {
@@ -523,6 +549,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
     model: () => st.model,
     launch: ({ sessionDir, resume, caps, wrapper, bin, baseEnv, childEnv }) => {
       tools = { n: 0, source: "none", seen: false };
+      toolsWaitOver = false;
+      synced = false;
       // qwen at medium at launch and on every respawn (global constraint).
       st.model = ASSISTANT_MODEL;
       st.thinking = ASSISTANT_THINKING;
@@ -535,7 +563,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
         assistantExt: o.ext,
         tools: ASSISTANT_TOOLS,
         thinking: ASSISTANT_THINKING,
-        model: o.model,
+        // Always: on `--session` pi would restore the session's own model (a Claude switch writes one).
+        model: o.model ?? ASSISTANT_MODEL,
         caps: o.caps ?? caps,
         wrapper: o.wrapper ?? wrapper,
         moduleEnv: o.moduleEnv,
@@ -548,6 +577,27 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
       });
     },
     createSession: (emitFn, sopts) => new AssistantSession(emitFn, { ...sopts, onStderr: onStderrLine }),
+    /**
+     * Before the first prompt reaches a new child: the model it really runs (back to qwen when pi restored
+     * another from the session file) and the thinking level (set_model and a launch both leave it to settings.json).
+     */
+    afterStart: async (session) => {
+      const want = o.model ?? ASSISTANT_MODEL;
+      const label = (m) => (m?.provider && m?.id ? `${m.provider}/${m.id}` : null);
+      const s = await session.client.send({ type: "get_state" }, 10000).catch(() => null);
+      let have = label(s?.data?.model);
+      if (have && have !== want) {
+        const slash = want.indexOf("/");
+        const r = await session.client.send({ type: "set_model", provider: want.slice(0, slash), modelId: want.slice(slash + 1) }, 10000).catch((e) => ({ success: false, error: e.message }));
+        if (r.success === false) log.warn?.(`[assistant] the child runs ${have}; set_model ${want} failed: ${r.error ?? "?"}`);
+        else have = want;
+      }
+      st.model = have ?? want;
+      const t = await session.client.send({ type: "set_thinking_level", level: ASSISTANT_THINKING }, 10000).catch((e) => ({ success: false, error: e.message }));
+      if (t.success === false) log.warn?.(`[assistant] set_thinking_level failed: ${t.error ?? "?"}`);
+      else st.thinking = ASSISTANT_THINKING;
+      synced = true;
+    },
     onSpawn: () => {
       spawnedAt = now();
     },

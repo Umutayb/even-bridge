@@ -138,7 +138,12 @@ export function assistantLaunch({
     if (caps?.cpuQuota) wrap.push("-p", `CPUQuota=${caps.cpuQuota}`);
     wrap.push("--");
   }
-  const extraArgs = ["-ne", "-e", expandHome(extDir), "-e", assistantExt, "--tools", tools.join(","), "--thinking", thinking, "--session-dir", sessionDir, "--no-mandate", "--approve"];
+  // --approve trusts the project of the cwd: everything else pi would take from it (skills, prompt templates,
+  // AGENTS.md/CLAUDE.md of the cwd and its parents) is switched off; `-ne` already drops project extensions.
+  const extraArgs = [
+    "-ne", "-e", expandHome(extDir), "-e", assistantExt, "--tools", tools.join(","), "--thinking", thinking, "--session-dir", sessionDir,
+    "--no-mandate", "--approve", "--no-skills", "--no-prompt-templates", "--no-context-files",
+  ];
   if (model) extraArgs.push("--model", launcherModel(bin, model));
   const own = {
     ...moduleEnv,

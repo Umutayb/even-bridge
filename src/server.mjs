@@ -12,7 +12,9 @@
 // untouched; extended sessions are served from the shared ring by the hub.
 
 import http from "node:http";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import express from "express";
@@ -139,6 +141,38 @@ export function lcOptions(env = process.env) {
 export function overseerEnabled(env = process.env) {
   return durableEnabled(env) && String(env.EVEN_BRIDGE_OVERSEER_ENABLE ?? "").trim() === "1";
 }
+
+/** Where the assistant API token lives (EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE). */
+export const ASSISTANT_API_TOKEN_FILE = "~/.even-terminal/assistant-api.token";
+
+/**
+ * The token /api/assistant/* takes (and the only one): the shim reads it from this file. The bridge token
+ * (the phone's) is refused there with 403, so the phone cannot prompt, reset or switch the assistant.
+ * Created 0600 with a random value when missing. @returns {() => string|null} a reader (the file may be rotated)
+ */
+export function assistantApiToken(env = process.env, home = homedir()) {
+  const raw = env.EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE || ASSISTANT_API_TOKEN_FILE;
+  const file = raw === "~" ? home : raw.startsWith("~/") ? home + raw.slice(1) : raw;
+  if (!existsSync(file)) {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(file, randomBytes(24).toString("hex") + "\n", { mode: 0o600, flag: "wx" });
+  }
+  chmodSync(file, 0o600);
+  return () => {
+    try {
+      return readFileSync(file, "utf8").trim() || null;
+    } catch {
+      return null;
+    }
+  };
+}
+
+const sameToken = (a, b) => {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+};
 
 /** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
 export const DURABLE_DEFAULT_ROOT = "~/sandbox/agents";
@@ -367,7 +401,29 @@ export async function startServer({ flags = {}, cwd } = {}) {
     handleHookRequest(req, res, emitBridgeMessage, claudeSyncTransport);
   });
 
+  // /api/assistant/* takes only the assistant API token (the shim's); the bridge token is the phone's.
+  if (durableOpts?.assistant) {
+    let assistantToken = () => null;
+    try {
+      assistantToken = assistantApiToken(process.env);
+    } catch (err) {
+      console.warn(`[bridge] assistant API token unavailable (${err.message}); /api/assistant/* refuses every request`);
+    }
+    app.use("/api/assistant", (req, res, next) => {
+      const header = req.headers.authorization;
+      const provided = header?.startsWith("Bearer ") ? header.slice(7) : req.query.token;
+      if (sameToken(provided, assistantToken() ?? "")) {
+        req.evenAssistantAuth = true;
+        return next();
+      }
+      if (ALLOWED_TOKENS.has(provided)) return res.status(403).json({ error: "the assistant routes take the assistant API token, not the bridge token" });
+      console.warn(`[auth] 401 ${req.method} ${redactTokenQueryParam(req.originalUrl)} (ip=${req.ip})`);
+      res.status(401).json(INFO_AUTH_ERROR);
+    });
+  }
+
   function auth(req, res, next) {
+    if (req.evenAssistantAuth && req.originalUrl.startsWith("/api/assistant/")) return next();
     const header = req.headers.authorization;
     const queryToken = req.query.token;
     const provided = header?.startsWith("Bearer ") ? header.slice(7) : queryToken;

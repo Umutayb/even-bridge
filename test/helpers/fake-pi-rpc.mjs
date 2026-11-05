@@ -52,6 +52,8 @@
 //   settings.json (claude → low, anything else → medium). `set_thinking_level {level}`; `get_state` reports
 //   `thinkingLevel` and `model`. `compact {customInstructions}` → `{summary, …}` (FAKE_PI_COMPACT_FAIL=1:
 //   `Nothing to compact (session too small)`). `new_session` → a new session id and file (written lazily).
+//   FAKE_PI_RESTORE_MODEL=1: with --session, the last `model_change` of the file wins over --model (as pi
+//   restores a session's model); `set_model` writes a `model_change` entry.
 //   LOOPTOOL: one `fetch_calendar` call per turn with new args every 10 ms, until `abort`.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -78,7 +80,8 @@ log({
 // ── the assistant profile ──
 const toolsArg = opt("--tools");
 let thinkingLevel = opt("--thinking") ?? "medium";
-let model = { provider: "lets-code", id: opt("--model") ?? "qwen3.8-27b" };
+const modelArg = opt("--model") ?? "lets-code/qwen3.8-27b";
+let model = modelArg.includes("/") ? { provider: modelArg.slice(0, modelArg.indexOf("/")), id: modelArg.slice(modelArg.indexOf("/") + 1) } : { provider: "lets-code", id: modelArg };
 if (toolsArg != null && process.env.FAKE_PI_TOOLS_LINE !== "0") {
   const n = process.env.FAKE_PI_TOOLS === "0" ? 0 : toolsArg.split(",").filter(Boolean).length;
   process.stderr.write(`[even-assistant] tools: ${n} (${n ? "live" : "none"})\n`);
@@ -113,6 +116,17 @@ const append = (obj) => {
 const message = (role, content) => append({ type: "message", timestamp: new Date().toISOString(), message: { role, content } });
 
 let startDelayed = false;
+
+if (process.env.FAKE_PI_RESTORE_MODEL === "1" && opt("--session") && existsSync(sessionFile)) {
+  for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
+    try {
+      const e = JSON.parse(line);
+      if (e.type === "model_change") model = { provider: e.provider, id: e.modelId };
+    } catch {
+      /* torn line */
+    }
+  }
+}
 
 // ── runs ──
 let run = null; // { text, dialog?: {id, onAnswer} }
@@ -353,6 +367,7 @@ process.stdin.on("data", (chunk) => {
       case "set_model": {
         model = { id: cmd.modelId, provider: cmd.provider, name: cmd.modelId, api: "openai-completions", reasoning: true, input: ["text"], contextWindow: 200000, maxTokens: 32768 };
         thinkingLevel = /claude/.test(String(cmd.modelId)) ? "low" : "medium"; // settings.json modelThinkingLevels
+        append({ type: "model_change", provider: cmd.provider, modelId: cmd.modelId, timestamp: new Date().toISOString() });
         out({ type: "response", id: cmd.id, command: "set_model", success: true, data: model });
         break;
       }

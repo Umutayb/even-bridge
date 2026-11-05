@@ -491,7 +491,9 @@ export function createDurableProvider(
   let asBox = null;
   // The engine exists for lets-code agents (lc) or for the assistant alone; agents still need `lc`.
   const lcOn = Boolean(lc) || Boolean(as);
-  const isLc = (row) => lcOn && row?.engine === "lets-code";
+  // An agent row goes to the engine only with the agent flag; without it the engine serves dur-assistant only
+  // (a lets-code agent row from an earlier lc=on start must never be run by an engine built for the assistant).
+  const isLc = (row) => row?.engine === "lets-code" && (Boolean(lc) || (Boolean(as) && row.sid === ASSISTANT_SID));
   const opened = (async () => {
     if (as) {
       asMods = await import("./lc/assistant.mjs");
@@ -517,7 +519,8 @@ export function createDurableProvider(
       await opened;
       if (lcOn) {
         // Without the agent flag the engine serves the assistant only (no sandbox needed: no shell tools).
-        const engCfg = lc ?? { bin: as.bin, caps: as.caps, maxLive: 1, sandbox: false, ...(as.engine ?? {}) };
+        // `agentsOff`: it refuses agent prompts and resumed agent runs; the sandbox stays required for agents.
+        const engCfg = lc ?? { bin: as.bin, caps: as.caps, maxLive: 1, sandbox: true, agentsOff: true, ...(as.engine ?? {}) };
         const { bin, caps, maxLive, sandbox, ...seams } = engCfg;
         lcEngine = lcMods.createLcEngine({
           harness: durable.harness,
@@ -552,7 +555,6 @@ export function createDurableProvider(
             map,
             agent: { model: defaultRef, maxTurns: 1, instructions: "Even AI assistant record", extensions: [], cwd: assistantCwd },
           });
-          const defaultLabel = `${defaultRef.provider}/${defaultRef.modelId}`;
           assistantObj = asMods.createAssistant({
             engine: lcEngine,
             emit: (sid, frame) => onLcFrame(sid, frame),
@@ -561,7 +563,7 @@ export function createDurableProvider(
             storeDir: dirname(expandHome(storePath)),
             box: asBox,
             meta: { getMeta: (k) => map.getMeta(k), setMeta: (k, v) => map.setMeta(k, v) },
-            opts: { model: asMods.ASSISTANT_MODEL !== defaultLabel ? asMods.ASSISTANT_MODEL : undefined, ...aopts },
+            opts: aopts,
           });
         } catch (err) {
           assistantError = err;
@@ -595,7 +597,7 @@ export function createDurableProvider(
       const since = Math.floor(Date.now() / 1000) - RESUME_WINDOW_S;
       if (lcEngine) {
         // Scopes of this store's lets-code rows only (never a glob: ruling 3).
-        const lcSids = [...map.rows({ seenSince: since })].filter((r) => r.engine === "lets-code").map((r) => r.sid);
+        const lcSids = lc ? [...map.rows({ seenSince: since })].filter((r) => r.engine === "lets-code").map((r) => r.sid) : [];
         const scopeRun = (lc ?? as?.engine ?? {}).run ?? scopeRunner;
         lcMods.stopLcScopes(lcSids, { env: shellEnv, run: scopeRun });
         // This store's assistant scope only (its unit carries the store, ruling 3).

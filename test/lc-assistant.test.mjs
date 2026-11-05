@@ -120,7 +120,8 @@ function makeCase({ lc = {}, assistant = {}, env = {}, noLc = false, clock } = {
     trustFile: join(dir, "trust.json"),
     stateFile: join(dir, "lc-state.json"),
   };
-  const open = () => {
+  const open = ({ noLc: noLcNow = noLc } = {}) => {
+    const noLc = noLcNow;
     const p = createDurableProvider((sid, frame) => frames.push({ sid, ...frame }), {
       hub: { clientCount: () => 0 },
       storePath: join(dir, "durable.sqlite"),
@@ -203,7 +204,8 @@ test("constants", () => {
   assert.equal(ASSISTANT_THINKING, "medium");
   assert.equal(ASSISTANT_RESET_HOUR, 4);
   assert.equal(ASSISTANT_RESET_RETRY_MS, 600000);
-  assert.equal(ASSISTANT_RESTART_NOTE, "(bridge restarted; your last answer was lost)");
+  assert.match(ASSISTANT_RESTART_NOTE, /^\(bridge restarted; your last answer was lost\./);
+  assert.match(ASSISTANT_RESTART_NOTE, /do not answer or continue that interrupted request unless the user asks for it again/i);
   assert.equal(ASSISTANT_LOST, "I lost that one, please ask again.");
   assert.match(ASSISTANT_HANDOFF, /^Keep open questions, pending tasks and the user's stated plans\./);
   assert.match(ASSISTANT_HANDOFF, /Do not copy calendar events, notes, quick-list items or any other phone data/, "the summary must not carry phone data (A0, A1 real run)");
@@ -242,7 +244,7 @@ test("assistant argv has no mandate, sandbox or subagents and loads only its ext
   assert.deepEqual(l.extraArgs, [
     "-ne", "-e", "/h/.pi/agent/extensions/lets-code", "-e", "/b/src/providers/durable/lc/even-assistant.ts",
     "--tools", "fetch_calendar,memory", "--thinking", "medium", "--session-dir", "/s/lc-sessions/dur-assistant",
-    "--no-mandate", "--approve",
+    "--no-mandate", "--approve", "--no-skills", "--no-prompt-templates", "--no-context-files",
   ]);
   for (const f of ["--mandate", "--sandbox", "--subagents"]) assert.ok(!l.extraArgs.includes(f), f);
   assert.deepEqual(l.wrap, []);
@@ -318,13 +320,87 @@ test("the assistant takes no agent slot", async (t) => {
   const c = makeCase({ lc: { maxLive: 1 } });
   t.after(c.closeAll);
   const p = await warm(c);
+  const pid = childPid(p);
   const { sessionId: sid } = await p.prompt(undefined, "HANG", c.work, { engine: "lets-code", name: "agent1" });
   await until(() => c.prompts().some((x) => x.message === "HANG"), 5000, "agent HANG");
+  await sleep(300);
+  // The warm assistant is never the idle child that makes room for an agent at the live limit.
+  assert.equal(childPid(p), pid, "the assistant child was not stopped");
+  assert.equal(c.spawns().length, 1, "and not respawned");
+  assert.equal(p.assistant.state().status, "idle");
   assert.equal(p._lc.liveCount(), 1, "only the agent counts");
   const agents = await p.listAgents();
   assert.deepEqual(agents.map((a) => a.sid), [sid]);
   assert.equal(c.agentSpawns().length, 1);
   assert.equal(c.agentSpawns()[0].argv.includes("--mandate"), true);
+});
+
+test("the assistant is never idle-stopped", async (t) => {
+  const c = makeCase({ lc: { idleKeepMs: 200 } });
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const pid = childPid(p);
+  await p.assistant.prompt("hi", { requestId: "k1" });
+  await idleAfter(c);
+  await sleep(1000);
+  assert.equal(childPid(p), pid, "still the same child 1 s after a run (idle keep 200 ms)");
+  assert.equal(c.spawns().length, 1);
+  assert.equal(p.assistant.state().status, "idle");
+});
+
+test("a respawn comes back on qwen at medium, also after a Claude switch", async (t) => {
+  const c = makeCase({ env: { FAKE_PI_RESTORE_MODEL: "1" } });
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const first = c.spawns()[0];
+  assert.equal(first.argv[first.argv.indexOf("--model") + 1], ASSISTANT_MODEL, "--model always (pi would restore the session's model)");
+  await p.assistant.prompt("hi", { requestId: "q1" });
+  await idleAfter(c);
+  await p.assistant.setModel({ model: "Anthropic/claude-sonnet-4-6", thinking: "low" });
+  assert.equal(p.assistant.state().model, "Anthropic/claude-sonnet-4-6");
+  const mark = c.log().length;
+  process.kill(childPid(p), "SIGKILL");
+  await until(() => c.spawns().length === 2, 10000, "respawn");
+  await until(() => p.assistant.state().status === "idle", 5000, "idle");
+  const again = c.spawns()[1];
+  assert.equal(again.argv[again.argv.indexOf("--model") + 1], ASSISTANT_MODEL);
+  // The fake restored claude from the session file anyway: the bridge set qwen again, then the level.
+  const after = c.log().slice(mark).filter((l) => l.type === "set_model" || l.type === "set_thinking_level");
+  assert.deepEqual(after.map((l) => l.type), ["set_model", "set_thinking_level"], JSON.stringify(c.log().slice(mark).map((l) => l.type ?? (l.spawn ? "spawn" : Object.keys(l)[0]))));
+  assert.deepEqual([after[0].provider, after[0].modelId], ["lets-code", "qwen3.8-27b"]);
+  assert.equal(after[1].level, "medium");
+  assert.deepEqual([p.assistant.state().model, p.assistant.state().thinking], [ASSISTANT_MODEL, "medium"]);
+});
+
+test("every spawn sets the thinking level and reports the child's real model", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const sent = c.log().filter((l) => l.type === "set_model" || l.type === "set_thinking_level");
+  assert.deepEqual(sent.map((l) => [l.type, l.level ?? null]), [["set_thinking_level", "medium"]], "the model was right: only the level");
+  assert.equal(p.assistant.state().model, ASSISTANT_MODEL);
+});
+
+test("lets-code agent rows get no child from the assistant's engine while the agent engine is off", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const a = await warm(c);
+  // An agent row started under the agent engine (sandboxed), left with a pending run.
+  const { sessionId: sid } = await a.prompt(undefined, "HANG", c.work, { engine: "lets-code", name: "agentx" });
+  await until(() => c.prompts().some((x) => x.message === "HANG"), 5000, "agent HANG");
+  await a.stopAll();
+  const before = c.agentSpawns().length;
+  const mark = c.log().length;
+  // The operator rolled the agent engine back but kept the assistant.
+  const b = c.open({ noLc: true });
+  await b.ready;
+  await b.assistant.ready;
+  await Promise.race([b.prompt(sid, "again").catch(() => {}), sleep(1500)]);
+  await sleep(500);
+  assert.equal(c.agentSpawns().length, before, "no agent child was spawned");
+  assert.ok(!c.log().slice(mark).some((l) => l.spawn && (l.argv.includes("--no-sandbox") || l.argv.includes("--mandate"))), "no agent child, never --no-sandbox");
+  assert.ok(!c.prompts().some((x) => x.message === "again" || x.message === LC_CUTOFF_PROMPT), "nothing reached a lets-code child");
+  assert.equal(b._lc.liveCount(), 0);
 });
 
 test("a retried requestId is accepted once", async (t) => {
@@ -413,16 +489,17 @@ test("switching to Claude hands off a summary first", async (t) => {
   await p.assistant.prompt("hi", { requestId: "c1" });
   await idleAfter(c);
   const fileBefore = (await recordOf(p)).piSessionFile;
+  const mark = c.log().length;
   const r = await p.assistant.setModel({ model: "Anthropic/claude-sonnet-4-6" });
   assert.deepEqual(r, { model: "Anthropic/claude-sonnet-4-6", thinking: "medium" });
-  const order = c.types().filter((x) => ["compact", "new_session", "/even-note", "set_model", "set_thinking_level"].includes(x));
+  const order = c.types().slice(c.log().slice(0, mark).filter((l) => l.type && l.type !== "get_state").length).filter((x) => ["compact", "new_session", "/even-note", "set_model", "set_thinking_level"].includes(x));
   assert.deepEqual(order, ["compact", "new_session", "/even-note", "set_model", "set_thinking_level"]);
   const compact = c.log().find((l) => l.type === "compact");
   assert.equal(compact.customInstructions, ASSISTANT_HANDOFF);
   assert.equal(c.notes()[0].note, "Summary of the earlier conversation:\n## Goal\nfake summary");
   const sm = c.log().find((l) => l.type === "set_model");
   assert.deepEqual([sm.provider, sm.modelId], ["Anthropic", "claude-sonnet-4-6"]);
-  assert.equal(c.log().find((l) => l.type === "set_thinking_level").level, "medium", "the level set_model reset is set again");
+  assert.equal(c.log().slice(mark).find((l) => l.type === "set_thinking_level").level, "medium", "the level set_model reset is set again");
   const rec = await recordOf(p);
   assert.notEqual(rec.piSessionFile, fileBefore, "a new session file");
   assert.equal(p.assistant.state().sessionFile, rec.piSessionFile);

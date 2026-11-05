@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -370,14 +370,27 @@ test("server, assistant on: routes answer, Even AI is listed read-only, not an a
   });
   let r = await fetch(`${s.base}/api/assistant/state`);
   assert.equal(r.status, 401, "auth-gated");
+  // The phone's (bridge) token never reaches the assistant routes: only the assistant API token does.
   r = await fetch(`${s.base}/api/assistant/state`, authed);
+  assert.equal(r.status, 403);
+  assert.match((await r.json()).error, /assistant API token/);
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "p1" }) });
+  assert.equal(r.status, 403);
+  const tokFile = join(s.home, ".even-terminal", "assistant-api.token");
+  assert.equal(statSync(tokFile).mode & 0o777, 0o600, "created 0600 by the bridge");
+  const asTok = readFileSync(tokFile, "utf8").trim();
+  assert.match(asTok, /^[0-9a-f]{48}$/);
+  const asAuthed = { headers: { Authorization: `Bearer ${asTok}` } };
+  r = await fetch(`${s.base}/api/agents`, asAuthed);
+  assert.equal(r.status, 401, "the assistant token opens only /api/assistant/*");
+  r = await fetch(`${s.base}/api/assistant/state`, asAuthed);
   assert.equal(r.status, 200);
   const st = await r.json();
   assert.equal(st.model, "lets-code/qwen3.8-27b");
   assert.equal(st.toolsLoaded, 0);
-  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1" }) });
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...asAuthed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1" }) });
   assert.equal(r.status, 503, "no child (it exits at once): the shim falls back to its loop");
-  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1", whenBusy: "now" }) });
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...asAuthed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1", whenBusy: "now" }) });
   assert.equal(r.status, 400);
   r = await fetch(`${s.base}/api/agents`, authed);
   assert.deepEqual(await r.json(), { agents: [] }, "not an agent; no engines advertised without the agent engine flag");

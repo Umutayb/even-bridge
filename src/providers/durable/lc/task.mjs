@@ -48,7 +48,7 @@ export function createLcRunTask(engine) {
           }
           await runtime.commit(() => ({ status: "running", checkpoint: { phase: "drive", attempt } }), context);
           try {
-            const { lastLine } = await engine.drive(sid, { text, attempt, taskId: task.id }, runtime.signal);
+            const { lastLine } = await engine.drive(sid, { text, attempt, taskId: task.id, requestId: task.input.requestId ?? null }, runtime.signal);
             await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { lastLine: lastLine ?? "" } } }), context);
             return;
           } catch (err) {

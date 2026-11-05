@@ -178,6 +178,7 @@ export function createLcEngine({
   repeatMax = LC_REPEAT_MAX,
   capAbortMs = LC_CAP_ABORT_MS,
   onCap = () => {},
+  agentsOff = false,
 } = {}) {
   const turnCap = lcTurnCap(maxTurns, (m) => log.warn?.(`[durable:lc] ${m}`));
   const mem = memoryController ?? lcMemoryControllerAvailable();
@@ -692,6 +693,16 @@ export function createLcEngine({
       d.cwd = row.cwd;
       d.model = prof.model?.() ?? d.model;
     });
+    if (prof.afterStart) {
+      try {
+        await prof.afterStart(session);
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: after-start hook failed: ${err.message}`);
+      }
+      await updateRecord(sid, (d) => {
+        d.model = prof.model?.() ?? d.model;
+      });
+    }
     try {
       prof.onSpawn?.(session);
     } catch (err) {
@@ -866,6 +877,7 @@ export function createLcEngine({
     /** A new or idle session's prompt starts a run task; a busy one's steers. Retried requestIds are dropped. */
     async prompt(sid, text, { requestId, whenBusy = "steer" } = {}) {
       if (closed) throw httpError(503, "durable provider is shut down");
+      if (agentsOff && !profileOf(sid)) throw httpError(400, "the lets-code engine is off");
       const s = S(sid);
       if (requestId && s.requestIds.has(requestId)) return { deduped: true };
       const id = convIdOf(sid);
@@ -918,8 +930,10 @@ export function createLcEngine({
     },
 
     /** The run task's phase (see task.mjs). Resolves at the end of the run; rejects LC_EXIT when the child died mid-turn. */
-    async drive(sid, { text, attempt, taskId }, signal) {
+    async drive(sid, { text, attempt, taskId, requestId }, signal) {
       const s = S(sid);
+      // The engine of the assistant alone (agent engine flag off) never runs an agent, not even a resumed run.
+      if (agentsOff && !profileOf(sid)) throw new Error("the lets-code engine is off");
       const row = map.get(sid);
       if (!row || row.archived) throw new Error("the session is gone");
       s.busy = true;
@@ -947,7 +961,7 @@ export function createLcEngine({
         s.queued = [];
         s.waiter = null;
         try {
-          prof.onNoResume?.({ attempt, crashed, requestId: lastRequestId ?? null });
+          prof.onNoResume?.({ attempt, crashed, requestId: requestId ?? lastRequestId ?? null });
         } catch (err) {
           log.warn?.(`[durable:lc] ${sid}: no-resume hook failed: ${err.message}`);
         }
@@ -1263,6 +1277,8 @@ export function createLcEngine({
         s.idleTimer = null;
         clearTimeout(s.capTimer);
         s.capTimer = null;
+        clearTimeout(s.deadlineTimer);
+        s.deadlineTimer = null;
         stopFactoryWatch(s.sid);
         clearInterval(s.sealTimer);
         s.sealTimer = null;
