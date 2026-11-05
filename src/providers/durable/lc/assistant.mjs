@@ -646,6 +646,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
 
     /** 202 body: `{ ok, requestId, deduped }`. 503 not ready / tools not loaded; 409 during a hand-off or a capped run's end. */
     async prompt(text, { requestId, whenBusy = "steer" } = {}) {
+      // A slash command would reach lets-code/pi as a command (`/even-note <file>` among them): refused here too.
+      if (String(text ?? "").trimStart().startsWith("/")) throw httpError(400, "slash_command_refused");
       if (stopped) throw httpError(503, "assistant not ready");
       if (!running()) {
         if (!spawning) {

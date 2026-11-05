@@ -196,6 +196,9 @@ export function assistantPromptOpts({ text, requestId, whenBusy } = {}) {
     return { error: `'requestId' must be 1-${L.requestIdMax} characters` };
   }
   if (whenBusy != null && !ASSISTANT_WHEN_BUSY.includes(whenBusy)) return { error: "'whenBusy' must be steer or followUp" };
+  // No pi/lets-code slash command (`/even-note`, `/mode`, `/model`, …) through the prompt route: notes go only
+  // through the bridge's own note path.
+  if (text.trimStart().startsWith("/")) return { error: "slash_command_refused" };
   return { text, requestId, whenBusy: whenBusy ?? "steer" };
 }
 

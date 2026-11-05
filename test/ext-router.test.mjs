@@ -1044,6 +1044,10 @@ test("assistant prompt validates text, requestId and whenBusy", async (t) => {
   await bad({ text: "hi" }, "'requestId' must be 1-128 characters");
   await bad({ text: "hi", requestId: "r".repeat(129) }, "'requestId' must be 1-128 characters");
   await bad({ text: "hi", requestId: "r1", whenBusy: "now" }, "'whenBusy' must be steer or followUp");
+  // No slash command reaches lets-code/pi through the prompt route (notes have their own path).
+  await bad({ text: "/even-note /home/ay/x.txt", requestId: "r1" }, "slash_command_refused");
+  await bad({ text: "  \n /mode orchestration", requestId: "r1" }, "slash_command_refused");
+  await bad({ text: "/model claude", requestId: "r1" }, "slash_command_refused");
   assert.deepEqual(assistant.calls.prompt, []);
   let r = await postJson(`${base}/api/assistant/prompt`, { text: "hi", requestId: "r1" });
   assert.equal(r.status, 202);

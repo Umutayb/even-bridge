@@ -449,14 +449,19 @@ the store; interrupt and question answers from the phone are 403 too; `state().l
 **Auth.** `/api/assistant/*` takes only the assistant API token: `Authorization: Bearer <contents of
 EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE>` (default `~/.even-terminal/assistant-api.token`, created 0600 with a
 random value at the first start with the flag on; the shim reads it). The bridge token, which the phone
-holds, gets 403 there, and the assistant token opens nothing else (401). Events stay on
+holds, gets 403 there, and the assistant token opens nothing else (401). A token file that is missing and
+cannot be created, empty, shorter than 16 characters or unreadable means no token: every `/api/assistant/*`
+request gets 503 `the assistant API token is not set up` (a startup warning says so); an empty token is
+never compared. Events stay on
 `GET /api/events?sessionId=dur-assistant` with the bridge token (read-only).
 
 **Deploy note.** The first start with the flag on adds a `meta` table to the session map
 (`<store>.sessions.sqlite`): back up `~/.even-terminal/durable.sqlite*` first (global constraint).
 
 Routes (all fall through to the official 404 unless the flag is on): `POST /api/assistant/prompt
-{text 1–4000, requestId 1–128, whenBusy?: steer|followUp}` → 202 `{ok, requestId, deduped}` | 503
+{text 1–4000, requestId 1–128, whenBusy?: steer|followUp}` (a text starting with `/` after leading
+whitespace is 400 `slash_command_refused`: no pi/lets-code command such as `/even-note` is reachable from
+the prompt route; notes go through `/api/assistant/note`) → 202 `{ok, requestId, deduped}` | 503
 `assistant not ready` | 503 `assistant tools not loaded` | 409 (hand-off running, capped run ending);
 `POST /api/assistant/{interrupt,reset,compact}` → `{ok:true}`; `POST /api/assistant/model {model?,
 thinking?}` → `{model, thinking}`; `POST /api/assistant/note {text}` → `{ok, queued}`; `POST

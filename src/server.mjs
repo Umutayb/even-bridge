@@ -160,19 +160,50 @@ export function assistantApiToken(env = process.env, home = homedir()) {
   chmodSync(file, 0o600);
   return () => {
     try {
-      return readFileSync(file, "utf8").trim() || null;
+      const t = readFileSync(file, "utf8").trim();
+      return t.length >= ASSISTANT_API_TOKEN_MIN ? t : null; // empty or short: no token at all
     } catch {
       return null;
     }
   };
 }
 
+/** The shortest assistant API token accepted (a shorter or empty file means: no token, every request refused). */
+export const ASSISTANT_API_TOKEN_MIN = 16;
+
 const sameToken = (a, b) => {
-  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (typeof a !== "string" || typeof b !== "string" || !a || !b) return false;
   const x = Buffer.from(a);
   const y = Buffer.from(b);
   return x.length === y.length && timingSafeEqual(x, y);
 };
+
+/**
+ * The gate of /api/assistant/*: only the assistant API token passes (marks `req.evenAssistantAuth`).
+ * No usable expected token (file missing, empty, shorter than ASSISTANT_API_TOKEN_MIN, unreadable, or never
+ * created) → 503 for every request, whatever was sent; the bridge (phone) token → 403; anything else → 401.
+ * @param {{ reader: () => string|null, allowedTokens: Set<string>, warn?: (line: string) => void }} o
+ */
+export function createAssistantAuth({ reader, allowedTokens, warn = (l) => console.warn(l) }) {
+  return (req, res, next) => {
+    const want = reader?.() ?? null;
+    if (typeof want !== "string" || want.length < ASSISTANT_API_TOKEN_MIN) {
+      warn(`[auth] 503 ${req.method} ${redactTokenQueryParam(req.originalUrl)}: no usable assistant API token`);
+      return res.status(503).json({ error: "the assistant API token is not set up" });
+    }
+    const header = req.headers.authorization;
+    const provided = header?.startsWith("Bearer ") ? header.slice(7) : req.query?.token;
+    if (sameToken(provided, want)) {
+      req.evenAssistantAuth = true;
+      return next();
+    }
+    if (typeof provided === "string" && allowedTokens?.has(provided)) {
+      return res.status(403).json({ error: "the assistant routes take the assistant API token, not the bridge token" });
+    }
+    warn(`[auth] 401 ${req.method} ${redactTokenQueryParam(req.originalUrl)} (ip=${req.ip})`);
+    res.status(401).json(INFO_AUTH_ERROR);
+  };
+}
 
 /** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
 export const DURABLE_DEFAULT_ROOT = "~/sandbox/agents";
@@ -407,19 +438,12 @@ export async function startServer({ flags = {}, cwd } = {}) {
     try {
       assistantToken = assistantApiToken(process.env);
     } catch (err) {
-      console.warn(`[bridge] assistant API token unavailable (${err.message}); /api/assistant/* refuses every request`);
+      console.warn(`[bridge] assistant API token unavailable (${err.message}); /api/assistant/* answers 503 to every request`);
     }
-    app.use("/api/assistant", (req, res, next) => {
-      const header = req.headers.authorization;
-      const provided = header?.startsWith("Bearer ") ? header.slice(7) : req.query.token;
-      if (sameToken(provided, assistantToken() ?? "")) {
-        req.evenAssistantAuth = true;
-        return next();
-      }
-      if (ALLOWED_TOKENS.has(provided)) return res.status(403).json({ error: "the assistant routes take the assistant API token, not the bridge token" });
-      console.warn(`[auth] 401 ${req.method} ${redactTokenQueryParam(req.originalUrl)} (ip=${req.ip})`);
-      res.status(401).json(INFO_AUTH_ERROR);
-    });
+    if (!assistantToken()) {
+      console.warn(`[bridge] the assistant API token file is missing, empty, unreadable or shorter than ${ASSISTANT_API_TOKEN_MIN} characters; /api/assistant/* answers 503 to every request`);
+    }
+    app.use("/api/assistant", createAssistantAuth({ reader: assistantToken, allowedTokens: ALLOWED_TOKENS }));
   }
 
   function auth(req, res, next) {

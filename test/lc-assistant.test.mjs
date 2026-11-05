@@ -403,6 +403,20 @@ test("lets-code agent rows get no child from the assistant's engine while the ag
   assert.equal(b._lc.liveCount(), 0);
 });
 
+test("a prompt that is a slash command is refused, also behind leading whitespace", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  for (const text of ["/even-note /etc/passwd", "  /mode orchestration", "\n/compact"]) {
+    await assert.rejects(p.assistant.prompt(text, { requestId: `sl-${text.length}` }), (e) => e.statusCode === 400 && e.message === "slash_command_refused");
+  }
+  await sleep(100);
+  assert.equal(c.prompts().length, 0, "nothing reached the child");
+  assert.equal(c.notes().length, 0);
+  await p.assistant.prompt("and/or is fine", { requestId: "sl-ok" });
+  await until(() => c.prompts().some((x) => x.message === "and/or is fine"), 5000, "a slash inside the text passes");
+});
+
 test("a retried requestId is accepted once", async (t) => {
   const c = makeCase();
   t.after(c.closeAll);

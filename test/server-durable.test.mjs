@@ -6,7 +6,9 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assistantEnabled, assistantOptions, cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT, overseerEnabled } from "../src/server.mjs";
+import express from "express";
+import { chmodSync } from "node:fs";
+import { ASSISTANT_API_TOKEN_MIN, assistantApiToken, createAssistantAuth, assistantEnabled, assistantOptions, cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT, overseerEnabled } from "../src/server.mjs";
 import { fakeModelsJson } from "./helpers/fake-openai.mjs";
 
 const CHILD = fileURLToPath(new URL("./helpers/server-child.mjs", import.meta.url));
@@ -429,4 +431,84 @@ test("server, durable on and the assistant flag unset: /api/assistant/* falls th
   const { out } = await s.stop();
   assert.doesNotMatch(out, /LOADED-DURABLE .*\/lc\//, "no lc module at all");
   assert.doesNotMatch(out, /assistant=/);
+});
+
+test("the assistant API token file: created 0600; empty, short, unreadable or uncreatable means no token", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "as-token-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(ASSISTANT_API_TOKEN_MIN, 16);
+  const at = (f) => ({ EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE: f });
+  // missing: created
+  const fresh = join(dir, "sub", "fresh.token");
+  const r = assistantApiToken(at(fresh));
+  assert.match(r(), /^[0-9a-f]{48}$/);
+  assert.equal(statSync(fresh).mode & 0o777, 0o600);
+  // empty, whitespace, short
+  for (const [name, body] of [["empty", ""], ["blank", "  \n"], ["short", "abc123"], ["fifteen", "x".repeat(15)]]) {
+    const f = join(dir, `${name}.token`);
+    writeFileSync(f, body);
+    assert.equal(assistantApiToken(at(f))(), null, name);
+  }
+  // unreadable: a directory where the file should be, or a file made unreadable after start
+  mkdirSync(join(dir, "isdir.token"));
+  assert.equal(assistantApiToken(at(join(dir, "isdir.token")))(), null);
+  const later = join(dir, "later.token");
+  const rl = assistantApiToken(at(later));
+  assert.ok(rl());
+  chmodSync(later, 0o000);
+  if (process.getuid?.() !== 0) assert.equal(rl(), null, "unreadable after a rotation");
+  // creation fails (the parent is a regular file): it throws; the server then refuses every request
+  writeFileSync(join(dir, "afile"), "x");
+  assert.throws(() => assistantApiToken(at(join(dir, "afile", "token"))));
+});
+
+async function authApp(t, reader) {
+  const app = express();
+  const reached = [];
+  app.use("/api/assistant", createAssistantAuth({ reader, allowedTokens: new Set(["bridge-token-0123456789"]), warn: () => {} }));
+  app.use((req, res) => {
+    reached.push(req.originalUrl);
+    res.json({ ok: true, authed: Boolean(req.evenAssistantAuth) });
+  });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((r) => server.once("listening", r));
+  t.after(() => {
+    server.close();
+    server.closeAllConnections();
+  });
+  return { base: `http://127.0.0.1:${server.address().port}`, reached };
+}
+
+test("no usable assistant token: every /api/assistant request gets 503, with no, an empty or any token", async (t) => {
+  for (const reader of [() => null, () => "", () => "short", undefined]) {
+    const { base, reached } = await authApp(t, reader);
+    for (const [path, headers] of [
+      ["/api/assistant/state", {}],
+      ["/api/assistant/state?token=", {}],
+      ["/api/assistant/state?token=short", {}],
+      ["/api/assistant/state", { Authorization: "Bearer " }],
+      ["/api/assistant/state", { Authorization: "Bearer bridge-token-0123456789" }],
+      ["/api/assistant/prompt?token=x", {}],
+    ]) {
+      const r = await fetch(base + path, { headers });
+      assert.equal(r.status, 503, `${path} ${JSON.stringify(headers)}`);
+      assert.deepEqual(await r.json(), { error: "the assistant API token is not set up" });
+    }
+    assert.deepEqual(reached, [], "no request reached a route");
+  }
+});
+
+test("a usable assistant token: only it passes; empty, wrong and bridge tokens are refused", async (t) => {
+  const tok = "a".repeat(48);
+  const { base, reached } = await authApp(t, () => tok);
+  const st = async (path, headers = {}) => (await fetch(base + path, { headers })).status;
+  assert.equal(await st("/api/assistant/state"), 401);
+  assert.equal(await st("/api/assistant/state?token="), 401, "an empty token never matches");
+  assert.equal(await st("/api/assistant/state", { Authorization: "Bearer " }), 401);
+  assert.equal(await st("/api/assistant/state?token=" + "a".repeat(47)), 401);
+  assert.equal(await st("/api/assistant/state", { Authorization: "Bearer bridge-token-0123456789" }), 403);
+  assert.equal(reached.length, 0);
+  assert.equal(await st("/api/assistant/state", { Authorization: `Bearer ${tok}` }), 200);
+  assert.equal(await st(`/api/assistant/state?token=${tok}`), 200);
+  assert.equal(reached.length, 2);
 });
