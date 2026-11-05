@@ -219,3 +219,43 @@ Findings:
 7. Nothing else bound `127.0.0.1:8795` during the runs (`ss -ltn`), and no Claude switch was run (it would
    start the lets-code Claude proxy in the throwaway child). After teardown: no `even-lc-dur-assistant-*`
    scope, ports 3466/8815 free, no core-memory project dir for the throwaway cwd (no memory write happened).
+
+## Smoke (A2 real run, 2026-11-05)
+
+`scripts/assistant-smoke.mjs`: a throwaway bridge on `127.0.0.1:3466` (store `~/tmp/ovs-a2-store`, cwd
+`~/tmp/ovs-a2/assistant`, `EVEN_BRIDGE_DURABLE_ENABLE=1 EVEN_BRIDGE_ASSISTANT_ENABLE=1`), the real
+`~/.local/bin/lets-code` + vLLM qwen at medium, this repo's `even-assistant.ts` (no probe), and
+`test/helpers/fake-tool-server.mjs` on `127.0.0.1:8815` with the dated fixtures. Each prompt carries the
+per-turn header (`[20:40 Thu 5 Nov 2026, Europe/Amsterdam · lang en · style brief]`). Two runs; run 1 found
+two script bugs (it ended turn (d) on the late `assistant_restarted` frame, so the reset in (e) met a busy
+run: 409), fixed for run 2. Output without tokens: `~/tmp/assistant-a2-run/` (`smoke*.out`,
+`summary.json`, the extension log, the bridge log with hex runs masked). Everything under `~/tmp/ovs-a2*`
+and the throwaway core-memory dir was removed; no `even-lc-dur-assistant-*` scope left, 3466/8815 free.
+
+| check | run 2 | run 1 |
+|---|---|---|
+| bridge start → idle, `tools: 16 (live)` | 2928 ms | 2713 ms |
+| (a) "What am I eating on Friday the 13th?" | 1 × `fetch_calendar 2026-11-13..13`, "lasagna … at 18:00", result 1589 ms | same, 3553 ms |
+| (b) "And on Thursday?" | 1 × `fetch_calendar` **2026-11-12**, no Lasagna, result 4647 ms; the turn-1 result reached the model as a stub (`stale: 1`) | same date, 12 344 ms (degenerate tail `</invoke> … (Revised)` in the text) |
+| (c) "Remember that I like tea." / "I like coffee." | 1 memory entry with tea; coffee: 1 `remember` blocked by the gate, 0 writes | tea 1 entry; coffee 2 blocked, 0 writes |
+| (d) bridge SIGKILL during a slow `web_search` (8 s) → restart | warm 2250 ms; `assistant_restarted` frame (late, inside the next turn) and `state.lost`; restart note delivered; the cut user turn stubbed (`cut: 1`); next turn ("Fridays") answered, 0 resumed `web_search` | warm 2248 ms; same stub, 0 resumed |
+| (e) `POST /api/assistant/reset`, then "Search your memory: what do I like to drink?" | 200 in 4578 ms, new session file; `memory` ×3, "I only have tea saved in memory …" | (409, script bug) |
+| prompt section | `even_assistant` section in the session's system message | |
+| `max_tokens` | 14/14 provider requests capped 32 768 → 4096; no vLLM error | 13/13 |
+
+Findings:
+
+1. **"And on Thursday?" on a Thursday resolves to next week** (12 Nov) in both runs, as in A0 (b). The plan
+   expected 5 Nov; with today being Thursday the model chose the next one and, in run 2, offered to check
+   today. The stub did its job (a fresh fetch, no Lasagna). The date choice is A4/A6's (header wording,
+   the "this/next" scenarios).
+2. **The memory gate is needed and works.** qwen tried `memory remember` for "I like coffee" in both runs
+   (1 and 2 calls); every one was blocked with "memory writes need the user to ask for them", and the
+   model then told the user to say "remember …".
+3. **The cut-turn stub works.** Without it A1 run 3 resumed the cut request; here the next turn answered
+   only the new question in both runs, and nothing called `web_search` again.
+4. **qwen still leaks tool-parser tails into the text** now and then (`</invoke>`, `</parameter>`,
+   `</function>`, "(Revised)"): 3 of 6 turns in run 1, 0 of 6 in run 2. The HUD path (A4: last message only,
+   dedupe) has to strip or drop them.
+5. Earlier phone data still rides in the model's own old answers (as A0 said); the instructions tell the
+   model they are no source.

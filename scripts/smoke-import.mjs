@@ -28,6 +28,7 @@ const MODULES = [
   "../src/providers/durable/lc/guard-core.mjs",
   "../src/providers/durable/lc/engine.mjs",
   "../src/providers/durable/lc/assistant.mjs",
+  "../src/providers/durable/lc/assistant-ext-core.mjs",
   "../src/providers/durable/agent-files.mjs",
   "../src/providers/durable/subagent.mjs",
   "../src/providers/durable/provider.mjs",
