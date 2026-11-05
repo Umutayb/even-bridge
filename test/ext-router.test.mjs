@@ -72,7 +72,7 @@ function stubPi() {
 /** Build an app with ONLY the ext router + a fall-through sentinel.
  *  The official default provider is injected (hermetic — never touches
  *  the user's ~/.claude or ~/.codex). */
-async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase, overseer }) {
+async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscriptBase, overseer, assistant }) {
   const { createExtRouter } = await import("../src/ext-router.mjs");
   const hub = new Hub();
   const app = express();
@@ -86,6 +86,7 @@ async function buildApp(t, { rc, pi, durable, local = localProvider, rcTranscrip
       getDefaultLocalProvider: () => local,
       rcTranscriptBase,
       overseer,
+      ...(assistant ? { assistant } : {}),
     })
   );
   app.use((req, res) => {
@@ -984,4 +985,146 @@ test("the agent origins include overseer", async () => {
   const { agentOpts, AGENT_ORIGINS } = await import("../src/ext-router.mjs");
   assert.deepEqual(AGENT_ORIGINS, ["evenai", "phone", "overseer"]);
   assert.deepEqual(agentOpts({ origin: "overseer" }).opts, { origin: "overseer" });
+});
+
+// ── /api/assistant ────────────────────────────────────────────────────────────
+
+function stubAssistant() {
+  const calls = { prompt: [], model: [], note: [], dialog: [], verbs: [] };
+  return {
+    calls,
+    sid: "dur-assistant",
+    prompt: async (text, opts) => {
+      calls.prompt.push([text, opts]);
+      return { ok: true, requestId: opts.requestId, deduped: false };
+    },
+    interrupt: async () => calls.verbs.push("interrupt"),
+    reset: async () => calls.verbs.push("reset"),
+    compact: async () => calls.verbs.push("compact"),
+    setModel: async (o) => {
+      calls.model.push(o);
+      if (o.model === "Anthropic/claude-busy") throw Object.assign(new Error("assistant is busy"), { statusCode: 409 });
+      return { model: o.model ?? "lets-code/qwen3.8-27b", thinking: o.thinking ?? "medium" };
+    },
+    note: (text) => {
+      calls.note.push(text);
+      return { queued: true };
+    },
+    answerDialog: async (id, answer) => {
+      calls.dialog.push([id, answer]);
+      if (id === "nope") throw Object.assign(new Error("no such dialog"), { statusCode: 404 });
+      return { ok: true };
+    },
+    state: () => ({ status: "idle", model: "lets-code/qwen3.8-27b", thinking: "medium", toolsLoaded: 17, toolsSource: "live", sessionFile: "/s/f.jsonl", lastResetAt: null }),
+  };
+}
+
+test("assistant routes are 404 when the assistant is off", async (t) => {
+  const { app, fellThrough } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable() });
+  const base = await listen(t, app);
+  for (const [m, path] of [["POST", "prompt"], ["POST", "interrupt"], ["POST", "reset"], ["POST", "compact"], ["POST", "model"], ["POST", "note"], ["POST", "dialog"], ["GET", "state"]]) {
+    const r = m === "GET" ? await fetch(`${base}/api/assistant/${path}`) : await postJson(`${base}/api/assistant/${path}`, { text: "hi", requestId: "r1" });
+    assert.deepEqual(await r.json(), { fellThrough: true, path: `/api/assistant/${path}` }, path);
+  }
+  assert.equal(fellThrough.length, 8, "the official routers answer (their 404), as before the routes existed");
+});
+
+test("assistant prompt validates text, requestId and whenBusy", async (t) => {
+  const assistant = stubAssistant();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistant });
+  const base = await listen(t, app);
+  const bad = async (body, error) => {
+    const r = await postJson(`${base}/api/assistant/prompt`, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.deepEqual(await r.json(), { error });
+  };
+  await bad({ text: "", requestId: "r1" }, "Missing 'text'");
+  await bad({ requestId: "r1" }, "Missing 'text'");
+  await bad({ text: "x".repeat(4001), requestId: "r1" }, "'text' must be 1-4000 characters");
+  await bad({ text: "hi" }, "'requestId' must be 1-128 characters");
+  await bad({ text: "hi", requestId: "r".repeat(129) }, "'requestId' must be 1-128 characters");
+  await bad({ text: "hi", requestId: "r1", whenBusy: "now" }, "'whenBusy' must be steer or followUp");
+  // No slash command reaches lets-code/pi through the prompt route (notes have their own path).
+  await bad({ text: "/even-note /home/ay/x.txt", requestId: "r1" }, "slash_command_refused");
+  await bad({ text: "  \n /mode orchestration", requestId: "r1" }, "slash_command_refused");
+  await bad({ text: "/model claude", requestId: "r1" }, "slash_command_refused");
+  assert.deepEqual(assistant.calls.prompt, []);
+  let r = await postJson(`${base}/api/assistant/prompt`, { text: "hi", requestId: "r1" });
+  assert.equal(r.status, 202);
+  assert.deepEqual(await r.json(), { ok: true, requestId: "r1", deduped: false });
+  r = await postJson(`${base}/api/assistant/prompt`, { text: "and?", requestId: "r2", whenBusy: "followUp" });
+  assert.equal(r.status, 202);
+  assert.deepEqual(assistant.calls.prompt, [["hi", { requestId: "r1", whenBusy: "steer" }], ["and?", { requestId: "r2", whenBusy: "followUp" }]]);
+  // The assistant's own refusals keep their status.
+  assistant.prompt = async () => {
+    throw Object.assign(new Error("assistant tools not loaded"), { statusCode: 503 });
+  };
+  r = await postJson(`${base}/api/assistant/prompt`, { text: "hi", requestId: "r3" });
+  assert.equal(r.status, 503);
+  assert.deepEqual(await r.json(), { error: "assistant tools not loaded" });
+});
+
+test("assistant model validates thinking", async (t) => {
+  const assistant = stubAssistant();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistant });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/assistant/model`, { thinking: "max" });
+  assert.equal(r.status, 400);
+  assert.deepEqual(await r.json(), { error: "'thinking' must be one of off, minimal, low, medium, high" });
+  r = await postJson(`${base}/api/assistant/model`, {});
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/assistant/model`, { model: "no-slash" });
+  assert.equal(r.status, 400);
+  assert.deepEqual(assistant.calls.model, []);
+  r = await postJson(`${base}/api/assistant/model`, { thinking: "low" });
+  assert.deepEqual(await r.json(), { model: "lets-code/qwen3.8-27b", thinking: "low" });
+  r = await postJson(`${base}/api/assistant/model`, { model: "Anthropic/claude-sonnet-4-6" });
+  assert.deepEqual(await r.json(), { model: "Anthropic/claude-sonnet-4-6", thinking: "medium" });
+  r = await postJson(`${base}/api/assistant/model`, { model: "Anthropic/claude-busy" });
+  assert.equal(r.status, 409);
+  assert.deepEqual(await r.json(), { error: "assistant is busy" });
+});
+
+test("assistant note, dialog, verbs and state", async (t) => {
+  const assistant = stubAssistant();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistant });
+  const base = await listen(t, app);
+  let r = await postJson(`${base}/api/assistant/note`, { text: "" });
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/assistant/note`, { text: "the user said bye" });
+  assert.deepEqual(await r.json(), { ok: true, queued: true });
+  assert.deepEqual(assistant.calls.note, ["the user said bye"]);
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "ui-1" });
+  assert.equal(r.status, 400, "one answer is required");
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "ui-1", value: "Deny", confirmed: true });
+  assert.equal(r.status, 400, "only one");
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "ui-1", cancelled: false });
+  assert.equal(r.status, 400);
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "ui-1", value: "Deny" });
+  assert.deepEqual(await r.json(), { ok: true });
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "ui-2", confirmed: false });
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "ui-3", cancelled: true });
+  assert.deepEqual(assistant.calls.dialog, [["ui-1", { value: "Deny" }], ["ui-2", { confirmed: false }], ["ui-3", { cancelled: true }]]);
+  r = await postJson(`${base}/api/assistant/dialog`, { id: "nope", value: "x" });
+  assert.equal(r.status, 404);
+  for (const v of ["interrupt", "reset", "compact"]) {
+    r = await postJson(`${base}/api/assistant/${v}`, {});
+    assert.deepEqual(await r.json(), { ok: true }, v);
+  }
+  assert.deepEqual(assistant.calls.verbs, ["interrupt", "reset", "compact"]);
+  r = await fetch(`${base}/api/assistant/state`);
+  assert.deepEqual(await r.json(), assistant.state());
+});
+
+test("Even AI is listed right after the overseer", async (t) => {
+  const durable = stubDurable();
+  durable.listSessions = async () => [
+    { id: "dur-overseer", title: "Overseer", timestamp: 1, cwd: "/w", provider: "claude", status: null },
+    { id: "dur-assistant", title: "Even AI", timestamp: 2, cwd: "/a", provider: "claude", status: null, readOnly: true },
+  ];
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable, overseer: { ...stubOverseer(), sid: "dur-overseer" }, assistant: stubAssistant() });
+  const base = await listen(t, app);
+  const r = await fetch(`${base}/api/sessions?limit=10`);
+  const ids = (await r.json()).sessions.map((s) => s.id);
+  assert.deepEqual(ids.slice(0, 2), ["dur-overseer", "dur-assistant"]);
 });

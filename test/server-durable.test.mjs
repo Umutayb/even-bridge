@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT, overseerEnabled } from "../src/server.mjs";
+import express from "express";
+import { chmodSync } from "node:fs";
+import { ASSISTANT_API_TOKEN_MIN, assistantApiToken, createAssistantAuth, assistantEnabled, assistantOptions, cwdAllowed, durableEnabled, durableOptions, DURABLE_DEFAULT_ROOT, overseerEnabled } from "../src/server.mjs";
 import { fakeModelsJson } from "./helpers/fake-openai.mjs";
 
 const CHILD = fileURLToPath(new URL("./helpers/server-child.mjs", import.meta.url));
@@ -195,6 +197,7 @@ test("server, flag unset: durable never imported, durable=off, /api/agents is au
   assert.doesNotMatch(out, /LOADED-DURABLE/, "src/providers/durable/* was imported with the flag off");
   assert.doesNotMatch(out, /LOADED-OVERSEER/, "src/overseer/* was imported with the flag off");
   assert.doesNotMatch(out, /overseer=/, "the banner is the one of before");
+  assert.doesNotMatch(out, /assistant=/);
 });
 
 test("server, flag on: durable=on after ready, the default cwd is <root>/glasses, SIGTERM waits for the store to close", async (t) => {
@@ -219,6 +222,8 @@ test("server, flag on: durable=on after ready, the default cwd is <root>/glasses
   assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=off/);
   assert.doesNotMatch(out, /LOADED-DURABLE .*\/lc\//, "flag off loads no lc module");
   assert.doesNotMatch(out, /LOADED-OVERSEER/, "overseer flag unset: no overseer module");
+  assert.doesNotMatch(out, /LOADED-DURABLE .*\/lc\/assistant\.mjs/, "assistant flag unset: no assistant module");
+  assert.doesNotMatch(out, /assistant=/, "the banner is the one of before");
   assert.doesNotMatch(out, /default cwd .* is not under EVEN_BRIDGE_DURABLE_CWDS/);
   assert.match(out, /\[bridge\] durable store closed/);
 });
@@ -324,4 +329,186 @@ test("server, overseer on: dur-overseer is listed, /api/overseer answers, the ag
   assert.equal(code, 0);
   assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=off, overseer=on/);
   assert.match(out, /LOADED-OVERSEER .*\/overseer\.mjs/);
+});
+
+test("assistant options only with EVEN_BRIDGE_ASSISTANT_ENABLE=1 and durable on", () => {
+  assert.equal(assistantEnabled({}), false);
+  assert.equal(assistantEnabled({ EVEN_BRIDGE_ASSISTANT_ENABLE: "1" }), false, "needs durable");
+  assert.equal(assistantEnabled({ EVEN_BRIDGE_DURABLE_ENABLE: "1", EVEN_BRIDGE_ASSISTANT_ENABLE: "true" }), false);
+  assert.equal(assistantOptions({ EVEN_BRIDGE_DURABLE_ENABLE: "1" }), null);
+  assert.equal(durableOptions({ EVEN_BRIDGE_DURABLE_ENABLE: "1" }).assistant, undefined, "flag unset: no key");
+  const on = { EVEN_BRIDGE_DURABLE_ENABLE: "1", EVEN_BRIDGE_ASSISTANT_ENABLE: "1" };
+  assert.deepEqual(assistantOptions(on), { toolsUrl: "http://127.0.0.1:8814", tokenFile: "~/even-app/shim-data/assistant_tools.token" });
+  assert.deepEqual(durableOptions(on).assistant, assistantOptions(on));
+  assert.equal(durableOptions(on).lc, undefined, "the agent engine flag stays its own");
+  assert.deepEqual(
+    assistantOptions({
+      ...on,
+      EVEN_BRIDGE_ASSISTANT_TOOLS_URL: "http://127.0.0.1:8815",
+      EVEN_BRIDGE_ASSISTANT_TOKEN_FILE: "/k/token",
+      EVEN_BRIDGE_PI_BIN: "/home/ay/.local/bin/lets-code",
+      EVEN_BRIDGE_ASSISTANT_EXT: "/tmp/probe.ts",
+      EVEN_BRIDGE_ASSISTANT_DEADLINE_S: "3",
+      EVEN_BRIDGE_ASSISTANT_CWD: "/home/ay/tmp/ovs-a1/assistant",
+    }),
+    { toolsUrl: "http://127.0.0.1:8815", tokenFile: "/k/token", bin: "/home/ay/.local/bin/lets-code", ext: "/tmp/probe.ts", cwd: "/home/ay/tmp/ovs-a1/assistant", deadlineMs: 3000 },
+  );
+  assert.equal(assistantOptions({ ...on, EVEN_BRIDGE_LC_BIN: "/a", EVEN_BRIDGE_PI_BIN: "/b" }).bin, "/a");
+  assert.equal("deadlineMs" in assistantOptions({ ...on, EVEN_BRIDGE_ASSISTANT_DEADLINE_S: "x" }), false);
+});
+
+test("server, assistant on: routes answer, Even AI is listed read-only, not an agent; the banner says assistant=on", async (t) => {
+  const s = await startChild(t, (home) => {
+    mkdirSync(join(home, "x", "y"), { recursive: true });
+    writeFileSync(join(home, "models.json"), JSON.stringify(fakeModelsJson("http://127.0.0.1:9/v1")));
+    return {
+      EVEN_BRIDGE_DURABLE_ENABLE: "1",
+      EVEN_BRIDGE_ASSISTANT_ENABLE: "1",
+      EVEN_BRIDGE_LC_BIN: "/bin/false", // never a real lets-code in a test: the child exits at once
+      EVEN_BRIDGE_DURABLE_STORE: join(home, "durable.sqlite"),
+      EVEN_BRIDGE_DURABLE_MODELS: join(home, "models.json"),
+      EVEN_BRIDGE_DURABLE_CWDS: "~/x",
+    };
+  });
+  let r = await fetch(`${s.base}/api/assistant/state`);
+  assert.equal(r.status, 401, "auth-gated");
+  // The phone's (bridge) token never reaches the assistant routes: only the assistant API token does.
+  r = await fetch(`${s.base}/api/assistant/state`, authed);
+  assert.equal(r.status, 403);
+  assert.match((await r.json()).error, /assistant API token/);
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "p1" }) });
+  assert.equal(r.status, 403);
+  const tokFile = join(s.home, ".even-terminal", "assistant-api.token");
+  assert.equal(statSync(tokFile).mode & 0o777, 0o600, "created 0600 by the bridge");
+  const asTok = readFileSync(tokFile, "utf8").trim();
+  assert.match(asTok, /^[0-9a-f]{48}$/);
+  const asAuthed = { headers: { Authorization: `Bearer ${asTok}` } };
+  r = await fetch(`${s.base}/api/agents`, asAuthed);
+  assert.equal(r.status, 401, "the assistant token opens only /api/assistant/*");
+  r = await fetch(`${s.base}/api/assistant/state`, asAuthed);
+  assert.equal(r.status, 200);
+  const st = await r.json();
+  assert.equal(st.model, "lets-code/qwen3.8-27b");
+  assert.equal(st.toolsLoaded, 0);
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...asAuthed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1" }) });
+  assert.equal(r.status, 503, "no child (it exits at once): the shim falls back to its loop");
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...asAuthed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1", whenBusy: "now" }) });
+  assert.equal(r.status, 400);
+  r = await fetch(`${s.base}/api/agents`, authed);
+  assert.deepEqual(await r.json(), { agents: [] }, "not an agent; no engines advertised without the agent engine flag");
+  r = await fetch(`${s.base}/api/sessions?provider=claude&limit=50`, authed);
+  const row = (await r.json()).sessions.find((x) => x.id === "dur-assistant");
+  assert.equal(row?.title, "Even AI");
+  assert.equal(row?.readOnly, true);
+  r = await fetch(`${s.base}/api/agents/dur-assistant/stop`, { method: "POST", ...authed });
+  assert.equal(r.status, 403);
+  assert.deepEqual(await r.json(), { error: "Even AI is read-only here" });
+  r = await fetch(`${s.base}/api/prompt`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ sessionId: "dur-assistant", text: "hi" }) });
+  assert.equal(r.status, 403);
+  const { code, out } = await s.stop();
+  assert.equal(code, 0);
+  assert.match(out, /\[bridge\] extensions: .*durable=on wrapper=(?:systemd-run|bwrap|none) lc=off assistant=on/);
+  assert.match(out, /LOADED-DURABLE .*\/lc\/assistant\.mjs/);
+});
+
+test("server, durable on and the assistant flag unset: /api/assistant/* falls through to the official 404", async (t) => {
+  const s = await startChild(t, (home) => {
+    mkdirSync(join(home, "x", "y"), { recursive: true });
+    writeFileSync(join(home, "models.json"), JSON.stringify(fakeModelsJson("http://127.0.0.1:9/v1")));
+    return {
+      EVEN_BRIDGE_DURABLE_ENABLE: "1",
+      EVEN_BRIDGE_DURABLE_STORE: join(home, "durable.sqlite"),
+      EVEN_BRIDGE_DURABLE_MODELS: join(home, "models.json"),
+      EVEN_BRIDGE_DURABLE_CWDS: "~/x",
+    };
+  });
+  let r = await fetch(`${s.base}/api/assistant/state`, authed);
+  assert.equal(r.status, 404);
+  r = await fetch(`${s.base}/api/assistant/prompt`, { method: "POST", headers: { ...authed.headers, "Content-Type": "application/json" }, body: JSON.stringify({ text: "hi", requestId: "a1" }) });
+  assert.equal(r.status, 404);
+  r = await fetch(`${s.base}/api/sessions?provider=claude&limit=50`, authed);
+  assert.ok(!(await r.json()).sessions.some((x) => x.id === "dur-assistant"));
+  const { out } = await s.stop();
+  assert.doesNotMatch(out, /LOADED-DURABLE .*\/lc\//, "no lc module at all");
+  assert.doesNotMatch(out, /assistant=/);
+});
+
+test("the assistant API token file: created 0600; empty, short, unreadable or uncreatable means no token", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "as-token-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(ASSISTANT_API_TOKEN_MIN, 16);
+  const at = (f) => ({ EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE: f });
+  // missing: created
+  const fresh = join(dir, "sub", "fresh.token");
+  const r = assistantApiToken(at(fresh));
+  assert.match(r(), /^[0-9a-f]{48}$/);
+  assert.equal(statSync(fresh).mode & 0o777, 0o600);
+  // empty, whitespace, short
+  for (const [name, body] of [["empty", ""], ["blank", "  \n"], ["short", "abc123"], ["fifteen", "x".repeat(15)]]) {
+    const f = join(dir, `${name}.token`);
+    writeFileSync(f, body);
+    assert.equal(assistantApiToken(at(f))(), null, name);
+  }
+  // unreadable: a directory where the file should be, or a file made unreadable after start
+  mkdirSync(join(dir, "isdir.token"));
+  assert.equal(assistantApiToken(at(join(dir, "isdir.token")))(), null);
+  const later = join(dir, "later.token");
+  const rl = assistantApiToken(at(later));
+  assert.ok(rl());
+  chmodSync(later, 0o000);
+  if (process.getuid?.() !== 0) assert.equal(rl(), null, "unreadable after a rotation");
+  // creation fails (the parent is a regular file): it throws; the server then refuses every request
+  writeFileSync(join(dir, "afile"), "x");
+  assert.throws(() => assistantApiToken(at(join(dir, "afile", "token"))));
+});
+
+async function authApp(t, reader) {
+  const app = express();
+  const reached = [];
+  app.use("/api/assistant", createAssistantAuth({ reader, allowedTokens: new Set(["bridge-token-0123456789"]), warn: () => {} }));
+  app.use((req, res) => {
+    reached.push(req.originalUrl);
+    res.json({ ok: true, authed: Boolean(req.evenAssistantAuth) });
+  });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise((r) => server.once("listening", r));
+  t.after(() => {
+    server.close();
+    server.closeAllConnections();
+  });
+  return { base: `http://127.0.0.1:${server.address().port}`, reached };
+}
+
+test("no usable assistant token: every /api/assistant request gets 503, with no, an empty or any token", async (t) => {
+  for (const reader of [() => null, () => "", () => "short", undefined]) {
+    const { base, reached } = await authApp(t, reader);
+    for (const [path, headers] of [
+      ["/api/assistant/state", {}],
+      ["/api/assistant/state?token=", {}],
+      ["/api/assistant/state?token=short", {}],
+      ["/api/assistant/state", { Authorization: "Bearer " }],
+      ["/api/assistant/state", { Authorization: "Bearer bridge-token-0123456789" }],
+      ["/api/assistant/prompt?token=x", {}],
+    ]) {
+      const r = await fetch(base + path, { headers });
+      assert.equal(r.status, 503, `${path} ${JSON.stringify(headers)}`);
+      assert.deepEqual(await r.json(), { error: "the assistant API token is not set up" });
+    }
+    assert.deepEqual(reached, [], "no request reached a route");
+  }
+});
+
+test("a usable assistant token: only it passes; empty, wrong and bridge tokens are refused", async (t) => {
+  const tok = "a".repeat(48);
+  const { base, reached } = await authApp(t, () => tok);
+  const st = async (path, headers = {}) => (await fetch(base + path, { headers })).status;
+  assert.equal(await st("/api/assistant/state"), 401);
+  assert.equal(await st("/api/assistant/state?token="), 401, "an empty token never matches");
+  assert.equal(await st("/api/assistant/state", { Authorization: "Bearer " }), 401);
+  assert.equal(await st("/api/assistant/state?token=" + "a".repeat(47)), 401);
+  assert.equal(await st("/api/assistant/state", { Authorization: "Bearer bridge-token-0123456789" }), 403);
+  assert.equal(reached.length, 0);
+  assert.equal(await st("/api/assistant/state", { Authorization: `Bearer ${tok}` }), 200);
+  assert.equal(await st(`/api/assistant/state?token=${tok}`), 200);
+  assert.equal(reached.length, 2);
 });

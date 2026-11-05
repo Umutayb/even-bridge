@@ -104,6 +104,13 @@ export class LcSession extends PiSession {
     return this.client.send({ type: "prompt", message: text }, timeoutMs);
   }
 
+  /** Queue a prompt after the running turn (pi `streamingBehavior: "followUp"`); `steer` is PiSession's. */
+  async followUp(text) {
+    if (!this.client) throw new Error("session not started");
+    this.send({ type: "user_prompt", text });
+    await this.client.send({ type: "prompt", message: text, streamingBehavior: "followUp" });
+  }
+
   /** A command that shows nothing on the glasses (`/mode …`); resolves with its prompt response. */
   command(text, timeoutMs = 5000) {
     if (!this.client) return Promise.reject(new Error("session not started"));

@@ -57,6 +57,13 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_LC_SANDBOX` | on | `0` drops lets-code's `--sandbox` (tests only); on and without `bwrap`+`socat`, every lets-code start answers 503 |
 | `EVEN_BRIDGE_OVERSEER_ENABLE` | off | `1` adds the overseer (needs `EVEN_BRIDGE_DURABLE_ENABLE=1`; it does not need the lets-code engine): the root conversation `dur-overseer`, `/api/overseer/*`, `overseer: true` on `GET /api/agents`; banner `, overseer=on` / `, overseer=failed: …` (the part is absent while the flag is unset). See *The overseer* below |
 | `EVEN_BRIDGE_OVERSEER_AUDIT` | `~/.even-terminal/overseer-actions.log` | the action audit file (JSONL, 0600); throwaway instances point it at their own dir |
+| `EVEN_BRIDGE_ASSISTANT_ENABLE` | off | `1` adds the Even AI assistant (needs `EVEN_BRIDGE_DURABLE_ENABLE=1`, **not** the lets-code engine flag): the always-warm lets-code session `dur-assistant` and `/api/assistant/*`; banner ` assistant=on` / ` assistant=failed: …` (absent while unset). Off: the routes fall through to the official 404, no child, no `lc/` module loaded. See *The Even AI assistant* below |
+| `EVEN_BRIDGE_ASSISTANT_TOOLS_URL` | `http://127.0.0.1:8814` | the shim's tool server (the child's `EVEN_ASSISTANT_TOOLS_URL`) |
+| `EVEN_BRIDGE_ASSISTANT_TOKEN_FILE` | `~/even-app/shim-data/assistant_tools.token` | the tool server's token **file** (0600); the child gets the path, never the token |
+| `EVEN_BRIDGE_ASSISTANT_EXT` | `src/providers/durable/lc/even-assistant.ts` (Task A2) | the assistant extension; smoke runs point it at a probe |
+| `EVEN_BRIDGE_ASSISTANT_CWD` | `~/sandbox/assistant` | the assistant's cwd (keys its core-memory store); smoke runs use their own |
+| `EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE` | `~/.even-terminal/assistant-api.token` | the only token `/api/assistant/*` accepts (created 0600 when missing; the shim reads it); the bridge token gets 403 there |
+| `EVEN_BRIDGE_ASSISTANT_DEADLINE_S` | `20` | per-run deadline (A0 `ASSISTANT_RUN_DEADLINE_S`); smoke runs lower it |
 | `EVEN_BRIDGE_OVERSEER_HANDOFF` | off | `1` accepts overnight hand-offs (`POST /api/overseer/ask {mode:"tell", handoff}`); off: `400 hand-offs are off`. Leave off until a producer (Ideate) exists |
 
 All of them are read at startup only. With every flag of this table unset the behavior and the wire output
@@ -346,6 +353,120 @@ five factory experts stay off in `~/.pi/agent/lets-code-state.json`, so every fa
   cut-off prompt (or `/factory resume <id>`); an undelivered prompt is sent again as it was.
   A child that crashes while the bridge runs gets a crash prompt after an error frame
   `lets-code exited mid-turn; starting it again (attempt n of 6)`.
+
+## The Even AI assistant (`EVEN_BRIDGE_ASSISTANT_ENABLE=1`)
+
+Code: `src/providers/durable/lc/assistant.mjs` (profile, routes' backend, nightly task), `launch.mjs`
+`assistantLaunch`, the profile hooks in `engine.mjs`, the no-resume branch in `task.mjs`. Design:
+`docs/superpowers/specs/2026-11-03-evenai-agent-design.md` §2; constants from `docs/assistant-spike.md` (A0).
+
+- **One session, its own profile.** `dur-assistant` is a virtual row (like `dur-overseer`) backed by a
+  record conversation of its own (id in the session map's `meta` table). It runs on the lets-code engine
+  as profile `assistant`: `<bin> --mode rpc -ne -e ~/.pi/agent/extensions/lets-code -e even-assistant.ts
+  --tools <17 Even tools>,memory --thinking medium --session-dir <store>/lc-sessions/dur-assistant
+  --no-mandate --approve --no-skills --no-prompt-templates --no-context-files --model <qwen> [--session <file>]`,
+  cwd `~/sandbox/assistant`, env `ASSISTANT_MODULE_ENV`
+  (`LETS_CODE_<X>=false|true`: only core memory, agent guard and grounding on; the `_ON` names do nothing)
+  + `EVEN_ASSISTANT_TOOLS_URL`, `EVEN_ASSISTANT_TOOLS_TOKEN_FILE`, `EVEN_ASSISTANT_SCHEMA_CACHE`; no
+  `*_TOKEN`/`*_KEY`, no `EVEN_GUARD_CWD`. No mandate, sandbox, subagents or guard: it has no shell or file
+  tools. Scope `even-lc-dur-assistant-<sha1(store dir)[0:8]>` (a throwaway bridge never touches the live
+  one's). `--approve` makes pi read `<cwd>/.pi/settings.json`, which the bridge writes with
+  `compaction.keepRecentTokens: 200` (without both, `compact` answers "Nothing to compact" on a short day).
+  `--approve` trusts that project, so everything else pi takes from a project is off (`-ne`, `--no-skills`,
+  `--no-prompt-templates`, `--no-context-files`), and the cwd and its `.pi` are created `0700`. **Only the
+  bridge writes `~/sandbox/assistant/.pi`** (just `settings.json`; anything else there is logged as a
+  warning at start). The assistant has no file tools; no agent, shim or operator script may put files
+  there.
+- **Own slot, always warm.** Never admitted against `EVEN_BRIDGE_LC_MAX_LIVE`, not in `/api/agents`
+  (so the shim's reaper and TTL never see it), no idle stop. Spawned at bridge start; after an exit
+  respawned with `--session` (backoff 2 s → 60 s, reset after 60 s up), at once when the engine stopped it
+  itself. qwen at `medium` at every (re)spawn: `--model` is always passed (on `--session` pi would restore
+  the session's own model, e.g. Claude after a switch), and before the first prompt the bridge reads
+  `get_state`, sends `set_model` back to qwen if the child runs anything else, then `set_thinking_level
+  medium`. `state().model` is what the child really runs; `status` is `starting` until that is done and
+  the tools line is in.
+- **The agent engine flag stays the agents' gate.** Without `EVEN_BRIDGE_DURABLE_ENGINE_LETSCODE` the engine
+  exists for `dur-assistant` only: lets-code agent rows left from an earlier `lc=on` start are not routed
+  to it (they behave as on `main` with the flag off), and the engine refuses agent prompts and resumed agent
+  runs (`agentsOff`); its sandbox setting stays on.
+- **Per-run caps (A0).** Deadline `ASSISTANT_RUN_DEADLINE_S = 20` (`EVEN_BRIDGE_ASSISTANT_DEADLINE_S`)
+  and `ASSISTANT_MAX_TOOL_CALLS = 8` (the 9th `tool_execution_start` trips it; A2's extension blocks
+  the 9th call itself): RPC `abort`, an error frame `code: "assistant_deadline" | "assistant_tool_cap"`,
+  the run task fails; a child still busy `ASSISTANT_ABORT_GRACE_MS = 2000` later is stopped and respawned
+  with `--session`, so the next prompt never meets "Agent is already processing". The agents' turn cap
+  (40) and repeat cap (8 identical calls) apply too. No overseer audit line (it is no agent). The deadline
+  runs from the run's first prompt: a steer or follow-up joins that run and shares its 20 s.
+- **No resume.** A run cut by a bridge restart or a crash (task attempt > 1) is not continued: the note
+  `(bridge restarted; your last answer was lost. Do not answer or continue that interrupted request unless
+  the user asks for it again.)` is queued (the cut user message stays in the session; A2's context hook
+  also stubs it), the frame
+  `{type:"error", code:"assistant_restarted", message:"I lost that one, please ask again."}` goes out,
+  the task ends `aborted`. That frame goes out while the bridge starts (before any client can listen), so
+  `GET /api/assistant/state` also carries `lost: {requestId, at}` (the cut run's own requestId). A retry with
+  that requestId is deduplicated (nothing runs): the shim checks `lost` first.
+- **Notes** (`POST /api/assistant/note`, restart, hand-off) are files
+  `<store>/lc-sessions/dur-assistant-notes/<ms>.txt` (0600, dir 0700) sent as `/even-note <file>` (the
+  extension reads, deletes and `sendMessage`s it with `triggerTurn:false`: no run). Queued while a run
+  is busy or the child is down, sent after `agent_end` / the next spawn (files a previous process left in
+  that dir are sent again at start, oldest first), and only once the child printed
+  `[even-assistant] tools: N (<source>)` (so `/even-note` is never sent to a child without the extension).
+- **Tools line.** `N = 0` (or no line within 3 s) → `POST /api/assistant/prompt` answers 503
+  `assistant tools not loaded`; `GET /api/assistant/state` shows `toolsLoaded`, `toolsSource`.
+- **Dialogs** never reach the phone: `{type:"assistant_dialog", id, method, title, options}` frames,
+  answered with `POST /api/assistant/dialog {id, value|confirmed|cancelled}`; `editor` is cancelled.
+- **Model and thinking** (`POST /api/assistant/model`, idle only, else 409 `assistant is busy`):
+  `set_thinking_level` follows **every** `set_model` (pi resets the level to `settings.json`
+  `modelThinkingLevels` on a switch; A0). A switch to `Anthropic/claude-*` from a non-Claude model hands
+  off first (ruling 32) and is refused with 409 while anything listens on `127.0.0.1:8795`: the child
+  would host the lets-code Claude proxy there itself, and a second proxy cannot bind it.
+- **Hand-off / daily reset** (04:00 local, task `even.assistant-nightly` of the assistant's conversation,
+  busy → again in 10 min; also `POST /api/assistant/reset`): RPC `compact {customInstructions:
+  ASSISTANT_HANDOFF}` ("Keep open questions, pending tasks and the user's stated plans. Do not copy
+  calendar events, notes, quick-list items or any other phone data … write "(phone data left out; fetch it
+  again)" instead …") → `new_session` → the note `Summary of the earlier
+  conversation:\n<summary>`; the record follows the new session file. A failed compact still resets
+  (`new_session` + the note `(the earlier conversation was reset; no summary of it was kept)`).
+  `POST /api/assistant/compact` compacts the current session only.
+- **Core memory** (`~/.pi/agent/core-memory/projects/assistant-<sha1(cwd)[0:8]>/memory.jsonl`, A0) is
+  read by the child only at `session_start` (a `new_session` or a respawn), and the child's next
+  `remember`/`forget` saves its cached entries over the file. Nothing in the bridge writes the store;
+  the reset path is the only point where a change made outside the child is picked up. The one-time
+  import (Task A5) runs while the assistant is off (ruling 36).
+- **Phone Terminal:** listed right after `dur-overseer` as "Even AI" with `readOnly: true`; history,
+  status and watch work; prompt, stop, forget, interrupt and question answers are 403
+  `Even AI is read-only here`.
+
+Where A1 differs from the plan text (A0 findings and the A1 real run, `docs/assistant-spike.md` § A1):
+`--no-mandate --approve` in the argv and `<cwd>/.pi/settings.json` written by the bridge; the run deadline,
+the tool-call cap and the grace stop/respawn; `set_thinking_level` after every `set_model`; the port-8795
+check before a Claude switch; the compact fallback (`new_session` with the no-summary note);
+`ASSISTANT_HANDOFF` says to leave phone data out (explicitly, with a placeholder); `ASSISTANT_RESTART_NOTE`
+says not to continue the cut request; `--model` always plus the post-spawn model/thinking sync; the
+assistant API token; the scope name carries
+the store; interrupt and question answers from the phone are 403 too; `state().lost`; and the optional
+`EVEN_BRIDGE_ASSISTANT_EXT`, `_CWD`, `_DEADLINE_S` (smoke runs).
+
+**Auth.** `/api/assistant/*` takes only the assistant API token: `Authorization: Bearer <contents of
+EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE>` (default `~/.even-terminal/assistant-api.token`, created 0600 with a
+random value at the first start with the flag on; the shim reads it). The bridge token, which the phone
+holds, gets 403 there, and the assistant token opens nothing else (401). A token file that is missing and
+cannot be created, empty, shorter than 16 characters or unreadable means no token: every `/api/assistant/*`
+request gets 503 `the assistant API token is not set up` (a startup warning says so); an empty token is
+never compared. Events stay on
+`GET /api/events?sessionId=dur-assistant` with the bridge token (read-only).
+
+**Deploy note.** The first start with the flag on adds a `meta` table to the session map
+(`<store>.sessions.sqlite`): back up `~/.even-terminal/durable.sqlite*` first (global constraint).
+
+Routes (all fall through to the official 404 unless the flag is on): `POST /api/assistant/prompt
+{text 1–4000, requestId 1–128, whenBusy?: steer|followUp}` (a text starting with `/` after leading
+whitespace is 400 `slash_command_refused`: no pi/lets-code command such as `/even-note` is reachable from
+the prompt route; notes go through `/api/assistant/note`) → 202 `{ok, requestId, deduped}` | 503
+`assistant not ready` | 503 `assistant tools not loaded` | 409 (hand-off running, capped run ending);
+`POST /api/assistant/{interrupt,reset,compact}` → `{ok:true}`; `POST /api/assistant/model {model?,
+thinking?}` → `{model, thinking}`; `POST /api/assistant/note {text}` → `{ok, queued}`; `POST
+/api/assistant/dialog`; `GET /api/assistant/state` → `{status: busy|idle|starting|down, model, thinking,
+toolsLoaded, toolsSource, sessionFile, lastResetAt, lost}`. Events: `GET /api/events?sessionId=dur-assistant`.
 
 ## The overseer (`EVEN_BRIDGE_OVERSEER_ENABLE=1`)
 

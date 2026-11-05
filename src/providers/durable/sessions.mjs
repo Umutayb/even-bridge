@@ -198,6 +198,29 @@ export class SessionMap {
     this.stmt.touch.run(this.now(), sid);
   }
 
+  /**
+   * A small key/value table (the assistant's conversation id, its last reset). Created on first use only,
+   * so a bridge that never uses it keeps the map file it had.
+   */
+  metaStmt() {
+    if (!this.stmtMeta) {
+      this.db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)");
+      this.stmtMeta = {
+        get: this.db.prepare("SELECT value FROM meta WHERE key = ?"),
+        set: this.db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"),
+      };
+    }
+    return this.stmtMeta;
+  }
+
+  getMeta(key) {
+    return this.metaStmt().get.get(String(key))?.value ?? undefined;
+  }
+
+  setMeta(key, value) {
+    this.metaStmt().set.run(String(key), value == null ? null : String(value));
+  }
+
   archive(sid) {
     this.stmt.archive.run(sid);
   }

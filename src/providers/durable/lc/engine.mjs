@@ -49,6 +49,8 @@ import {
   lcSandboxAvailable,
   removeStaleRegistry,
   resetFailedScope,
+  resetFailedUnit,
+  stopScopeUnits,
   sealProjectPi,
   tracksDotPi,
   stopLcScopes,
@@ -56,10 +58,10 @@ import {
 } from "./launch.mjs";
 import { LC_ANSWER, LC_ANSWER_MAX, LC_TOOL, LC_USER, LcSessionDoc, lcSessionInitial } from "./record.mjs";
 import { LcSession } from "./session.mjs";
-import { LC_CAP, LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_EXIT, LC_RESTART_LIMIT, LC_RUN_TASK, createLcRunTask } from "./task.mjs";
+import { LC_CAP, LC_CRASH_PROMPT, LC_CUTOFF_PROMPT, LC_EXIT, LC_NO_RESUME, LC_RESTART_LIMIT, LC_RUN_TASK, createLcRunTask } from "./task.mjs";
 
 // What the provider needs besides the engine (it imports only this module, lazily).
-export { stopLcScopes } from "./launch.mjs";
+export { stopLcScopes, stopScopeUnits } from "./launch.mjs";
 export { LC_RUN_TASK } from "./task.mjs";
 
 export const LC_IDLE_KEEP_MS = 120_000;
@@ -176,6 +178,7 @@ export function createLcEngine({
   repeatMax = LC_REPEAT_MAX,
   capAbortMs = LC_CAP_ABORT_MS,
   onCap = () => {},
+  agentsOff = false,
 } = {}) {
   const turnCap = lcTurnCap(maxTurns, (m) => log.warn?.(`[durable:lc] ${m}`));
   const mem = memoryController ?? lcMemoryControllerAvailable();
@@ -187,6 +190,14 @@ export function createLcEngine({
 
   /** sid → state */
   const states = new Map();
+  /**
+   * sid → a session profile other than the glasses agent (the Even AI assistant, Task A1): its own launch
+   * and session class, no admission (sandbox, live limit), no idle stop, no seal or factory, its own caps
+   * (deadline, tool calls), no resume after a restart (attempt > 1), and an exit hook (it stays warm).
+   * Added with `engine.addProfile(sid, profile)` before its first spawn.
+   */
+  const profiles = new Map();
+  const profileOf = (sid) => profiles.get(sid) ?? null;
   /** sid → the last launch (tests read it) */
   const launches = new Map();
   let closed = false;
@@ -241,7 +252,9 @@ export function createLcEngine({
   };
   const stopScope = (sid) => {
     try {
-      stopLcScopes([sid], { env: scopeEnv, run });
+      const prof = profileOf(sid);
+      if (prof?.unit) stopScopeUnits([prof.unit], { env: scopeEnv, run });
+      else stopLcScopes([sid], { env: scopeEnv, run });
     } catch (err) {
       log.warn?.(`[durable:lc] scope stop ${sid} failed: ${err.message}`);
     }
@@ -281,9 +294,10 @@ export function createLcEngine({
    * idle-kept child of another session is stopped (awaited) to make room.
    */
   async function admit(sid) {
+    if (sid && profileOf(sid)) return; // its own slot (the assistant): never counted, no sandbox (no shell tools)
     if (!sandboxOk) throw httpError(503, LC_SANDBOX_MISSING);
     if (sid && isLive(S(sid))) return;
-    const live = [...states.values()].filter((s) => s.sid !== sid && !s.stopping && (isLive(s) || s.busy || s.reserved));
+    const live = [...states.values()].filter((s) => s.sid !== sid && !profileOf(s.sid) && !s.stopping && (isLive(s) || s.busy || s.reserved));
     if (live.length < maxLive) return;
     const spare = live.find((s) => idleKept(s));
     if (spare) {
@@ -305,7 +319,7 @@ export function createLcEngine({
     const s = S(sid);
     clearTimeout(s.idleTimer);
     s.idleTimer = null;
-    if (closed || !s.session?.running) return;
+    if (closed || !s.session?.running || profileOf(sid)) return; // a profile session (the assistant) stays warm
     s.idleTimer = setTimeout(() => {
       s.idleTimer = null;
       if (s.busy || s.session?.openDialogs().length) return; // a held dialog keeps the child (ruling 1)
@@ -361,6 +375,16 @@ export function createLcEngine({
       w.reject(err);
     }
     for (const m of s.modeWaiters.splice(0)) m.reject(httpError(504, "lets-code did not confirm the mode"));
+    clearTimeout(s.deadlineTimer);
+    s.deadlineTimer = null;
+    const prof = profileOf(sid);
+    if (prof?.onExit) {
+      try {
+        prof.onExit({ code, signal, expected, closed });
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: exit hook failed: ${err.message}`);
+      }
+    }
   }
 
   /** lets-code refused a `/factory start`: an error frame, the answer entry and `record.lastError` (the shim reads it). */
@@ -543,6 +567,8 @@ export function createLcEngine({
       const sessionDir = join(storeDir, "lc-sessions", sid);
       mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
       const resume = rec.piSessionFile && existsSync(rec.piSessionFile) ? rec.piSessionFile : undefined;
+      const prof = profileOf(sid);
+      if (prof) return startProfileChild(sid, prof, { row, sessionDir, resume });
       // lets-code's subagents are plain pi processes in this cwd without our `-e`: they get the guard
       // from the project-local copy (trusted by the parent's even-guard.ts, see there).
       // The guard rewritten, anything else in .pi quarantined: a project that cannot be sealed gets no child
@@ -621,6 +647,69 @@ export function createLcEngine({
     }
   }
 
+  /** The child of a profile session (the assistant): its own launch and session class, nothing of the agents' seal/factory. */
+  async function startProfileChild(sid, prof, { row, sessionDir, resume }) {
+    const s = S(sid);
+    if (wrapper === "systemd-run" && prof.unit) resetFailedUnit(prof.unit, { env: scopeEnv, run });
+    const launch = prof.launch({ sessionDir, resume, caps: effectiveCaps, wrapper, bin, baseEnv, childEnv });
+    launches.set(sid, launch);
+    const opts = {
+      sid,
+      bin: launch.bin,
+      wrap: spawnWrap(launch.wrap),
+      envExact: true,
+      env: launch.env,
+      extraArgs: launch.extraArgs,
+      resume: launch.resume ?? resume,
+      name: row.name,
+      cwd: row.cwd,
+      now,
+      clientCount: () => clientCount(sid),
+      onNotify: (text, type) => prof.onNotify?.(text, type),
+      onAgentEnd: (sess) => finish(sid, sess),
+      onToolEnd: (name, args) => {
+        if (++s.tools <= LC_TOOL_ENTRIES_MAX) writeEntry(sid, LC_TOOL, summarizePiToolCall(name, args));
+        else s.toolsDropped += 1;
+      },
+      onActivity: () => markSent(sid),
+      onTurnEnd: (sess) => countTurn(sid, sess),
+      onToolStart: (name, args) => countCall(sid, session, name, args),
+      onExit: (sess, info) => onChildExit(sid, sess, info),
+    };
+    const session = prof.createSession(emitTo, opts);
+    s.session = session;
+    try {
+      await session.start();
+    } catch (err) {
+      if (s.session === session) s.session = null;
+      throw err;
+    }
+    if (session.sessionId) claim(session.sessionId, "durable");
+    await updateRecord(sid, (d) => {
+      d.piSessionId = session.sessionId ?? d.piSessionId;
+      d.piSessionFile = session.sessionFile ?? d.piSessionFile;
+      d.childPid = session.childPid || null;
+      d.label = row.name;
+      d.cwd = row.cwd;
+      d.model = prof.model?.() ?? d.model;
+    });
+    if (prof.afterStart) {
+      try {
+        await prof.afterStart(session);
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: after-start hook failed: ${err.message}`);
+      }
+      await updateRecord(sid, (d) => {
+        d.model = prof.model?.() ?? d.model;
+      });
+    }
+    try {
+      prof.onSpawn?.(session);
+    } catch (err) {
+      log.warn?.(`[durable:lc] ${sid}: spawn hook failed: ${err.message}`);
+    }
+  }
+
   /** A run ended (agent_end, or a command's response): record the answer, wake drive(), keep the child a while. */
   function finish(sid, session) {
     const s = S(sid);
@@ -645,9 +734,23 @@ export function createLcEngine({
     s.capped = null;
     clearTimeout(s.capTimer);
     s.capTimer = null;
+    clearTimeout(s.deadlineTimer);
+    s.deadlineTimer = null;
     if (capped) w?.reject(capError(capped.message));
     else w?.resolve({ lastLine });
     armIdle(sid);
+    runEnded(sid);
+  }
+
+  /** A profile session went idle (its queued notes go out now). */
+  function runEnded(sid) {
+    const prof = profileOf(sid);
+    if (!prof?.onRunEnd) return;
+    try {
+      prof.onRunEnd();
+    } catch (err) {
+      log.warn?.(`[durable:lc] ${sid}: run-end hook failed: ${err.message}`);
+    }
   }
 
   const capError = (message) => Object.assign(new Error(message), { code: LC_CAP });
@@ -682,7 +785,15 @@ export function createLcEngine({
       s.lastCall = key;
       s.repeats = 1;
     }
-    if (s.repeats >= repeatMax) capRun(sid, { message: lcRepeatCapMessage(name, s.repeats), reason: "repeat", tool: name, repeats: s.repeats, turns: s.turns });
+    if (s.repeats >= repeatMax) {
+      capRun(sid, { message: lcRepeatCapMessage(name, s.repeats), reason: "repeat", tool: name, repeats: s.repeats, turns: s.turns });
+      return;
+    }
+    const prof = profileOf(sid);
+    s.calls = (s.calls ?? 0) + 1;
+    if (prof?.maxToolCalls && s.calls > prof.maxToolCalls) {
+      capRun(sid, { message: prof.toolCapMessage?.(prof.maxToolCalls) ?? `run stopped: more than ${prof.maxToolCalls} tool calls`, reason: "tools", code: prof.toolCapCode, calls: s.calls, turns: s.turns });
+    }
   }
 
   /**
@@ -695,17 +806,24 @@ export function createLcEngine({
     const session = s.session;
     s.capped = info;
     const row = map.get(sid);
+    const prof = profileOf(sid);
     log.warn?.(`[durable:lc] ${sid}: ${info.message}`);
-    emitTo(sid, { type: "error", message: info.message });
+    emitTo(sid, { type: "error", message: info.message, ...(info.code ? { code: info.code } : {}) });
     updateRecord(sid, (d) => {
       d.lastError = { text: info.message, at: now(), reason: LC_CAP_REASON };
     });
-    try {
-      const { message, ...rest } = info;
-      onCap({ sid, label: row?.name ?? null, message, ...rest });
-    } catch (err) {
-      log.warn?.(`[durable:lc] ${sid}: cap hook failed: ${err.message}`);
+    clearTimeout(s.deadlineTimer);
+    s.deadlineTimer = null;
+    // The overseer's audit is about agents; a profile session (the assistant) is not one.
+    if (!prof) {
+      try {
+        const { message, code: _code, ...rest } = info;
+        onCap({ sid, label: row?.name ?? null, message, ...rest });
+      } catch (err) {
+        log.warn?.(`[durable:lc] ${sid}: cap hook failed: ${err.message}`);
+      }
     }
+    const graceMs = prof?.abortGraceMs ?? capAbortMs;
     session?.interrupt();
     clearTimeout(s.capTimer);
     s.capTimer = setTimeout(() => {
@@ -722,9 +840,10 @@ export function createLcEngine({
       w?.reject(capError(info.message));
       if (dropped) emitTo(sid, { type: "error", message: lcCapDroppedMessage(dropped) });
       emitTo(sid, { type: "status", state: "idle", sessionId: sid });
-      log.warn?.(`[durable:lc] ${sid}: no turn end ${capAbortMs} ms after the cap abort; stopping the child`);
+      log.warn?.(`[durable:lc] ${sid}: no turn end ${graceMs} ms after the cap abort; stopping the child`);
       stopChild(sid).catch(() => {});
-    }, capAbortMs);
+      runEnded(sid);
+    }, graceMs);
     s.capTimer.unref?.();
   }
 
@@ -756,8 +875,9 @@ export function createLcEngine({
     admit,
 
     /** A new or idle session's prompt starts a run task; a busy one's steers. Retried requestIds are dropped. */
-    async prompt(sid, text, { requestId } = {}) {
+    async prompt(sid, text, { requestId, whenBusy = "steer" } = {}) {
       if (closed) throw httpError(503, "durable provider is shut down");
+      if (agentsOff && !profileOf(sid)) throw httpError(400, "the lets-code engine is off");
       const s = S(sid);
       if (requestId && s.requestIds.has(requestId)) return { deduped: true };
       const id = convIdOf(sid);
@@ -767,8 +887,9 @@ export function createLcEngine({
         if (s.capped) throw httpError(409, `${s.capped.message}; send the prompt again once it is idle`);
         const rec = await readRecord(sid);
         if (requestId && rec.lastRequestId === requestId) return { deduped: true };
-        if (s.session?.running && !s.starting && s.waiter) await s.session.steer(text);
-        else s.queued.push(text); // the child is (re)starting: sent right after the run's prompt
+        const follow = whenBusy === "followUp" && typeof s.session?.followUp === "function";
+        if (s.session?.running && !s.starting && s.waiter) await (follow ? s.session.followUp(text) : s.session.steer(text));
+        else s.queued.push(follow ? { text, whenBusy: "followUp" } : text); // the child is (re)starting: sent right after the run's prompt
         if (requestId) remember(s, requestId); // only once it was steered or queued
         writeEntry(sid, LC_USER, text);
         if (requestId) updateRecord(sid, (d) => (d.lastRequestId = requestId));
@@ -809,8 +930,10 @@ export function createLcEngine({
     },
 
     /** The run task's phase (see task.mjs). Resolves at the end of the run; rejects LC_EXIT when the child died mid-turn. */
-    async drive(sid, { text, attempt, taskId }, signal) {
+    async drive(sid, { text, attempt, taskId, requestId }, signal) {
       const s = S(sid);
+      // The engine of the assistant alone (agent engine flag off) never runs an agent, not even a resumed run.
+      if (agentsOff && !profileOf(sid)) throw new Error("the lets-code engine is off");
       const row = map.get(sid);
       if (!row || row.archived) throw new Error("the session is gone");
       s.busy = true;
@@ -823,10 +946,29 @@ export function createLcEngine({
       if (s.capTask !== (taskId ?? null) || taskId == null) {
         // A new run (a crash retry of the same task keeps its counts).
         s.capTask = taskId ?? null;
-        s.turns = s.repeats = 0;
+        s.turns = s.repeats = s.calls = 0;
         s.lastCall = null;
       }
       let send = text;
+      const prof = profileOf(sid);
+      if (attempt > 1 && prof?.noResume) {
+        // The assistant never resumes a cut turn (ruling 23): its hook queues the "lost" note and tells the shim.
+        const crashed = s.crashed;
+        const { lastRequestId } = await readRecord(sid).catch(() => ({}));
+        s.crashed = false;
+        s.busy = false;
+        s.taskId = null;
+        s.queued = [];
+        s.waiter = null;
+        try {
+          prof.onNoResume?.({ attempt, crashed, requestId: requestId ?? lastRequestId ?? null });
+        } catch (err) {
+          log.warn?.(`[durable:lc] ${sid}: no-resume hook failed: ${err.message}`);
+        }
+        emitTo(sid, { type: "status", state: "idle", sessionId: sid });
+        runEnded(sid);
+        throw Object.assign(new Error("the run was cut off and is not resumed"), { code: LC_NO_RESUME });
+      }
       if (attempt > 1) {
         const rec = await readRecord(sid);
         removeStaleRegistry(rec.childPid, { root: registryRoot });
@@ -862,9 +1004,21 @@ export function createLcEngine({
       });
       done.catch(() => {});
       s.pendingSend = taskId ?? null;
+      if (prof?.deadlineMs > 0) {
+        clearTimeout(s.deadlineTimer);
+        s.deadlineTimer = setTimeout(() => {
+          s.deadlineTimer = null;
+          if (s.session !== session || !s.waiter || s.capped) return;
+          capRun(sid, { message: prof.deadlineMessage?.(prof.deadlineMs) ?? `run stopped after ${prof.deadlineMs} ms (deadline)`, reason: "deadline", code: prof.deadlineCode, turns: s.turns });
+        }, prof.deadlineMs);
+        s.deadlineTimer.unref?.();
+      }
       const sent = session.runLc(send);
-      // Steers that arrived while the child was starting.
-      for (const q of s.queued.splice(0)) session.steer(q).catch(() => {});
+      // Steers (or follow-ups) that arrived while the child was starting.
+      for (const q of s.queued.splice(0)) {
+        if (typeof q === "object" && q?.whenBusy === "followUp") session.followUp(q.text).catch(() => {});
+        else session.steer(typeof q === "object" ? q.text : q).catch(() => {});
+      }
       sent.then(
         (res) => {
           if (res && res.success !== false) markSent(sid);
@@ -893,6 +1047,8 @@ export function createLcEngine({
     /** The run task ended without an answer (limit, error): say so and go idle. */
     runFailed(sid, message) {
       const s = S(sid);
+      clearTimeout(s.deadlineTimer);
+      s.deadlineTimer = null;
       s.queued = []; // steers of a run that ended without an answer are stale
       s.busy = false;
       s.taskId = null;
@@ -900,11 +1056,14 @@ export function createLcEngine({
       emitTo(sid, { type: "error", message });
       emitTo(sid, { type: "status", state: "idle", sessionId: sid });
       armIdle(sid);
+      runEnded(sid);
     },
 
     /** The task's abort handler: cancel dialogs, abort the turn, stop the child. */
     async abortChild(sid) {
       const s = S(sid);
+      clearTimeout(s.deadlineTimer);
+      s.deadlineTimer = null;
       s.busy = false;
       s.taskId = null;
       s.queued = [];
@@ -1105,7 +1264,7 @@ export function createLcEngine({
     },
 
     liveCount() {
-      return [...states.values()].filter((s) => s.session?.running).length;
+      return [...states.values()].filter((s) => s.session?.running && !profileOf(s.sid)).length;
     },
 
     /** Bridge shutdown: children and their scopes stop; run tasks stay pending (a restart resumes them). */
@@ -1118,6 +1277,8 @@ export function createLcEngine({
         s.idleTimer = null;
         clearTimeout(s.capTimer);
         s.capTimer = null;
+        clearTimeout(s.deadlineTimer);
+        s.deadlineTimer = null;
         stopFactoryWatch(s.sid);
         clearInterval(s.sealTimer);
         s.sealTimer = null;
@@ -1128,7 +1289,41 @@ export function createLcEngine({
           s.session = null;
         }
       }
-      if (sids.length) stopLcScopes(sids, { env: scopeEnv, run });
+      const units = sids.map((sid) => profileOf(sid)?.unit).filter(Boolean);
+      const plain = sids.filter((sid) => !profileOf(sid)?.unit);
+      if (plain.length) stopLcScopes(plain, { env: scopeEnv, run });
+      if (units.length) stopScopeUnits(units, { env: scopeEnv, run });
+    },
+
+    /** Register a profile session (see `profiles`); before its first spawn. */
+    addProfile(sid, profile) {
+      profiles.set(sid, profile);
+    },
+
+    /** The live child session of `sid`, or null (a profile's own RPC calls: compact, set_model, …). */
+    session(sid) {
+      const s = states.get(sid);
+      return s?.session?.running ? s.session : null;
+    },
+
+    /** Spawn the child of `sid` unless one runs (a profile's warm start). @returns {Promise<boolean>} whether it spawned */
+    ensureChild(sid) {
+      if (closed) return Promise.reject(httpError(503, "durable provider is shut down"));
+      return ensureChild(sid);
+    },
+
+    /** Stop the child of `sid` (and its scope). */
+    stopChild(sid) {
+      return stopChild(sid);
+    },
+
+    /** Change the record of `sid` (a profile's new session file after `new_session`). */
+    updateRecord(sid, change) {
+      return updateRecord(sid, change);
+    },
+
+    get closed() {
+      return closed;
     },
 
     _states: states,

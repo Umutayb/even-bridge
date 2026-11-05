@@ -206,6 +206,11 @@ export class PiSession {
       ...this.opts,
       onStderr: (line) => {
         if (line.trim()) console.error(`[pi stderr] ${line}`);
+        try {
+          this.opts.onStderr?.(line); // a subclass's own reader (the lets-code assistant's tools line)
+        } catch {
+          /* a reader never breaks the stream */
+        }
       },
     });
     this.client = client;

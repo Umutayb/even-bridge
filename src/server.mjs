@@ -12,7 +12,9 @@
 // untouched; extended sessions are served from the shared ring by the hub.
 
 import http from "node:http";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import express from "express";
@@ -77,6 +79,39 @@ export function durableOptions(env = process.env) {
   if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
   const lc = lcOptions(env);
   if (lc) opts.lc = lc;
+  const assistant = assistantOptions(env);
+  if (assistant) opts.assistant = assistant;
+  return opts;
+}
+
+/**
+ * The Even AI assistant (`dur-assistant` on the lets-code engine, /api/assistant/*, Task A1):
+ * EVEN_BRIDGE_ASSISTANT_ENABLE=1, and only with the durable provider on (not the agent engine flag).
+ */
+export function assistantEnabled(env = process.env) {
+  return durableEnabled(env) && String(env.EVEN_BRIDGE_ASSISTANT_ENABLE ?? "").trim() === "1";
+}
+
+/**
+ * The assistant's options, or null when off: the shim's tool server and its token file (a path; the
+ * child reads the token itself). Optional, only when set: the bin (EVEN_BRIDGE_LC_BIN, else
+ * EVEN_BRIDGE_PI_BIN, else lets-code), the extension (EVEN_BRIDGE_ASSISTANT_EXT, default A2's
+ * even-assistant.ts), the cwd (EVEN_BRIDGE_ASSISTANT_CWD, default ~/sandbox/assistant; smoke runs) and a
+ * run deadline in seconds (EVEN_BRIDGE_ASSISTANT_DEADLINE_S, default 20).
+ */
+export function assistantOptions(env = process.env) {
+  if (!assistantEnabled(env)) return null;
+  const opts = {
+    toolsUrl: env.EVEN_BRIDGE_ASSISTANT_TOOLS_URL || "http://127.0.0.1:8814",
+    tokenFile: env.EVEN_BRIDGE_ASSISTANT_TOKEN_FILE || "~/even-app/shim-data/assistant_tools.token",
+  };
+  const bin = env.EVEN_BRIDGE_LC_BIN || env.EVEN_BRIDGE_PI_BIN;
+  if (bin) opts.bin = bin;
+  if (env.EVEN_BRIDGE_ASSISTANT_EXT) opts.ext = env.EVEN_BRIDGE_ASSISTANT_EXT;
+  // A throwaway bridge's own cwd (its core-memory store is keyed by the cwd; the live one is ~/sandbox/assistant).
+  if (env.EVEN_BRIDGE_ASSISTANT_CWD) opts.cwd = env.EVEN_BRIDGE_ASSISTANT_CWD;
+  const d = Number(env.EVEN_BRIDGE_ASSISTANT_DEADLINE_S);
+  if (env.EVEN_BRIDGE_ASSISTANT_DEADLINE_S != null && Number.isFinite(d) && d > 0 && d <= 600) opts.deadlineMs = Math.round(d * 1000);
   return opts;
 }
 
@@ -105,6 +140,69 @@ export function lcOptions(env = process.env) {
  */
 export function overseerEnabled(env = process.env) {
   return durableEnabled(env) && String(env.EVEN_BRIDGE_OVERSEER_ENABLE ?? "").trim() === "1";
+}
+
+/** Where the assistant API token lives (EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE). */
+export const ASSISTANT_API_TOKEN_FILE = "~/.even-terminal/assistant-api.token";
+
+/**
+ * The token /api/assistant/* takes (and the only one): the shim reads it from this file. The bridge token
+ * (the phone's) is refused there with 403, so the phone cannot prompt, reset or switch the assistant.
+ * Created 0600 with a random value when missing. @returns {() => string|null} a reader (the file may be rotated)
+ */
+export function assistantApiToken(env = process.env, home = homedir()) {
+  const raw = env.EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE || ASSISTANT_API_TOKEN_FILE;
+  const file = raw === "~" ? home : raw.startsWith("~/") ? home + raw.slice(1) : raw;
+  if (!existsSync(file)) {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    writeFileSync(file, randomBytes(24).toString("hex") + "\n", { mode: 0o600, flag: "wx" });
+  }
+  chmodSync(file, 0o600);
+  return () => {
+    try {
+      const t = readFileSync(file, "utf8").trim();
+      return t.length >= ASSISTANT_API_TOKEN_MIN ? t : null; // empty or short: no token at all
+    } catch {
+      return null;
+    }
+  };
+}
+
+/** The shortest assistant API token accepted (a shorter or empty file means: no token, every request refused). */
+export const ASSISTANT_API_TOKEN_MIN = 16;
+
+const sameToken = (a, b) => {
+  if (typeof a !== "string" || typeof b !== "string" || !a || !b) return false;
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+};
+
+/**
+ * The gate of /api/assistant/*: only the assistant API token passes (marks `req.evenAssistantAuth`).
+ * No usable expected token (file missing, empty, shorter than ASSISTANT_API_TOKEN_MIN, unreadable, or never
+ * created) → 503 for every request, whatever was sent; the bridge (phone) token → 403; anything else → 401.
+ * @param {{ reader: () => string|null, allowedTokens: Set<string>, warn?: (line: string) => void }} o
+ */
+export function createAssistantAuth({ reader, allowedTokens, warn = (l) => console.warn(l) }) {
+  return (req, res, next) => {
+    const want = reader?.() ?? null;
+    if (typeof want !== "string" || want.length < ASSISTANT_API_TOKEN_MIN) {
+      warn(`[auth] 503 ${req.method} ${redactTokenQueryParam(req.originalUrl)}: no usable assistant API token`);
+      return res.status(503).json({ error: "the assistant API token is not set up" });
+    }
+    const header = req.headers.authorization;
+    const provided = header?.startsWith("Bearer ") ? header.slice(7) : req.query?.token;
+    if (sameToken(provided, want)) {
+      req.evenAssistantAuth = true;
+      return next();
+    }
+    if (typeof provided === "string" && allowedTokens?.has(provided)) {
+      return res.status(403).json({ error: "the assistant routes take the assistant API token, not the bridge token" });
+    }
+    warn(`[auth] 401 ${req.method} ${redactTokenQueryParam(req.originalUrl)} (ip=${req.ip})`);
+    res.status(401).json(INFO_AUTH_ERROR);
+  };
 }
 
 /** The provider's DEFAULT_AGENT_ROOT (mirrored: server.mjs must not import the provider when off). */
@@ -222,6 +320,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
       durableState = `on wrapper=${p.wrapper ?? "none"} lc=${p.lcBanner ?? "off"}`;
+      if (durableOpts.assistant) durableState += ` assistant=${p.assistant ? "on" : `failed: ${p.assistantError?.message ?? "not set up"}`}`;
     } catch (err) {
       durableState = `failed: ${err.message}`;
       p?.stopAll().catch(() => {});
@@ -311,6 +410,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
     overseer,
     infoCache,
+    assistant: durableProvider?.assistant ?? null,
   });
 
   // ── App (mirrors dist/index.js) ───────────────────────────────────────────
@@ -332,7 +432,22 @@ export async function startServer({ flags = {}, cwd } = {}) {
     handleHookRequest(req, res, emitBridgeMessage, claudeSyncTransport);
   });
 
+  // /api/assistant/* takes only the assistant API token (the shim's); the bridge token is the phone's.
+  if (durableOpts?.assistant) {
+    let assistantToken = () => null;
+    try {
+      assistantToken = assistantApiToken(process.env);
+    } catch (err) {
+      console.warn(`[bridge] assistant API token unavailable (${err.message}); /api/assistant/* answers 503 to every request`);
+    }
+    if (!assistantToken()) {
+      console.warn(`[bridge] the assistant API token file is missing, empty, unreadable or shorter than ${ASSISTANT_API_TOKEN_MIN} characters; /api/assistant/* answers 503 to every request`);
+    }
+    app.use("/api/assistant", createAssistantAuth({ reader: assistantToken, allowedTokens: ALLOWED_TOKENS }));
+  }
+
   function auth(req, res, next) {
+    if (req.evenAssistantAuth && req.originalUrl.startsWith("/api/assistant/")) return next();
     const header = req.headers.authorization;
     const queryToken = req.query.token;
     const provided = header?.startsWith("Bearer ") ? header.slice(7) : queryToken;
