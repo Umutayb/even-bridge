@@ -383,7 +383,8 @@ Code: `src/providers/durable/lc/assistant.mjs` (profile, routes' backend, nightl
 - **No resume.** A run cut by a bridge restart or a crash (task attempt > 1) is not continued: the note
   `(bridge restarted; your last answer was lost)` is queued, the frame
   `{type:"error", code:"assistant_restarted", message:"I lost that one, please ask again."}` goes out,
-  the task ends `aborted`.
+  the task ends `aborted`. That frame goes out while the bridge starts (before any client can listen), so
+  `GET /api/assistant/state` also carries `lost: {requestId, at}` (the last accepted requestId of the cut run).
 - **Notes** (`POST /api/assistant/note`, restart, hand-off) are files
   `<store>/lc-sessions/dur-assistant-notes/<ms>.txt` (0600, dir 0700) sent as `/even-note <file>` (the
   extension reads, deletes and `sendMessage`s it with `triggerTurn:false`: no run). Queued while a run
@@ -400,8 +401,9 @@ Code: `src/providers/durable/lc/assistant.mjs` (profile, routes' backend, nightl
   would host the lets-code Claude proxy there itself, and a second proxy cannot bind it.
 - **Hand-off / daily reset** (04:00 local, task `even.assistant-nightly` of the assistant's conversation,
   busy → again in 10 min; also `POST /api/assistant/reset`): RPC `compact {customInstructions:
-  ASSISTANT_HANDOFF}` ("Keep open questions, pending tasks and the user's stated plans. Leave out
-  calendar, notes and quick-list contents …") → `new_session` → the note `Summary of the earlier
+  ASSISTANT_HANDOFF}` ("Keep open questions, pending tasks and the user's stated plans. Do not copy
+  calendar events, notes, quick-list items or any other phone data … write "(phone data left out; fetch it
+  again)" instead …") → `new_session` → the note `Summary of the earlier
   conversation:\n<summary>`; the record follows the new session file. A failed compact still resets
   (`new_session` + the note `(the earlier conversation was reset; no summary of it was kept)`).
   `POST /api/assistant/compact` compacts the current session only.
@@ -414,13 +416,21 @@ Code: `src/providers/durable/lc/assistant.mjs` (profile, routes' backend, nightl
   status and watch work; prompt, stop, forget, interrupt and question answers are 403
   `Even AI is read-only here`.
 
+Where A1 differs from the plan text (A0 findings and the A1 real run, `docs/assistant-spike.md` § A1):
+`--no-mandate --approve` in the argv and `<cwd>/.pi/settings.json` written by the bridge; the run deadline,
+the tool-call cap and the grace stop/respawn; `set_thinking_level` after every `set_model`; the port-8795
+check before a Claude switch; the compact fallback (`new_session` with the no-summary note);
+`ASSISTANT_HANDOFF` says to leave phone data out (explicitly, with a placeholder); the scope name carries
+the store; interrupt and question answers from the phone are 403 too; `state().lost`; and the optional
+`EVEN_BRIDGE_ASSISTANT_EXT`, `_CWD`, `_DEADLINE_S` (smoke runs).
+
 Routes (all fall through to the official 404 unless the flag is on): `POST /api/assistant/prompt
 {text 1–4000, requestId 1–128, whenBusy?: steer|followUp}` → 202 `{ok, requestId, deduped}` | 503
 `assistant not ready` | 503 `assistant tools not loaded` | 409 (hand-off running, capped run ending);
 `POST /api/assistant/{interrupt,reset,compact}` → `{ok:true}`; `POST /api/assistant/model {model?,
 thinking?}` → `{model, thinking}`; `POST /api/assistant/note {text}` → `{ok, queued}`; `POST
 /api/assistant/dialog`; `GET /api/assistant/state` → `{status: busy|idle|starting|down, model, thinking,
-toolsLoaded, toolsSource, sessionFile, lastResetAt}`. Events: `GET /api/events?sessionId=dur-assistant`.
+toolsLoaded, toolsSource, sessionFile, lastResetAt, lost}`. Events: `GET /api/events?sessionId=dur-assistant`.
 
 ## The overseer (`EVEN_BRIDGE_OVERSEER_ENABLE=1`)
 

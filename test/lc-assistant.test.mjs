@@ -206,7 +206,7 @@ test("constants", () => {
   assert.equal(ASSISTANT_RESTART_NOTE, "(bridge restarted; your last answer was lost)");
   assert.equal(ASSISTANT_LOST, "I lost that one, please ask again.");
   assert.match(ASSISTANT_HANDOFF, /^Keep open questions, pending tasks and the user's stated plans\./);
-  assert.match(ASSISTANT_HANDOFF, /calendar, notes and quick-list/, "the summary must not carry phone data (A0)");
+  assert.match(ASSISTANT_HANDOFF, /Do not copy calendar events, notes, quick-list items or any other phone data/, "the summary must not carry phone data (A0, A1 real run)");
   assert.equal(ASSISTANT_NOTE_CMD, "/even-note");
   assert.equal(ASSISTANT_NIGHTLY_TASK, "even.assistant-nightly");
   assert.equal(ASSISTANT_RUN_DEADLINE_S, 20);
@@ -378,6 +378,8 @@ test("a restart mid-turn writes the lost note and does not resume", async (t) =>
   const { ctx } = await b.ready;
   await until(async () => !(await b._harness.inspect(ctx)).tasks.some((x) => x.record.kind === LC_RUN_TASK), 5000, "run task ended");
   assert.equal(b.getStatus(ASSISTANT_SID).state, "idle");
+  // The frame went out before any client could listen: the state names the lost request too.
+  assert.equal(b.assistant.state().lost?.requestId, "r1");
   // The next prompt works on the respawned child.
   await b.assistant.prompt("hi", { requestId: "r2" });
   await until(() => c.mine().some((f) => f.type === "text_delta" && f.text === "ok: hi"), 5000, "answer");

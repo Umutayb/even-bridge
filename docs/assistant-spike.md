@@ -161,3 +161,61 @@ App behaviour (progress text + pause + answer, a 30 s gap after `start`, a `requ
 6. **Ruling 28 summary.** The compaction summary copies calendar and notes contents into the next session. The reset's `customInstructions` must say "no calendar, notes or list contents", and A6 should assert it.
 7. **A6 scenario.** "And Thursday?" after a Friday question resolved to next week's Thursday (12 Nov), not this week's (5 Nov). Keep the `next/this Thursday` transcripts.
 8. **Thinking cost** is small on these turns: medium 35–105 reasoning tokens. Medium thinking does not set the turn time; the tool round trip does (≈ 1.4 s of model time + the tool).
+
+## A1 (real run, 2026-11-05)
+
+The Task A1 profile on a throwaway bridge: `127.0.0.1:3466`, store `~/tmp/ovs-a1-store`, cwd
+`~/tmp/ovs-a1/assistant` (`EVEN_BRIDGE_ASSISTANT_CWD`), real `~/.local/bin/lets-code` + vLLM qwen (one
+prompt at a time), wrapper `systemd-run` (scope `even-lc-dur-assistant-b6d9903f`), a stub tool server on
+`127.0.0.1:8815` and a throwaway probe extension (`EVEN_BRIDGE_ASSISTANT_EXT`; schema → HTTP tools, the
+`[even-assistant] tools: N (live)` line, `/even-note`, a short system-prompt addition). Every prompt went
+through `POST /api/assistant/prompt`, every frame came from `GET /api/events?sessionId=dur-assistant`.
+Three runs: run 1 with the default deadline (20 s), run 2 with `EVEN_BRIDGE_ASSISTANT_DEADLINE_S=6`,
+run 3 with 8 s and a serial slow tool. Raw output (no tokens): `~/tmp/assistant-a1-run/`; the store was removed.
+
+Banner: `durable=on wrapper=systemd-run lc=off assistant=on`. `GET /api/agents` → `{agents: []}`;
+`/api/sessions` lists `{id:"dur-assistant", title:"Even AI", readOnly:true}`.
+
+| step | run 1 (20 s) | run 2 (6 s) | run 3 (8 s) |
+|---|---|---|---|
+| bridge start → assistant idle with tools | 3124 ms | 2496 ms | 2747 ms |
+| calendar turn (1 tool): 202 / first `tool_start` / first text / `result` | 15 / 1087 / 2074 / 2152 ms | 20 / 2945 / 3785 / 3881 ms | 15 / 1147 / 1925 / 1992 ms |
+| no-tool turn: first text / `result` | 226 / 449 ms | 497 / 656 ms | 239 / 378 ms |
+| `POST /api/assistant/note` (idle) | 5 ms, `queued:false`, `/even-note` handled | 3 ms | 3 ms |
+| forced fast loop (`kb_search`, 0.1 s, "read every page") | tool cap at 3580 ms (`assistant_tool_cap`) | tool cap at 4871 ms | tool cap at 6414 ms |
+| next prompt after the cap | `result` 619 ms | 857 ms | 1228 ms |
+| forced slow loop (`web_search`, 3 s per call) | the model stopped by itself after 3 calls, 15.0 s (no cap) | tool cap at 5947 ms (9 starts, 2 requests: parallel calls) | **deadline at 8007 ms** (`assistant_deadline`, 2 serial calls) |
+| next prompt after it | `result` 477 ms | 748 ms | 591 ms |
+| `POST /api/assistant/reset` (compact → new_session → summary note) | 6005 ms | 5697 ms | 6077 ms |
+| summary: chars / phone data in it | 3560 / **"Lasagna at 18:00"** (old wording) | 3027 / none ("(phone data left out; fetch it again)") | 3328 / none |
+| bridge SIGKILL mid-turn → restart → idle with tools | 2445 ms | 2250 ms | 2238 ms |
+| restart note delivered / `state.lost` | yes / (not built yet) | yes / `{requestId:"kill-…"}` | yes / `{requestId:"kill-…"}` |
+
+Findings:
+
+1. **The deadline catches what the tool cap cannot.** Run 1's first turn after the restart answered in
+   0.98 s and then kept generating `*\n**\n**…` (13 354 characters, no tool call): the 20 s deadline sent
+   `abort`, the run ended `aborted` 19 ms later, and the next prompt worked. Run 3's serial slow loop
+   was stopped by the deadline at 8.0 s. No run needed the grace stop (qwen always honoured `abort`).
+2. **The tool cap counts `tool_execution_start`, so parallel calls count.** qwen issued up to 9 calls in
+   one message on the "read every page" prompt; the cap fired after 1–13 requests had reached the
+   server. A normal turn uses ≤ 2 calls, so 8 holds.
+3. **The milder hand-off wording was ignored.** With "Leave out calendar, notes and quick-list contents",
+   run 1's summary still listed "Lasagna at 18:00" (taken from the model's own answer). The explicit
+   wording now in `ASSISTANT_HANDOFF` ("Do not copy calendar events, … not even from your own earlier
+   answers: write "(phone data left out; fetch it again)" instead") kept it out in runs 2 and 3, and the
+   placeholder appeared where the event had been. A6 should still assert it (n = 2 is no proof).
+4. **`compact` works on a short session** with `--approve` + `keepRecentTokens: 200` (3 of 3; 5.7–6.1 s).
+   The new session file is written at once (it holds `model_change`, `thinking_level_change` and the
+   summary note), so a respawn right after a reset resumes it.
+5. **After a restart the cut user message stays in the session.** In run 3 the model, after answering
+   the next prompt, went back to the cut request ("search the web for aurora") on its own and ran into
+   the deadline; run 1 offered to "pick that aurora search back up". The note says only that the last
+   answer was lost.
+6. **The `assistant_restarted` frame is emitted while the bridge starts**, before any client listens.
+   It reached the SSE client late: replayed at the reconnect in run 3, and only with the next turn's
+   frames in run 2 (so a client could take it for the new turn). Hence `GET /api/assistant/state`
+   carries `lost: {requestId, at}`.
+7. Nothing else bound `127.0.0.1:8795` during the runs (`ss -ltn`), and no Claude switch was run (it would
+   start the lets-code Claude proxy in the throwaway child). After teardown: no `even-lc-dur-assistant-*`
+   scope, ports 3466/8815 free, no core-memory project dir for the throwaway cwd (no memory write happened).

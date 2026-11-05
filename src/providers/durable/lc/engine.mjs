@@ -940,13 +940,14 @@ export function createLcEngine({
       if (attempt > 1 && prof?.noResume) {
         // The assistant never resumes a cut turn (ruling 23): its hook queues the "lost" note and tells the shim.
         const crashed = s.crashed;
+        const { lastRequestId } = await readRecord(sid).catch(() => ({}));
         s.crashed = false;
         s.busy = false;
         s.taskId = null;
         s.queued = [];
         s.waiter = null;
         try {
-          prof.onNoResume?.({ attempt, crashed });
+          prof.onNoResume?.({ attempt, crashed, requestId: lastRequestId ?? null });
         } catch (err) {
           log.warn?.(`[durable:lc] ${sid}: no-resume hook failed: ${err.message}`);
         }

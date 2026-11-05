@@ -44,11 +44,14 @@ export const ASSISTANT_RESTART_NOTE = "(bridge restarted; your last answer was l
 export const ASSISTANT_LOST = "I lost that one, please ask again.";
 /**
  * The hand-off's compaction instructions (ruling 28 plus A0 finding 6: the summary copied calendar and
- * notes contents into the next session; phone data changes and the phone is the truth).
+ * notes contents into the next session; phone data changes and the phone is the truth). The A1 real run
+ * showed a milder wording ("leave out calendar … contents") was ignored by qwen: the summary still listed
+ * "Lasagna at 18:00", taken from the model's own earlier answer; hence the explicit placeholder.
  */
 export const ASSISTANT_HANDOFF =
   "Keep open questions, pending tasks and the user's stated plans. " +
-  "Leave out calendar, notes and quick-list contents (phone data): they change, and the phone is the source.";
+  "Do not copy calendar events, notes, quick-list items or any other phone data (titles, times, dates of events) into the summary, " +
+  "not even from your own earlier answers: write \"(phone data left out; fetch it again)\" instead. They change, and the phone is the source.";
 export const ASSISTANT_SUMMARY_PREFIX = "Summary of the earlier conversation:\n";
 /** The first note of a reset whose compact failed (the reset goes ahead without a summary). */
 export const ASSISTANT_NO_SUMMARY_NOTE = "(the earlier conversation was reset; no summary of it was kept)";
@@ -319,6 +322,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
   const queue = []; // note files not yet sent, oldest first
   let flushing = null;
   let noteSeq = 0;
+  let lost = null; // { requestId, at }: the last run a restart cut (the shim matches its pending requestId)
 
   const emitTo = (frame) => {
     try {
@@ -559,7 +563,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
       log.warn?.(`[assistant] the child exited; respawning in ${delay} ms`);
       scheduleRespawn();
     },
-    onNoResume: () => {
+    onNoResume: ({ requestId } = {}) => {
+      lost = { requestId: requestId ?? null, at: now() };
       note(ASSISTANT_RESTART_NOTE);
       emitTo({ type: "error", code: "assistant_restarted", message: ASSISTANT_LOST });
     },
@@ -687,6 +692,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
         toolsSource: tools.source,
         sessionFile: sess?.sessionFile ?? null,
         lastResetAt: last ? Number(last) : null,
+        // The frame `assistant_restarted` goes out while the bridge starts, before a client can listen.
+        lost,
       };
     },
 
