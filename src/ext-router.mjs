@@ -38,6 +38,22 @@ const NAME_RE = /^[\w .-]+$/;
  * out; `maxTurns` may be a number or a digit-only string and comes back a number.
  * @returns {{ opts: object } | { error: string }}
  */
+/**
+ * One session row as the phone expects it: the official providers send `timestamp` as an ISO-8601 string and the
+ * app's model parses it as such; durable/overseer rows carry epoch ms internally (ordering), so the wire copy gets
+ * the ISO form. Every other field passes through unchanged. Never throws (a bad number stays as it was).
+ */
+export function wireSession(row) {
+  if (!row || typeof row !== "object") return row;
+  const t = row.timestamp;
+  if (typeof t !== "number" || !Number.isFinite(t)) return row;
+  try {
+    return { ...row, timestamp: new Date(t).toISOString() };
+  } catch {
+    return row;
+  }
+}
+
 export function agentOpts({ name, model, maxTurns, requestId, origin, engine, factory } = {}) {
   const opts = {};
   const L = AGENT_LIMITS;
@@ -311,7 +327,7 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       const i = out.findIndex((s) => s.id === overseer.sid);
       if (i > 0) out.unshift(...out.splice(i, 1));
     }
-    res.json({ sessions: out.slice(0, limit) });
+    res.json({ sessions: out.slice(0, limit).map(wireSession) });
   });
 
   // ── GET /api/info — extended provider info (explicit param) or the cache ──
