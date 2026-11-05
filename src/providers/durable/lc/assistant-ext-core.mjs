@@ -39,7 +39,8 @@ export const MAX_TOOL_CALLS = 8;
 export const MAX_TOKENS = 4096;
 export const NOTE_TYPE = "even-note";
 /** A1's ASSISTANT_RESTART_NOTE (the note the bridge sends after a restart cut a run). */
-export const RESTART_NOTE = "(bridge restarted; your last answer was lost)";
+export const RESTART_NOTE =
+  "(bridge restarted; your last answer was lost. Do not answer or continue that interrupted request unless the user asks for it again.)";
 /** How a restart note is recognised: its marker, not its exact wording (A1 may reword the note). */
 export const RESTART_MARKER = /\bbridge restart(?:ed)?\b/i;
 /** What the cut user message becomes (A2 ruling 1). */

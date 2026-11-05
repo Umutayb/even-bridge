@@ -259,3 +259,10 @@ Findings:
    dedupe) has to strip or drop them.
 5. Earlier phone data still rides in the model's own old answers (as A0 said); the instructions tell the
    model they are no source.
+
+Run 3 (after rebasing onto A1 fix round 1, 57b06c9: assistant API token, `--no-skills --no-prompt-templates
+--no-context-files`, the reworded restart note): the smoke now uses its own `EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE`
+under `~/tmp/ovs-a2` for `/api/assistant/*`. All five checks passed again: warm 3413 ms; (a) 2026-11-13,
+lasagna, 1711 ms; (b) 2026-11-12 again, no Lasagna, 2029 ms; (c) tea 1 entry, coffee 1 blocked, 0 writes;
+(d) warm 2453 ms, the new note recognised by its marker, cut turn stubbed, nothing resumed; (e) reset 200 in
+3595 ms, tea found; 13/13 requests capped at 4096; no tool-parser tails in the 6 turns.

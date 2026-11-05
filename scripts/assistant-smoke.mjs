@@ -70,6 +70,10 @@ for (const d of [ROOT, CWD, STORE_DIR, OUT_DIR, join(H, "tmp", "ovs-tmp")]) mkdi
 writeFileSync(TOKEN_FILE, `${randomBytes(24).toString("hex")}\n`, { mode: 0o600 });
 chmodSync(TOKEN_FILE, 0o600);
 const BRIDGE_TOKEN = randomBytes(24).toString("hex");
+// /api/assistant/* takes only the assistant API token (A1 fix round 1); its own file, never the live one.
+const API_TOKEN_FILE = join(ROOT, "assistant-api.token");
+const API_TOKEN = randomBytes(24).toString("hex");
+writeFileSync(API_TOKEN_FILE, `${API_TOKEN}\n`, { mode: 0o600 });
 // lets-code's core-memory store for this cwd (A0: `<basename>-<sha1(cwd)[0:8]>`).
 const CORE_MEM = join(H, ".pi", "agent", "core-memory", "projects", `assistant-${createHash("sha1").update(CWD).digest("hex").slice(0, 8)}`);
 const MEM_FILE = join(CORE_MEM, "memory.jsonl");
@@ -87,7 +91,8 @@ const BASE = `http://127.0.0.1:${PORT}/api`;
 const auth = { authorization: `Bearer ${BRIDGE_TOKEN}` };
 async function api(method, path, body, ms = 30000) {
   const t0 = Date.now();
-  const r = await fetch(BASE + path, { method, headers: { ...auth, ...(body ? { "content-type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(ms) });
+  const who = path.startsWith("/assistant/") ? { authorization: `Bearer ${API_TOKEN}` } : auth;
+  const r = await fetch(BASE + path, { method, headers: { ...who, ...(body ? { "content-type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(ms) });
   let json = null;
   try {
     json = await r.json();
@@ -112,6 +117,7 @@ function bridgeEnv() {
     EVEN_BRIDGE_ASSISTANT_TOOLS_URL: `http://127.0.0.1:${TOOLS_PORT}`,
     EVEN_BRIDGE_ASSISTANT_TOKEN_FILE: TOKEN_FILE,
     EVEN_BRIDGE_ASSISTANT_CWD: CWD,
+    EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE: API_TOKEN_FILE,
     EVEN_BRIDGE_PI_ENABLE: "0",
     EVEN_BRIDGE_RC_ENABLE: "0",
     EVEN_BRIDGE_CC_DISABLED: "1",
