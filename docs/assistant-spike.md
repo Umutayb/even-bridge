@@ -266,3 +266,10 @@ under `~/tmp/ovs-a2` for `/api/assistant/*`. All five checks passed again: warm 
 lasagna, 1711 ms; (b) 2026-11-12 again, no Lasagna, 2029 ms; (c) tea 1 entry, coffee 1 blocked, 0 writes;
 (d) warm 2453 ms, the new note recognised by its marker, cut turn stubbed, nothing resumed; (e) reset 200 in
 3595 ms, tea found; 13/13 requests capped at 4096; no tool-parser tails in the 6 turns.
+
+Runs 4–7 (review fix round 1):
+- **What changed:** notes are read only from `<lc-sessions>/dur-assistant-notes/<digits>.txt` (after realpath), every user message of a cut run is stubbed, and the untrusted fences carry a nonce.
+- **Notes:** the restart note and the summary note were delivered in all four runs, with 0 `note_refused`.
+- **Restart, reset, cap:** the cut run was stubbed and nothing was resumed; reset and the 4096 cap behaved as before.
+- **Check (c) failed in runs 4 and 5.** On "Remember that I like tea." qwen called `memory` 10 and 11 times in one run. The gate blocked none of these calls (no `memory_blocked`), and the tool cap stopped the run, so no entry was written. The tool's replies are not kept: the smoke removes the session. Runs 6 and 7 wrote the entry at the first call (`remember`, kind preference, a gist).
+- **(b) dates asked:** 11-12 and 11-05 (run 4), 11-19 and 11-12 (run 5), 11-05 (run 7).
