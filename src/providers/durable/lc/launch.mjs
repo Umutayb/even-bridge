@@ -15,6 +15,7 @@
 // check of findExternalPi and the memory cap would all miss it.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -89,6 +90,68 @@ export function lcLaunch({ sid, cwd, sessionDir, model, bin = LC_DEFAULT_BIN, gu
   return { bin, wrap, extraArgs, env: lcEnv(baseEnv, { cwd, extra: extraEnv }) };
 }
 
+/** lets-code's own extension dir (the assistant loads it explicitly: `-ne` drops every global extension). */
+export const ASSISTANT_EXT_DIR = "~/.pi/agent/extensions/lets-code";
+
+/**
+ * The scope unit of a store's assistant child (without `.scope`): `even-lc-dur-assistant-<sha1(storeDir)[0:8]>`.
+ * Every store has a `dur-assistant`, so the unit carries the store: a throwaway bridge (smoke, tests) never
+ * stops or reuses the live bridge's assistant scope (ruling 3).
+ */
+export function assistantScopeUnit(storeDir) {
+  return `${lcScopeUnit("dur-assistant")}-${createHash("sha1").update(resolve(String(storeDir ?? ""))).digest("hex").slice(0, 8)}`;
+}
+
+/**
+ * The launch of the Even AI assistant (`dur-assistant`, plan Task A1, rulings 23–25, A0 Decisions): no
+ * mandate, sandbox, subagents or guard (it has no shell or file tools), only lets-code's own extensions
+ * and the assistant extension (`-ne -e …`), exactly `tools`. `--no-mandate` because no env switch removes
+ * lets-code's mandate module (A0); `--approve` so pi loads the project settings of the assistant cwd
+ * (`<cwd>/.pi/settings.json`, the small `keepRecentTokens` the daily reset's compact needs; RPC mode cannot
+ * ask the trust question). `--session <file>` is PiRpcClient's `resume` (returned as `resume`).
+ * @returns {{ bin: string, wrap: string[], extraArgs: string[], env: object, unit: string, resume?: string }}
+ */
+export function assistantLaunch({
+  cwd,
+  sessionDir,
+  sessionFile,
+  bin = LC_DEFAULT_BIN,
+  extDir = ASSISTANT_EXT_DIR,
+  assistantExt,
+  tools = [],
+  thinking = "medium",
+  model,
+  caps = { memoryMax: null, cpuQuota: "200%" },
+  wrapper = "none",
+  moduleEnv = {},
+  toolsUrl,
+  tokenFile,
+  schemaCache,
+  unit = lcScopeUnit("dur-assistant"),
+  baseEnv = process.env,
+  extraEnv = {},
+} = {}) {
+  const wrap = [];
+  if (wrapper === "systemd-run") {
+    wrap.push("systemd-run", "--user", "--scope", "-q", "--collect", `--unit=${unit}`);
+    if (caps?.memoryMax) wrap.push("-p", `MemoryMax=${caps.memoryMax}`, "-p", "MemorySwapMax=0");
+    if (caps?.cpuQuota) wrap.push("-p", `CPUQuota=${caps.cpuQuota}`);
+    wrap.push("--");
+  }
+  const extraArgs = ["-ne", "-e", expandHome(extDir), "-e", assistantExt, "--tools", tools.join(","), "--thinking", thinking, "--session-dir", sessionDir, "--no-mandate", "--approve"];
+  if (model) extraArgs.push("--model", launcherModel(bin, model));
+  const own = {
+    ...moduleEnv,
+    ...(toolsUrl ? { EVEN_ASSISTANT_TOOLS_URL: toolsUrl } : {}),
+    ...(tokenFile ? { EVEN_ASSISTANT_TOOLS_TOKEN_FILE: tokenFile } : {}),
+    ...(schemaCache ? { EVEN_ASSISTANT_SCHEMA_CACHE: schemaCache } : {}),
+    ...extraEnv,
+  };
+  // lcEnv without a cwd: no EVEN_GUARD_CWD (the assistant has no guard); secrets dropped, pi kept in the scope.
+  const env = lcEnv(baseEnv, { extra: own });
+  return { bin, wrap, extraArgs, env, unit, ...(sessionFile ? { resume: sessionFile } : {}) };
+}
+
 /** Does this kernel give scopes a memory controller (`MemoryMax` is enforced)? Read once at start. */
 export function lcMemoryControllerAvailable({ readFile = (p) => readFileSync(p, "utf8"), path = LC_CGROUP_CONTROLLERS } = {}) {
   try {
@@ -103,6 +166,20 @@ export function stopLcScopes(sids, { env = process.env, run = runSync } = {}) {
   const units = [...new Set((sids ?? []).filter(Boolean))].map((sid) => `${lcScopeUnit(sid)}.scope`);
   if (!units.length) return true;
   const { status } = run(["systemctl", "--user", "stop", ...units], { env });
+  return status === 0;
+}
+
+/** Stop these scope units (`<unit>.scope`), e.g. a store's assistant scope. */
+export function stopScopeUnits(units, { env = process.env, run = runSync } = {}) {
+  const list = [...new Set((units ?? []).filter(Boolean))].map((u) => `${u}.scope`);
+  if (!list.length) return true;
+  const { status } = run(["systemctl", "--user", "stop", ...list], { env });
+  return status === 0;
+}
+
+/** Forget a failed scope unit (by unit name). */
+export function resetFailedUnit(unit, { env = process.env, run = runSync } = {}) {
+  const { status } = run(["systemctl", "--user", "reset-failed", `${unit}.scope`], { env });
   return status === 0;
 }
 

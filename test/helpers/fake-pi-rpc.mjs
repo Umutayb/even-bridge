@@ -43,7 +43,17 @@
 //   LOOPVARY the same, each call with other args (only the turn cap stops it)
 //   Each loop turn is logged as `{loopTurn: n}`; `abort` logs `{aborted: true, loopTurns: n}`.
 // FAKE_PI_IGNORE_ABORT=1: `abort` is answered but the run goes on (logged `{abortIgnored: true}`).
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+//
+// The assistant profile (argv has `--tools`, Task A1):
+//   stderr `[even-assistant] tools: N (live)` at start, N = the --tools count; FAKE_PI_TOOLS=0 prints
+//   `tools: 0 (none)`; FAKE_PI_TOOLS_LINE=0 prints nothing (an extension that never loaded).
+//   `/even-note <file>` reads the file, deletes it, logs `{note: <text>}`, writes a custom message, "handled".
+//   `set_model {provider, modelId}` → the model object; it resets the thinking level as pi does from
+//   settings.json (claude → low, anything else → medium). `set_thinking_level {level}`; `get_state` reports
+//   `thinkingLevel` and `model`. `compact {customInstructions}` → `{summary, …}` (FAKE_PI_COMPACT_FAIL=1:
+//   `Nothing to compact (session too small)`). `new_session` → a new session id and file (written lazily).
+//   LOOPTOOL: one `fetch_calendar` call per turn with new args every 10 ms, until `abort`.
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -61,13 +71,24 @@ log({
   spawn: true,
   argv,
   pid: process.pid,
-  env: pick(["LETS_CODE_EXPERTS_ON", "LETS_CODE_MEM_WATCH", "LETS_CODE_MEM_GUARD", "BRIDGE_TOKEN", "LETS_CODE_TOKEN", "EVEN_GUARD_CWD", "LETS_CODE_SUBAGENT_CONCURRENCY", "PI_TELEMETRY", "HOME", "EVEN_GUARD_QUARANTINE"]),
+  env: pick(["LETS_CODE_EXPERTS_ON", "LETS_CODE_MEM_WATCH", "LETS_CODE_MEM_GUARD", "BRIDGE_TOKEN", "LETS_CODE_TOKEN", "EVEN_GUARD_CWD", "LETS_CODE_SUBAGENT_CONCURRENCY", "PI_TELEMETRY", "HOME", "EVEN_GUARD_QUARANTINE", "EVEN_ASSISTANT_TOOLS_URL", "EVEN_ASSISTANT_TOOLS_TOKEN_FILE", "EVEN_ASSISTANT_SCHEMA_CACHE", "EVEN_ASSISTANT_TOOLS_TOKEN", "LETS_CODE_CORE_MEMORY", "LETS_CODE_SUBAGENTS", "LETS_CODE_MANDATE"]),
+  cwd: process.cwd(),
 });
+
+// ── the assistant profile ──
+const toolsArg = opt("--tools");
+let thinkingLevel = opt("--thinking") ?? "medium";
+let model = { provider: "lets-code", id: opt("--model") ?? "qwen3.8-27b" };
+if (toolsArg != null && process.env.FAKE_PI_TOOLS_LINE !== "0") {
+  const n = process.env.FAKE_PI_TOOLS === "0" ? 0 : toolsArg.split(",").filter(Boolean).length;
+  process.stderr.write(`[even-assistant] tools: ${n} (${n ? "live" : "none"})\n`);
+}
 
 const out = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 
 // ── session file ──
 let sessionFile = opt("--session");
+const sessionDirArg = opt("--session-dir");
 let sessionId;
 if (sessionFile && existsSync(sessionFile)) {
   const head = readFileSync(sessionFile, "utf8").split("\n")[0];
@@ -143,6 +164,19 @@ function onPrompt(cmd) {
   }
   if (text.startsWith("/")) {
     const [verb, arg] = text.split(/\s+/);
+    if (verb === "/even-note") {
+      let content = null;
+      try {
+        content = readFileSync(arg, "utf8");
+        unlinkSync(arg);
+      } catch {
+        /* missing: logged as null */
+      }
+      log({ note: content, file: arg });
+      append({ type: "custom_message", customType: "even-note", content, display: true, timestamp: new Date().toISOString() });
+      out({ type: "response", id: cmd.id, command: "prompt", success: true, data: { disposition: "handled" } });
+      return;
+    }
     if (verb === "/mode") {
       if (process.env.FAKE_PI_NO_NOTIFY !== "1") notify(`mode: ${arg}`);
       out({ type: "response", id: cmd.id, command: "prompt", success: true, data: { disposition: "handled" } });
@@ -211,6 +245,22 @@ function onPrompt(cmd) {
       out({ type: "tool_execution_end", toolCallId: `t${i}`, toolName: "bash", result: { content: [{ type: "text", text: String(i) }] } });
     }
   }
+  if (text === "LOOPTOOL") {
+    const mine = run;
+    mine.loopTurns = 0;
+    const tick = () => {
+      if (run !== mine) return;
+      const n = ++mine.loopTurns;
+      const args = { from: `2026-11-${String((n % 28) + 1).padStart(2, "0")}`, to: "2026-11-30" };
+      out({ type: "tool_execution_start", toolCallId: `c${n}`, toolName: "fetch_calendar", args });
+      out({ type: "tool_execution_end", toolCallId: `c${n}`, toolName: "fetch_calendar", result: { content: [{ type: "text", text: "window: …\n18:00 Lasagna" }] } });
+      out({ type: "turn_end", message: { usage: { input: 10, output: 3, totalTokens: 13, cost: { total: 0 } } } });
+      log({ loopTurn: n });
+      if (n < 1000) setTimeout(tick, 10);
+    };
+    setTimeout(tick, 10);
+    return;
+  }
   if (text === "LOOP" || text === "LOOPVARY") {
     const mine = run;
     mine.loopTurns = 0;
@@ -277,7 +327,7 @@ process.stdin.on("data", (chunk) => {
     log({ ...cmd, _pid: process.pid });
     switch (cmd.type) {
       case "get_state": {
-        const reply = () => out({ type: "response", id: cmd.id, command: "get_state", success: true, data: { sessionId, sessionFile, isStreaming: Boolean(run) } });
+        const reply = () => out({ type: "response", id: cmd.id, command: "get_state", success: true, data: { sessionId, sessionFile, isStreaming: Boolean(run), thinkingLevel, model } });
         const delay = Number(process.env.FAKE_PI_START_DELAY_MS || 0);
         if (delay > 0 && !startDelayed) {
           startDelayed = true;
@@ -300,6 +350,37 @@ process.stdin.on("data", (chunk) => {
           endRun();
         }
         break;
+      case "set_model": {
+        model = { id: cmd.modelId, provider: cmd.provider, name: cmd.modelId, api: "openai-completions", reasoning: true, input: ["text"], contextWindow: 200000, maxTokens: 32768 };
+        thinkingLevel = /claude/.test(String(cmd.modelId)) ? "low" : "medium"; // settings.json modelThinkingLevels
+        out({ type: "response", id: cmd.id, command: "set_model", success: true, data: model });
+        break;
+      }
+      case "set_thinking_level":
+        thinkingLevel = cmd.level;
+        out({ type: "response", id: cmd.id, command: "set_thinking_level", success: true });
+        break;
+      case "compact":
+        if (process.env.FAKE_PI_COMPACT_FAIL === "1") {
+          out({ type: "response", id: cmd.id, command: "compact", success: false, error: "Nothing to compact (session too small)" });
+        } else {
+          append({ type: "compaction", summary: "## Goal\nfake summary", timestamp: new Date().toISOString() });
+          out({
+            type: "response",
+            id: cmd.id,
+            command: "compact",
+            success: true,
+            data: { summary: "## Goal\nfake summary", firstKeptEntryId: "e1", tokensBefore: 100, estimatedTokensAfter: 50, usage: { reasoning: 3 }, details: {} },
+          });
+        }
+        break;
+      case "new_session": {
+        sessionId = randomUUID();
+        const dir = sessionDirArg ?? dirname(sessionFile);
+        sessionFile = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
+        out({ type: "response", id: cmd.id, command: "new_session", success: true, data: { cancelled: false } });
+        break;
+      }
       case "extension_ui_response": {
         const cb = dialogs.get(cmd.id);
         dialogs.delete(cmd.id);

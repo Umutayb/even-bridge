@@ -18,6 +18,11 @@ export const LC_RESTART_LIMIT_MESSAGE = `lets-code run stopped: restarted ${LC_R
 
 /** The child died mid-turn (not stopped by us): the run is retried. */
 export const LC_EXIT = "LC_EXIT";
+/**
+ * A profile that never resumes (the Even AI assistant, ruling 23) refused attempt > 1: the engine already
+ * queued its note and went idle; the task ends `aborted`, never retried.
+ */
+export const LC_NO_RESUME = "LC_NO_RESUME";
 /** The engine stopped the run at a per-run cap (turns, repeated tool call): failed, never retried; the engine already went idle. */
 export const LC_CAP = "LC_CAP";
 
@@ -49,6 +54,10 @@ export function createLcRunTask(engine) {
           } catch (err) {
             if (runtime.signal.aborted) throw err; // closing or aborted: the rerun / abort handler takes over
             if (err?.code === LC_EXIT) continue; // a crash: next attempt
+            if (err?.code === LC_NO_RESUME) {
+              await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context);
+              return;
+            }
             if (err?.code === LC_CAP) {
               await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error: { message: err.message } } }), context);
               return;

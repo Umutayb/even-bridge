@@ -77,6 +77,39 @@ export function durableOptions(env = process.env) {
   if (env.EVEN_BRIDGE_DURABLE_MODELS) opts.modelsPath = env.EVEN_BRIDGE_DURABLE_MODELS;
   const lc = lcOptions(env);
   if (lc) opts.lc = lc;
+  const assistant = assistantOptions(env);
+  if (assistant) opts.assistant = assistant;
+  return opts;
+}
+
+/**
+ * The Even AI assistant (`dur-assistant` on the lets-code engine, /api/assistant/*, Task A1):
+ * EVEN_BRIDGE_ASSISTANT_ENABLE=1, and only with the durable provider on (not the agent engine flag).
+ */
+export function assistantEnabled(env = process.env) {
+  return durableEnabled(env) && String(env.EVEN_BRIDGE_ASSISTANT_ENABLE ?? "").trim() === "1";
+}
+
+/**
+ * The assistant's options, or null when off: the shim's tool server and its token file (a path; the
+ * child reads the token itself). Optional, only when set: the bin (EVEN_BRIDGE_LC_BIN, else
+ * EVEN_BRIDGE_PI_BIN, else lets-code), the extension (EVEN_BRIDGE_ASSISTANT_EXT, default A2's
+ * even-assistant.ts), the cwd (EVEN_BRIDGE_ASSISTANT_CWD, default ~/sandbox/assistant; smoke runs) and a
+ * run deadline in seconds (EVEN_BRIDGE_ASSISTANT_DEADLINE_S, default 20).
+ */
+export function assistantOptions(env = process.env) {
+  if (!assistantEnabled(env)) return null;
+  const opts = {
+    toolsUrl: env.EVEN_BRIDGE_ASSISTANT_TOOLS_URL || "http://127.0.0.1:8814",
+    tokenFile: env.EVEN_BRIDGE_ASSISTANT_TOKEN_FILE || "~/even-app/shim-data/assistant_tools.token",
+  };
+  const bin = env.EVEN_BRIDGE_LC_BIN || env.EVEN_BRIDGE_PI_BIN;
+  if (bin) opts.bin = bin;
+  if (env.EVEN_BRIDGE_ASSISTANT_EXT) opts.ext = env.EVEN_BRIDGE_ASSISTANT_EXT;
+  // A throwaway bridge's own cwd (its core-memory store is keyed by the cwd; the live one is ~/sandbox/assistant).
+  if (env.EVEN_BRIDGE_ASSISTANT_CWD) opts.cwd = env.EVEN_BRIDGE_ASSISTANT_CWD;
+  const d = Number(env.EVEN_BRIDGE_ASSISTANT_DEADLINE_S);
+  if (env.EVEN_BRIDGE_ASSISTANT_DEADLINE_S != null && Number.isFinite(d) && d > 0 && d <= 600) opts.deadlineMs = Math.round(d * 1000);
   return opts;
 }
 
@@ -222,6 +255,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
       await p.ready; // store open + resumed (undefined on providers without it)
       durableProvider = p;
       durableState = `on wrapper=${p.wrapper ?? "none"} lc=${p.lcBanner ?? "off"}`;
+      if (durableOpts.assistant) durableState += ` assistant=${p.assistant ? "on" : `failed: ${p.assistantError?.message ?? "not set up"}`}`;
     } catch (err) {
       durableState = `failed: ${err.message}`;
       p?.stopAll().catch(() => {});
@@ -311,6 +345,7 @@ export async function startServer({ flags = {}, cwd } = {}) {
     getDefaultLocalProvider: () => getProvider(getDefaultProvider()),
     overseer,
     infoCache,
+    assistant: durableProvider?.assistant ?? null,
   });
 
   // ── App (mirrors dist/index.js) ───────────────────────────────────────────

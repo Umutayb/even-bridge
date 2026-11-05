@@ -182,6 +182,51 @@ export function overseerActionOpts({ kind, args, origin, requestId } = {}) {
   return { kind, args: args ?? {}, requestId };
 }
 
+/** /api/assistant/* body limits (Task A1). */
+export const ASSISTANT_LIMITS = Object.freeze({ textMax: 4000, requestIdMax: 128, modelMax: 64, dialogIdMax: 128 });
+export const ASSISTANT_WHEN_BUSY = Object.freeze(["steer", "followUp"]);
+export const ASSISTANT_THINKING = Object.freeze(["off", "minimal", "low", "medium", "high"]);
+
+/** Validate POST /api/assistant/prompt: `{ text, requestId, whenBusy }` or `{ error }`. */
+export function assistantPromptOpts({ text, requestId, whenBusy } = {}) {
+  const L = ASSISTANT_LIMITS;
+  if (typeof text !== "string" || !text.trim()) return { error: "Missing 'text'" };
+  if (text.length > L.textMax) return { error: `'text' must be 1-${L.textMax} characters` };
+  if (typeof requestId !== "string" || requestId.length < 1 || requestId.length > L.requestIdMax) {
+    return { error: `'requestId' must be 1-${L.requestIdMax} characters` };
+  }
+  if (whenBusy != null && !ASSISTANT_WHEN_BUSY.includes(whenBusy)) return { error: "'whenBusy' must be steer or followUp" };
+  return { text, requestId, whenBusy: whenBusy ?? "steer" };
+}
+
+/** Validate POST /api/assistant/model: `{ model?, thinking? }` (at least one) or `{ error }`. */
+export function assistantModelOpts({ model, thinking } = {}) {
+  const out = {};
+  if (model != null) {
+    if (typeof model !== "string" || model.length < 3 || model.length > ASSISTANT_LIMITS.modelMax || !/^[\w.-]+\/[\w.:-]+$/.test(model)) {
+      return { error: `'model' must be <provider>/<model id> (at most ${ASSISTANT_LIMITS.modelMax} characters)` };
+    }
+    out.model = model;
+  }
+  if (thinking != null) {
+    if (!ASSISTANT_THINKING.includes(thinking)) return { error: `'thinking' must be one of ${ASSISTANT_THINKING.join(", ")}` };
+    out.thinking = thinking;
+  }
+  if (!out.model && !out.thinking) return { error: "Missing 'model' or 'thinking'" };
+  return out;
+}
+
+/** Validate POST /api/assistant/dialog: `{ id, answer: {value}|{confirmed}|{cancelled:true} }` or `{ error }`. */
+export function assistantDialogOpts({ id, value, confirmed, cancelled } = {}) {
+  if (typeof id !== "string" || id.length < 1 || id.length > ASSISTANT_LIMITS.dialogIdMax) return { error: "Missing 'id'" };
+  const given = [value !== undefined, confirmed !== undefined, cancelled !== undefined].filter(Boolean).length;
+  if (given !== 1) return { error: "Give exactly one of 'value', 'confirmed' or 'cancelled'" };
+  if (value !== undefined && (typeof value !== "string" || value.length > ASSISTANT_LIMITS.textMax)) return { error: "'value' must be a string" };
+  if (confirmed !== undefined && typeof confirmed !== "boolean") return { error: "'confirmed' must be true or false" };
+  if (cancelled !== undefined && cancelled !== true) return { error: "'cancelled' must be true" };
+  return { id, answer: value !== undefined ? { value } : confirmed !== undefined ? { confirmed } : { cancelled: true } };
+}
+
 const seqParam = (v) => {
   if (v == null || v === "") return 0;
   const n = typeof v === "number" ? v : /^\d+$/.test(String(v)) ? Number(v) : NaN;
@@ -204,7 +249,7 @@ function infoTargetsClaude(param) {
   return param === "claude";
 }
 
-export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null, infoCache = null } = {}) {
+export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTranscriptBase, overseer = null, infoCache = null, assistant = null } = {}) {
   const ext = providers.filter(Boolean); // [{name, probe, listSessions, ...}]
   const router = Router();
 
@@ -326,6 +371,12 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
       // The overseer is pinned first (plan ruling 6), whatever the other rows' timestamps.
       const i = out.findIndex((s) => s.id === overseer.sid);
       if (i > 0) out.unshift(...out.splice(i, 1));
+    }
+    if (assistant?.sid) {
+      // Even AI right after the overseer (or first without one).
+      const at = overseer?.sid && out[0]?.id === overseer.sid ? 1 : 0;
+      const i = out.findIndex((s) => s.id === assistant.sid);
+      if (i > at) out.splice(at, 0, ...out.splice(i, 1));
     }
     res.json({ sessions: out.slice(0, limit).map(wireSession) });
   });
@@ -673,6 +724,75 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     if (!by) return res.status(400).json({ error: `'by' must be one of ${ACTION_BY.join(", ")}` });
     try {
       res.json(await a.deny(req.params.id, { by }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // ── /api/assistant — the Even AI assistant (EVEN_BRIDGE_ASSISTANT_ENABLE=1, Task A1) ─────────
+  // Without it every route falls through (next()), as before they existed. Events: GET /api/events?sessionId=dur-assistant.
+  router.post("/assistant/prompt", async (req, res, next) => {
+    if (!assistant) return next();
+    const checked = assistantPromptOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      res.status(202).json(await assistant.prompt(checked.text, { requestId: checked.requestId, whenBusy: checked.whenBusy }));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  for (const verb of ["interrupt", "reset", "compact"]) {
+    router.post(`/assistant/${verb}`, async (req, res, next) => {
+      if (!assistant) return next();
+      try {
+        await assistant[verb]();
+        res.json({ ok: true });
+      } catch (err) {
+        fail(res, err);
+      }
+    });
+  }
+
+  router.post("/assistant/model", async (req, res, next) => {
+    if (!assistant) return next();
+    const checked = assistantModelOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      res.json(await assistant.setModel(checked));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/assistant/note", async (req, res, next) => {
+    if (!assistant) return next();
+    const text = req.body?.text;
+    if (typeof text !== "string" || !text.trim()) return res.status(400).json({ error: "Missing 'text'" });
+    if (text.length > ASSISTANT_LIMITS.textMax) return res.status(400).json({ error: `'text' must be 1-${ASSISTANT_LIMITS.textMax} characters` });
+    try {
+      const r = assistant.note(text);
+      res.json({ ok: true, queued: Boolean(r?.queued) });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.post("/assistant/dialog", async (req, res, next) => {
+    if (!assistant) return next();
+    const checked = assistantDialogOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      res.json(await assistant.answerDialog(checked.id, checked.answer));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  router.get("/assistant/state", async (req, res, next) => {
+    if (!assistant) return next();
+    try {
+      res.json(assistant.state());
     } catch (err) {
       fail(res, err);
     }

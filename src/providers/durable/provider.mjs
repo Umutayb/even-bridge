@@ -236,8 +236,17 @@ function parseMaxTurns(v) {
  *   `overseerProviderOptions`): `{ extension, sid, title, maxTurns, instructions }`. The root conversation is
  *   created (or reconfigured) with only that extension before anything resumes, and is served as the virtual
  *   session `sid`. Unset: nothing changes.
+ * @param {object} [o.assistant] the Even AI assistant (EVEN_BRIDGE_ASSISTANT_ENABLE=1, Task A1; server.mjs
+ *   `assistantOptions`): `{ toolsUrl, tokenFile, bin?, ext?, … }` plus test seams (lc/assistant.mjs
+ *   `createAssistant` opts; `engine` = lets-code engine seams when the agent engine is off). The lets-code
+ *   engine is built for it even with `lc` unset (then no agent may use the engine). Unset: nothing changes.
  * @param {{ now?: () => number, setTimer?: Function }} [o.clock] test seam: the Harness clock and timers.
  */
+/** The assistant's virtual session (mirrored from lc/assistant.mjs: this module must not load it when off). */
+export const ASSISTANT_SID = "dur-assistant";
+export const ASSISTANT_TITLE = "Even AI";
+export const ASSISTANT_CWD = "~/sandbox/assistant";
+export const ASSISTANT_READ_ONLY = "Even AI is read-only here";
 /** The TTL an overseer-started agent may carry (stored in the row; the shim reaper adopts it). */
 export const AGENT_TTL_S = Object.freeze({ min: 300, max: 43200 });
 
@@ -271,6 +280,7 @@ export function createDurableProvider(
     forbidden = forbiddenDirs({ env }),
     lc,
     overseer,
+    assistant,
     clock,
   } = {},
 ) {
@@ -324,6 +334,38 @@ export function createDurableProvider(
     map.byConversation = (id) => (id === ROOT_CONVERSATION_ID ? (overseerError ? undefined : overseerRow()) : byConversation(id));
   }
   const isOverseer = (sid) => Boolean(ov) && sid === ov.sid;
+  // The Even AI assistant (Task A1): a virtual row like the overseer's, backed by its own record
+  // conversation (id in the session map's meta table), listed read-only, never in listAgents/rows.
+  const as = assistant ?? null;
+  let assistantConvId = null;
+  let assistantObj = null;
+  let assistantError = null;
+  const assistantCwd = as ? expandHome(as.cwd ?? ASSISTANT_CWD) : null;
+  const assistantRow = () => ({
+    sid: ASSISTANT_SID,
+    conversation_id: assistantConvId,
+    name: ASSISTANT_TITLE,
+    cwd: assistantCwd,
+    model_provider: null,
+    model_id: null,
+    created_at: startedS,
+    last_seen: Math.floor(Date.now() / 1000),
+    origin: "evenai",
+    archived: 0,
+    max_turns: null,
+    engine: "lets-code",
+    ttl_s: null,
+  });
+  if (as) {
+    const get = map.get.bind(map);
+    const byConversation = map.byConversation.bind(map);
+    map.get = (sid) => (sid === ASSISTANT_SID ? (assistantConvId == null ? undefined : assistantRow()) : get(sid));
+    map.byConversation = (id) => (assistantConvId != null && id === assistantConvId ? assistantRow() : byConversation(id));
+  }
+  const isAssistant = (sid) => Boolean(as) && sid === ASSISTANT_SID;
+  const readOnly = (sid) => {
+    if (isAssistant(sid)) throw httpError(403, ASSISTANT_READ_ONLY);
+  };
   const notTheOverseer = (sid) => {
     if (isOverseer(sid)) throw httpError(403, "The overseer cannot be stopped or archived");
   };
@@ -445,9 +487,18 @@ export function createDurableProvider(
   let lcMods = null;
   let lcBox = null;
   let lcEngine = null;
-  const isLc = (row) => Boolean(lc) && row?.engine === "lets-code";
+  let asMods = null;
+  let asBox = null;
+  // The engine exists for lets-code agents (lc) or for the assistant alone; agents still need `lc`.
+  const lcOn = Boolean(lc) || Boolean(as);
+  const isLc = (row) => lcOn && row?.engine === "lets-code";
   const opened = (async () => {
-    if (lc) {
+    if (as) {
+      asMods = await import("./lc/assistant.mjs");
+      asBox = asMods.createAssistantBox({ now: clock?.now ?? Date.now });
+      registry.install(defineExtension({ name: "even-assistant", tasks: [asBox.task] }));
+    }
+    if (lcOn) {
       lcMods = await import("./lc/engine.mjs");
       const made = lcMods.createLcTaskBox();
       lcBox = made.box;
@@ -464,8 +515,10 @@ export function createDurableProvider(
   const ready = (async () => {
     try {
       await opened;
-      if (lc) {
-        const { bin, caps, maxLive, sandbox, ...seams } = lc;
+      if (lcOn) {
+        // Without the agent flag the engine serves the assistant only (no sandbox needed: no shell tools).
+        const engCfg = lc ?? { bin: as.bin, caps: as.caps, maxLive: 1, sandbox: false, ...(as.engine ?? {}) };
+        const { bin, caps, maxLive, sandbox, ...seams } = engCfg;
         lcEngine = lcMods.createLcEngine({
           harness: durable.harness,
           ctx: durable.ctx,
@@ -488,6 +541,33 @@ export function createDurableProvider(
           ...seams,
         });
         lcBox.engine = lcEngine;
+      }
+      if (as) {
+        // Its record conversation and its profile, before anything resumes (a resumed run of it must find it).
+        try {
+          const { engine: _seams, ...aopts } = as;
+          assistantConvId = await asMods.ensureAssistantConversation({
+            harness: durable.harness,
+            ctx: durable.ctx,
+            map,
+            agent: { model: defaultRef, maxTurns: 1, instructions: "Even AI assistant record", extensions: [], cwd: assistantCwd },
+          });
+          const defaultLabel = `${defaultRef.provider}/${defaultRef.modelId}`;
+          assistantObj = asMods.createAssistant({
+            engine: lcEngine,
+            emit: (sid, frame) => onLcFrame(sid, frame),
+            now: clock?.now ?? Date.now,
+            log,
+            storeDir: dirname(expandHome(storePath)),
+            box: asBox,
+            meta: { getMeta: (k) => map.getMeta(k), setMeta: (k, v) => map.setMeta(k, v) },
+            opts: { model: asMods.ASSISTANT_MODEL !== defaultLabel ? asMods.ASSISTANT_MODEL : undefined, ...aopts },
+          });
+        } catch (err) {
+          assistantError = err;
+          assistantConvId = null;
+          log.warn?.(`[durable] assistant: ${err.message}`);
+        }
       }
       if (ov) {
         // The root with the overseer's agent, before anything resumes (a resumed root run needs its tools).
@@ -516,7 +596,10 @@ export function createDurableProvider(
       if (lcEngine) {
         // Scopes of this store's lets-code rows only (never a glob: ruling 3).
         const lcSids = [...map.rows({ seenSince: since })].filter((r) => r.engine === "lets-code").map((r) => r.sid);
-        lcMods.stopLcScopes(lcSids, { env: shellEnv, run: lc.run ?? scopeRunner });
+        const scopeRun = (lc ?? as?.engine ?? {}).run ?? scopeRunner;
+        lcMods.stopLcScopes(lcSids, { env: shellEnv, run: scopeRun });
+        // This store's assistant scope only (its unit carries the store, ruling 3).
+        if (assistantObj?.profile?.unit) lcMods.stopScopeUnits([assistantObj.profile.unit], { env: shellEnv, run: scopeRun });
       }
       map.pruneChildren(since);
       loadChildren();
@@ -534,6 +617,8 @@ export function createDurableProvider(
         // The overseer's own background tasks (sleeping check-ins, the nightly reset) are not a run:
         // they resume on their own and never make dur-overseer busy.
         if (ov && row?.sid === ov.sid && t.record.background && String(t.record.kind).startsWith("even.overseer-")) continue;
+        // The assistant's nightly reset sleeps on its own and never makes dur-assistant busy.
+        if (as && row?.sid === ASSISTANT_SID && t.record.kind === asMods.ASSISTANT_NIGHTLY_TASK) continue;
         if (row && !row.archived && row.last_seen >= since) {
           states.set(row.sid, "busy");
           if (isLc(row)) {
@@ -555,6 +640,15 @@ export function createDurableProvider(
       }
       if (staleConvs.size) log.warn?.(`[durable] aborting ${staleConvs.size} unfinished run(s) not seen for over 7 days`);
       durable.harness.resume();
+      if (assistantObj) {
+        // The nightly reset exists once; the child is spawned warm (not awaited: the bridge listens meanwhile).
+        await asMods.ensureNightly({ harness: durable.harness, ctx: durable.ctx, box: asBox, conversationId: assistantConvId }).catch((err) => log.warn?.(`[durable] assistant nightly: ${err.message}`));
+        try {
+          assistantObj.start().catch(() => {});
+        } catch (err) {
+          log.warn?.(`[durable] assistant start: ${err.message}`);
+        }
+      }
       for (const sid of recent.keys()) await ensureWatcher(sid).catch(() => {});
       await Promise.all(
         [...staleConvs].map(async (id) => {
@@ -784,7 +878,7 @@ export function createDurableProvider(
     }
     const engine = opts.engine ?? "native";
     if (engine !== "native" && engine !== "lets-code") throw httpError(400, `Invalid engine ${JSON.stringify(engine)}`);
-    if (engine === "lets-code" && !lcEngine) throw httpError(400, "the lets-code engine is off");
+    if (engine === "lets-code" && (!lc || !lcEngine)) throw httpError(400, "the lets-code engine is off");
     if (opts.factory && engine !== "lets-code") throw httpError(400, "'factory' needs engine lets-code");
     const ref = resolveModel(opts.model);
     const maxTurns = parseMaxTurns(opts.maxTurns);
@@ -860,7 +954,18 @@ export function createDurableProvider(
     engines: lc ? ["native", "lets-code"] : ["native"],
     /** The startup banner's lets-code part: on(sandbox|nosandbox|sandbox-missing,mem|nomem), or off. */
     get lcBanner() {
-      return lcEngine?.banner ?? (lc ? "starting" : "off");
+      if (!lc) return "off"; // the engine of the assistant alone is no lets-code agent engine
+      return lcEngine?.banner ?? "starting";
+    },
+
+    /** The Even AI assistant (createAssistant), or null (off, or its setup failed). */
+    get assistant() {
+      return assistantObj;
+    },
+
+    /** Why the assistant could not be set up, or null. */
+    get assistantError() {
+      return assistantError;
     },
 
     /** Sync ownership probe: a "dur-" id the session map knows. */
@@ -877,9 +982,15 @@ export function createDurableProvider(
         .list({ limit, cwd })
         .filter((r) => r.conversation_id != null)
         .map((r) => ({ id: r.sid, title: r.name, timestamp: r.last_seen * 1000, cwd: r.cwd, provider: WIRE_PROVIDER, status: null }));
-      if (!ov || overseerError || (cwd && cwd !== defaultCwd)) return rows;
+      const head = [];
       // The overseer first (the phone Terminal opens it like any session).
-      return [{ id: ov.sid, title: ov.title, timestamp: Date.now(), cwd: defaultCwd ?? "", provider: WIRE_PROVIDER, status: null }, ...rows].slice(0, limit);
+      if (ov && !overseerError && (!cwd || cwd === defaultCwd)) head.push({ id: ov.sid, title: ov.title, timestamp: Date.now(), cwd: defaultCwd ?? "", provider: WIRE_PROVIDER, status: null });
+      // Then Even AI, read-only (ruling 31): history and watch work, prompt/stop/forget are refused.
+      if (as && assistantConvId != null && (!cwd || cwd === assistantCwd)) {
+        head.push({ id: ASSISTANT_SID, title: ASSISTANT_TITLE, timestamp: Date.now(), cwd: assistantCwd, provider: WIRE_PROVIDER, status: null, readOnly: true });
+      }
+      if (!head.length) return rows;
+      return [...head, ...rows].slice(0, limit);
     },
 
     /** The last error of a lets-code agent (a cap, a refused factory start): `{text, at, reason?}` or null. */
@@ -984,12 +1095,13 @@ export function createDurableProvider(
      */
     async prompt(sessionId, text, cwd, opts = {}) {
       if (closed) throw httpError(503, "durable provider is shut down");
+      readOnly(sessionId); // Even AI takes prompts only from the shim (/api/assistant/prompt)
       await ready;
       let sid = sessionId;
       if (!sid && opts.requestId) sid = map.sidForRequest(opts.requestId);
       // A new lets-code agent: 503 without the sandbox, 429 at the live limit (an idle-kept child is
       // stopped first, awaited), all before any row exists. The requestId is checked again after it.
-      if (!sid && opts.engine === "lets-code" && lcEngine) {
+      if (!sid && opts.engine === "lets-code" && lc && lcEngine) {
         await lcEngine.admit(null);
         if (opts.requestId) sid = map.sidForRequest(opts.requestId);
       }
@@ -1043,6 +1155,7 @@ export function createDurableProvider(
     },
 
     respondPermission(sessionId, decision) {
+      if (isAssistant(sessionId)) return false; // its dialogs never reach the phone
       // The overseer's proposals reach the phone as permission requests on dur-overseer (actions.mjs answers).
       if (isOverseer(sessionId)) return !overseerError && provider.onOverseerPermission ? provider.onOverseerPermission(decision) : false;
       if (isLc(map.get(sessionId))) return lcEngine?.respondPermission(sessionId, decision) ?? false;
@@ -1051,6 +1164,7 @@ export function createDurableProvider(
 
     /** A question ends the run (the agent stops); the answer is the next input. lets-code: answers its open dialog. */
     respondQuestion(sessionId, answer) {
+      readOnly(sessionId);
       const row = map.get(sessionId);
       if (isLc(row)) {
         if (row.archived) throw notFound();
@@ -1060,6 +1174,7 @@ export function createDurableProvider(
     },
 
     interrupt(sessionId) {
+      readOnly(sessionId);
       const row = map.get(sessionId);
       if (!row || row.archived || row.conversation_id == null) throw notFound();
       if (isLc(row)) return lcEngine?.interrupt(sessionId);
@@ -1088,6 +1203,7 @@ export function createDurableProvider(
      */
     forgetSession(sessionId) {
       notTheOverseer(sessionId);
+      readOnly(sessionId);
       const row = map.get(sessionId);
       if (isLc(row)) {
         lcEngine?.forget(sessionId).catch((err) => log.warn?.(`[durable] forget ${sessionId} failed: ${err.message}`));
@@ -1107,6 +1223,7 @@ export function createDurableProvider(
     /** Abort and archive (the shim's reaper / stop endpoint). */
     async stopSession(sessionId) {
       notTheOverseer(sessionId);
+      readOnly(sessionId);
       const lcRow = map.get(sessionId);
       if (isLc(lcRow)) {
         if (lcRow.archived) throw notFound();
@@ -1220,6 +1337,7 @@ export function createDurableProvider(
         );
       }
       for (const sid of [...live.keys()]) stopWatcher(sid);
+      assistantObj?.stop(); // no respawn while the engine stops its child
       await durable.close(); // signals the lets-code run tasks first: they stay pending for the next start
       await lcEngine?.stopAll(); // then the children and their scopes
       clearScopes(); // bash still running in a scope would outlive the bridge
