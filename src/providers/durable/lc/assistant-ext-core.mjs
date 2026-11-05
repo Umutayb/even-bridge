@@ -377,6 +377,34 @@ export function memoryGate(toolName, input, lastUserText, rememberPattern) {
   return { block: true, reason: MEMORY_BLOCK_REASON };
 }
 
+/** A complete `remember` call, as the reason of a blocked gist-less one shows it (re-review N1). */
+export const GIST_EXAMPLE = '{"action":"remember","kind":"preference","gist":"User likes tea.","by":"user"}';
+export const GIST_FIRST_REASON = `memory remember needs a non-empty "gist" (the fact in one short sentence); nothing was saved. Call it once more with every field, for example ${GIST_EXAMPLE}`;
+export const GIST_AGAIN_REASON = "Do not call memory again this turn; tell the user it was not saved.";
+
+/**
+ * Re-review N1: qwen sends `memory {"action":"remember","by":"user"}` without a `gist`; lets-code answers
+ * "Give the gist…" and qwen repeats the same call until a cap ends the run with nothing saved. A remember
+ * without a non-empty string gist is blocked before it reaches lets-code: the first time with a complete
+ * example, from the second time in the same run with a stop. Nothing is filled in.
+ */
+export function createGistGate() {
+  let misses = 0;
+  return {
+    reset() {
+      misses = 0;
+    },
+    /** @returns {{ block: true, reason: string } | undefined} */
+    check(toolName, input) {
+      if (toolName !== "memory") return undefined;
+      if (String(input?.action ?? "").trim().toLowerCase() !== "remember") return undefined;
+      if (typeof input?.gist === "string" && input.gist.trim() !== "") return undefined;
+      misses += 1;
+      return { block: true, reason: misses === 1 ? GIST_FIRST_REASON : GIST_AGAIN_REASON };
+    },
+  };
+}
+
 /**
  * The per-run tool-call cap (A2 ruling 2): every `tool_call` counts, parallel calls one by one, so the
  * 9th call is blocked exactly when the host cap (9th `tool_execution_start`) aborts the run.
@@ -521,10 +549,12 @@ export async function setupAssistantExtension(pi, { env = process.env, fetch = g
   stderr.write(toolsLine(registered, schema.source));
 
   const counter = createToolCounter(MAX_TOOL_CALLS);
+  const gist = createGistGate();
   let userText = "";
 
   pi.on("before_agent_start", async (event) => {
     counter.reset();
+    gist.reset();
     userText = String(event?.prompt ?? "");
     const o = event?.systemPromptOptions;
     if (o && typeof o === "object") {
@@ -536,6 +566,7 @@ export async function setupAssistantExtension(pi, { env = process.env, fetch = g
   });
   pi.on("agent_start", async () => {
     counter.reset();
+    gist.reset();
   });
   pi.on("context", async (event) => {
     const msgs = Array.isArray(event?.messages) ? event.messages : [];
@@ -553,8 +584,13 @@ export async function setupAssistantExtension(pi, { env = process.env, fetch = g
       return cap;
     }
     const gate = memoryGate(name, event?.input ?? {}, userText, rememberPattern);
-    if (gate) log("memory_blocked", { action: String(event?.input?.action ?? "") });
-    return gate;
+    if (gate) {
+      log("memory_blocked", { action: String(event?.input?.action ?? "") });
+      return gate;
+    }
+    const g = gist.check(name, event?.input ?? {});
+    if (g) log("memory_no_gist", { again: g.reason === GIST_AGAIN_REASON });
+    return g;
   });
   pi.on("before_provider_request", async (event) => {
     const p = capPayload(event?.payload, MAX_TOKENS);

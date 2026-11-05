@@ -19,6 +19,9 @@ import {
   callTool,
   capPayload,
   createToolCounter,
+  createGistGate,
+  GIST_EXAMPLE,
+  GIST_AGAIN_REASON,
   isRestartNote,
   loadSchema,
   memoryGate,
@@ -387,6 +390,26 @@ test("memory writes need the user to ask", () => {
   assert.deepEqual(memoryGate("memory", { action: "remember" }, "remember", "(unclosed"), blocked, "a broken pattern blocks");
 });
 
+test("a remember without a gist is blocked before lets-code, the second time with a stop (re-review N1)", () => {
+  const g = createGistGate();
+  assert.equal(GIST_EXAMPLE, '{"action":"remember","kind":"preference","gist":"User likes tea.","by":"user"}');
+  const first = g.check("memory", { action: "remember", by: "user" });
+  assert.equal(first.block, true);
+  assert.ok(first.reason.includes(GIST_EXAMPLE), first.reason);
+  assert.equal(g.check("memory", { action: "remember", kind: "preference", gist: "User likes tea.", by: "user" }), undefined, "a remember with a gist passes");
+  assert.equal(g.check("memory", { action: "search", query: "tea" }), undefined);
+  assert.equal(g.check("fetch_calendar", {}), undefined);
+  const second = g.check("memory", { action: " Remember ", gist: "   " });
+  assert.deepEqual(second, { block: true, reason: GIST_AGAIN_REASON });
+  assert.equal(GIST_AGAIN_REASON, "Do not call memory again this turn; tell the user it was not saved.");
+  assert.deepEqual(g.check("memory", { action: "remember", gist: 42 }), { block: true, reason: GIST_AGAIN_REASON }, "a gist must be a non-empty string");
+  g.reset();
+  assert.ok(g.check("memory", { action: "remember" }).reason.includes(GIST_EXAMPLE), "a new run starts over");
+  const input = { action: "remember", by: "user" };
+  createGistGate().check("memory", input);
+  assert.deepEqual(input, { action: "remember", by: "user" }, "no gist is filled in");
+});
+
 test("the tool cap blocks from the 9th call, parallel calls counted one by one", () => {
   assert.equal(MAX_TOOL_CALLS, ASSISTANT_MAX_TOOL_CALLS, "the same cap as the host");
   const c = createToolCounter();
@@ -429,16 +452,21 @@ test("only note files in the bridge's notes dir are read (review R1)", () => {
     writeFileSync(outsideNote, "outside");
     const link = join(notesDir, "456.txt");
     symlinkSync(secret, link);
+    const inner = join(notesDir, "100.txt");
+    writeFileSync(inner, "a real note");
+    const innerLink = join(notesDir, "101.txt");
+    symlinkSync(inner, innerLink);
     const linkToNote = join(notesDir, "457.txt");
     symlinkSync(outsideNote, linkToNote);
     writeFileSync(join(notesDir, "abc.txt"), "x");
     writeFileSync(join(notesDir, "12.txt.bak"), "x");
     const home = join(process.env.HOME ?? "/home/x", ".ssh", "id_ed25519");
-    for (const f of [home, secret, link, linkToNote, join(notesDir, "..", "123.txt"), join(notesDir, "abc.txt"), join(notesDir, "12.txt.bak"), "../x.txt", "", notesDir]) {
+    for (const f of [home, secret, link, linkToNote, innerLink, join(notesDir, "..", "123.txt"), join(notesDir, "abc.txt"), join(notesDir, "12.txt.bak"), "../x.txt", "", notesDir]) {
       assert.throws(() => readNote(f, { notesDir }), { code: "ENOTE" }, JSON.stringify(f));
     }
     assert.throws(() => readNote(join(notesDir, "789.txt"), {}), { code: "ENOTE" }, "no notes dir: refused");
     assert.equal(readFileSync(secret, "utf8"), "PRIVATE KEY", "nothing outside was read away or deleted");
+    assert.ok(existsSync(inner) && existsSync(innerLink), "a symlink to a note inside the dir is refused by lstat, and its target stays");
     assert.ok(existsSync(outsideNote) && existsSync(link) && existsSync(linkToNote) && existsSync(join(notesDir, "abc.txt")));
   } finally {
     rmSync(d, { recursive: true, force: true });
@@ -498,8 +526,10 @@ test("the extension registers the schema tools, prints the tools line and wires 
     await pi.fire("agent_start", {});
     assert.deepEqual(await pi.fire("tool_call", { toolName: "memory", toolCallId: "m1", input: { action: "remember", gist: "likes coffee" } }), { block: true, reason: MEMORY_BLOCK_REASON });
     await pi.fire("context", { messages: [...msgs, answer("ok"), user("Remember that I like tea")] });
+    const noGist = await pi.fire("tool_call", { toolName: "memory", toolCallId: "m2a", input: { action: "remember", by: "user" } });
+    assert.ok(noGist.block && noGist.reason.includes(GIST_EXAMPLE));
     assert.equal(await pi.fire("tool_call", { toolName: "memory", toolCallId: "m2", input: { action: "remember", gist: "likes tea" } }), undefined);
-    for (let i = 3; i <= 8; i++) assert.equal(await pi.fire("tool_call", { toolName: "fetch_calendar", toolCallId: `p${i}`, input: {} }), undefined, `call ${i}`);
+    for (let i = 4; i <= 8; i++) assert.equal(await pi.fire("tool_call", { toolName: "fetch_calendar", toolCallId: `p${i}`, input: {} }), undefined, `call ${i}`);
     const ninth = await pi.fire("tool_call", { toolName: "fetch_calendar", toolCallId: "p9", input: {} });
     assert.equal(ninth.block, true);
     await pi.fire("agent_start", {});

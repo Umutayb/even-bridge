@@ -10,6 +10,7 @@
 //   (d) the bridge SIGKILLed mid-turn and restarted → `assistant_restarted` (frame or state.lost), and the
 //       next turn does not resume the cut request (A2 ruling 1);
 //   (e) POST /api/assistant/reset → a new session file, and a memory search still finds tea.
+//   (c) passes with tea stored or an honest "not saved" answer, never a run the tool cap ended.
 // Usage: node scripts/assistant-smoke.mjs [--keep]. Prints JSON lines and never prints a token; writes a
 // summary and the extension log (counts only) to ~/tmp/assistant-a2-run/, then removes ~/tmp/ovs-a2*
 // and the throwaway cwd's core-memory dir (unless --keep). Never touches the live bridge (3456).
@@ -265,14 +266,22 @@ try {
 
   // (c): memory on request only
   const m0 = memLines().length;
+  const logT = extLog().length;
   const c1 = await turn("c-tea", "Remember that I like tea.");
   const m1 = memLines();
+  const noGist = extLog().slice(logT).filter((x) => x.kind === "memory_no_gist").length;
+  const teaStored = m1.length > m0 && m1.slice(m0).some((l) => /tea/i.test(l));
+  // Re-review N1: tea stored, or an honest "not saved" answer; never a run the tool cap ended.
+  const honest = /\b(not|n't|never)\b[^.]{0,40}\b(saved|stored|remembered|save|store)\b|\bcould(n't| not)\b/i.test(c1.text);
   const logC = extLog().length;
   const c2 = await turn("c-coffee", "I like coffee.");
   const m2 = memLines();
   const blocked = extLog().slice(logC).filter((x) => x.kind === "memory_blocked").length;
-  check("c", m1.length > m0 && m1.slice(m0).some((l) => /tea/i.test(l)) && m2.length === m1.length && !m2.some((l) => /coffee/i.test(l)), {
+  check("c", (teaStored || honest) && !c1.errors.includes("assistant_tool_cap") && m2.length === m1.length && !m2.some((l) => /coffee/i.test(l)), {
     teaEntries: m1.length - m0,
+    teaNoGistBlocks: noGist,
+    teaErrors: c1.errors,
+    teaText: c1.text.slice(0, 120),
     coffeeWrites: m2.length - m1.length,
     coffeeBlockedCalls: blocked,
     teaTools: c1.toolNames,
