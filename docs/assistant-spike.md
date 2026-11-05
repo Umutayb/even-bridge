@@ -273,3 +273,9 @@ Runs 4–7 (review fix round 1):
 - **Restart, reset, cap:** the cut run was stubbed and nothing was resumed; reset and the 4096 cap behaved as before.
 - **Check (c) failed in runs 4 and 5.** On "Remember that I like tea." qwen called `memory` 10 and 11 times in one run. The gate blocked none of these calls (no `memory_blocked`), and the tool cap stopped the run, so no entry was written. The tool's replies are not kept: the smoke removes the session. Runs 6 and 7 wrote the entry at the first call (`remember`, kind preference, a gist).
 - **(b) dates asked:** 11-12 and 11-05 (run 4), 11-19 and 11-12 (run 5), 11-05 (run 7).
+
+Runs 8–10 (re-review N1: the extension now blocks a gist-less `memory remember` before it reaches lets-code. The first block shows a complete example; from the second in the same run it says "Do not call memory again this turn; tell the user it was not saved."):
+- **Check (c):** passed 3 of 3. Tea was stored at the first `remember` call each time. No gist-less call occurred (`memory_no_gist` 0), and no run was ended by the tool cap. The coffee writes were blocked by the remember gate (1–4 calls) and nothing was written.
+- **(d) and (e):** passed 3 of 3.
+- **Run 8 failed (b).** It fetched 11-12 and 11-05 (no Lasagna in either result), but the answer then kept generating sentences ("Let me know if you need more. I'm here if you need anything else. …") and repeated Lasagna from its own earlier answer.
+- **Run 9: a hallucinated `<system-reminder>` tail.** Every answer ended with a made-up "This is a reminder that your last message ended with a function call…". Like the `</invoke>` tails, the HUD path (A4) has to cut these.
