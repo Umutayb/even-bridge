@@ -21,6 +21,13 @@ import { transcriptEntriesToWire } from "./wire.mjs";
 
 const MAX_SEEN_IDS = 2000;
 
+// The phone's "thinking" row moves on `running_stats` frames only (the official sessions tick one every 10 s
+// of a turn). A terminal-driven pi turn has no busy/idle events, so the watcher ticks while the transcript is
+// being written: the first write after a quiet spell starts the turn (a user_prompt restarts it), writes keep
+// it alive for FRESH_MS, and a quiet transcript ends it silently (status comes from the poll).
+const STATS_INTERVAL_MS = 10_000;
+const FRESH_MS = 15_000;
+
 export class TranscriptWatcher {
   /**
    * @param {{
@@ -33,7 +40,19 @@ export class TranscriptWatcher {
    *   log?: (line: string) => void,
    * }} deps
    */
-  constructor({ emit, findFile, healthy, active, skipUserEcho, intervalMs = 1000, log = () => {} }) {
+  constructor({
+    emit,
+    findFile,
+    healthy,
+    active,
+    skipUserEcho,
+    intervalMs = 1000,
+    statsIntervalMs = STATS_INTERVAL_MS,
+    freshMs = FRESH_MS,
+    log = () => {},
+  }) {
+    this.statsIntervalMs = statsIntervalMs;
+    this.freshMs = freshMs;
     this.emit = emit;
     this.findFile = findFile;
     this.healthy = healthy;
@@ -78,6 +97,47 @@ export class TranscriptWatcher {
   async tick(sessionId) {
     const w = this.watchers.get(sessionId);
     if (!w) return;
+    await this.readNew(sessionId, w);
+    if (this.watchers.get(sessionId) === w) this.tickStats(sessionId, w);
+  }
+
+  tickStats(sessionId, w) {
+    if (!w.turnStartMs) return;
+    const now = Date.now();
+    if (now - w.lastWriteMs >= this.freshMs) {
+      w.turnStartMs = 0;
+      w.inputTokens = 0;
+      w.outputTokens = 0;
+      return;
+    }
+    if (now - w.lastStatsMs < this.statsIntervalMs) return;
+    w.lastStatsMs = now;
+    this.emit(sessionId, {
+      type: "running_stats",
+      durationMs: now - w.turnStartMs,
+      inputTokens: w.inputTokens,
+      outputTokens: w.outputTokens,
+    });
+  }
+
+  noteWrite(w, entries, msgs) {
+    const now = Date.now();
+    if (!w.turnStartMs || msgs.some((m) => m.type === "user_prompt")) {
+      w.turnStartMs = now;
+      w.lastStatsMs = now;
+      w.inputTokens = 0;
+      w.outputTokens = 0;
+    }
+    w.lastWriteMs = now;
+    for (const e of entries) {
+      const u = e?.type === "message" && e.message?.role === "assistant" ? e.message.usage : null;
+      if (!u) continue;
+      w.inputTokens += (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+      w.outputTokens += u.output ?? 0;
+    }
+  }
+
+  async readNew(sessionId, w) {
     // Prune when no longer relevant.
     if (!this.active(sessionId)) {
       clearInterval(w.timer);
@@ -89,6 +149,7 @@ export class TranscriptWatcher {
     // double-emit. (If an external writer shows up, healthy() flips false.)
     const healthy = await this.healthy(sessionId);
     if (healthy) {
+      w.turnStartMs = 0; // the live child's own session ticks its stats
       // Keep the offset current so a later flip back doesn't replay.
       const file = this.findFile(sessionId);
       if (file) {
@@ -156,6 +217,7 @@ export class TranscriptWatcher {
       const state = (w.state ??= { pending: new Map() });
       if (state.pending.size > 1000) state.pending.clear();
       const msgs = transcriptEntriesToWire(entries, state);
+      if (entries.length) this.noteWrite(w, entries, msgs);
       for (const m of msgs) {
         // The bridge's own tmux-delivered prompt is echoed into the ring at
         // delivery time; the terminal then writes the same prompt to the
