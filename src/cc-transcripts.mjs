@@ -14,6 +14,7 @@ import { readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { summarizeCcToolCall } from "./providers/pi/summarize.mjs";
+import { cleanUserText, isInjectedUserEntry, isSidechainEntry } from "./cc-injected.mjs";
 
 export function ccProjectsBase(override) {
   return override || process.env.EVEN_BRIDGE_CC_DIR || join(homedir(), ".claude", "projects");
@@ -111,13 +112,10 @@ export function ccMeta(file, dirCwd = "") {
   const head = parseCcLines(readHead(file));
   if (!title) {
     for (const e of head) {
-      if (
-        e?.type === "user" &&
-        !e.isCompactSummary &&
-        typeof e.message?.content === "string" &&
-        e.message.content.trim()
-      ) {
-        title = e.message.content.replace(/\s+/g, " ").trim().slice(0, 60);
+      if (e?.type !== "user" || isInjectedUserEntry(e) || isSidechainEntry(e)) continue;
+      const text = typeof e.message?.content === "string" ? cleanUserText(e.message.content) : null;
+      if (text) {
+        title = text.replace(/\s+/g, " ").trim().slice(0, 60);
         break;
       }
     }
@@ -199,8 +197,8 @@ export function recentCcPromptFragments(file, n = 3) {
   const fr = [];
   for (let i = entries.length - 1; i >= 0 && fr.length < n; i--) {
     const e = entries[i];
-    if (e?.type === "user" && !e.isCompactSummary && typeof e.message?.content === "string") {
-      const t = e.message.content.replace(/\s+/g, "").trim();
+    if (e?.type === "user" && !isInjectedUserEntry(e) && !isSidechainEntry(e) && typeof e.message?.content === "string") {
+      const t = (cleanUserText(e.message.content) ?? "").replace(/\s+/g, "").trim();
       if (t) fr.push(t.slice(-40));
     }
   }
@@ -222,11 +220,18 @@ export function ccEntriesToWire(entries, state = {}) {
   const pending = state.pending ?? new Map();
   state.pending = pending;
   for (const e of entries) {
+    // Another agent's thread (subagent / teammate sidechain): never the
+    // wearer's conversation (the official SDK's history drops these too).
+    if (isSidechainEntry(e)) continue;
     if (e?.type === "user") {
       const content = e.message?.content;
+      // Harness-injected turns (isMeta skill bodies / command expansions /
+      // peer hand-backs, task notifications, compact summaries, ...) keep
+      // their tool_results but never show their text as a prompt.
+      const injected = isInjectedUserEntry(e);
       if (typeof content === "string") {
-        // Human prompt (compact summaries are metadata, not user input).
-        if (!e.isCompactSummary && content.trim()) out.push({ type: "user_prompt", text: content });
+        const text = injected ? null : cleanUserText(content);
+        if (text) out.push({ type: "user_prompt", text });
       } else if (Array.isArray(content)) {
         for (const b of content) {
           if (b?.type === "tool_result") {
@@ -240,8 +245,9 @@ export function ccEntriesToWire(entries, state = {}) {
               summary: info ? summarizeCcToolCall(info.name, info.input) : "Tool",
               detail: { input: info?.input ?? {}, output: toolResultText(b) },
             });
-          } else if (typeof b?.text === "string" && b.text.trim()) {
-            out.push({ type: "user_prompt", text: b.text });
+          } else if (!injected && typeof b?.text === "string") {
+            const text = cleanUserText(b.text);
+            if (text) out.push({ type: "user_prompt", text });
           }
         }
       }

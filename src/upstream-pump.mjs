@@ -38,6 +38,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import { historyCoveredIndex } from "./hub.mjs";
+import { cleanUserText } from "./cc-injected.mjs";
 
 const IDLE_STOP_MS = 600_000; // fork: PUMP_IDLE_STOP_S
 const RING_SIZE = 500; // fork: MAX_MESSAGES_PER_SESSION — reset-detection threshold
@@ -283,7 +284,15 @@ export class UpstreamPump {
     }
     if (data === null || data === "") return;
     if (this.discarding) return;
-    const msg = JSON.parse(data);
+    let msg = JSON.parse(data);
+    // The fork turns every RC `user` event whose text does not start with "<"
+    // into a user_prompt; harness notices ("[Request interrupted by user]",
+    // "[SYSTEM NOTIFICATION …]"), peer envelopes and appended reminders get
+    // through. Drop / clean them here (the id still advances the water mark).
+    if (msg?.type === "user_prompt") {
+      const text = cleanUserText(msg.text);
+      msg = text ? (text === msg.text ? msg : { ...msg, text }) : null;
+    }
     if (typeof id === "number" && Number.isFinite(id)) {
       if (this.awaitFirstId) {
         this.awaitFirstId = false;
@@ -304,11 +313,13 @@ export class UpstreamPump {
       }
       if (id <= this.lastUpstreamId) return; // replayed / already fed
       this.lastUpstreamId = id;
+      if (!msg) return; // injected prompt: counted, not relayed
       if (id <= this.seedUntil) {
         this.hub.seed(this.sid, msg); // history the phone already has
         return;
       }
     }
+    if (!msg) return;
     this.hub.feed(this.sid, msg);
   }
 

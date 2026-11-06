@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { PumpManager } from "../upstream-pump.mjs";
 import { claim, forget } from "../ownership.mjs";
+import { cleanUserText } from "../cc-injected.mjs";
 
 const NAME = "claude-remote";
 const WIRE_PROVIDER = "claude"; // what the phone sees
@@ -195,7 +196,19 @@ export function createClaudeRemoteProvider(emit, { hub, baseUrl, token } = {}) {
       const n = Math.max(1, Math.min(limit, HISTORY_MAX));
       const r = await rpcGet(`/api/sessions/${encodeURIComponent(sessionId)}/history?limit=${n}`);
       if (r.status !== 200) return [];
-      return (r.body?.history ?? []).map((h) => ({ role: h.role ?? "assistant", text: String(h.text ?? "") }));
+      // The fork's /history drops only "<"-leading user rows (not its own
+      // isSynthetic ones): clean the rest of the injected turns here.
+      const out = [];
+      for (const h of r.body?.history ?? []) {
+        const role = h.role ?? "assistant";
+        let text = String(h.text ?? "");
+        if (role === "user") {
+          text = cleanUserText(text);
+          if (!text) continue;
+        }
+        out.push({ role, text });
+      }
+      return out;
     },
 
     async prompt(sessionId, text, cwd) {
