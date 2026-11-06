@@ -6,8 +6,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { cleanUserText, isInjectedUserEntry } from "../src/cc-injected.mjs";
-import { ccEntriesToWire } from "../src/cc-transcripts.mjs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { cleanUserText, isInjectedUserEntry, userTextMode } from "../src/cc-injected.mjs";
+import { ccEntriesToWire, recentCcPromptFragments } from "../src/cc-transcripts.mjs";
 import { UpstreamPump } from "../src/upstream-pump.mjs";
 import { Hub } from "../src/hub.mjs";
 import { createClaudeRemoteProvider } from "../src/providers/claude-remote.mjs";
@@ -109,8 +112,8 @@ test("local CC: prompt with an appended system-reminder keeps only the prompt", 
   assert.deepEqual(wire, [{ type: "user_prompt", text: "fix the fixture" }]);
 });
 
-test("local CC: prompt with a leading system-reminder keeps the human text", () => {
-  const wire = ccEntriesToWire([u(`${REMINDER}\nwhat now?`, human)]);
+test("local CC (no flags): prompt with a leading system-reminder keeps the human text", () => {
+  const wire = ccEntriesToWire([u(`${REMINDER}\nwhat now?`)]);
   assert.deepEqual(wire, [{ type: "user_prompt", text: "what now?" }]);
 });
 
@@ -128,7 +131,7 @@ test("cleanUserText leaves prose that merely mentions the tags alone", () => {
 });
 
 test("cleanUserText drops whole injected turns", () => {
-  for (const t of [TASK_NOTE, PEER, REMINDER, "  \n" + REMINDER, "[SYSTEM NOTIFICATION - NOT USER INPUT]\nx", "[Request interrupted by user]", "<local-command-stdout></local-command-stdout>", "<some-new-harness-tag>x</some-new-harness-tag>", '<relay from="coordinator" id="1">x</relay>', "<system-reminder>unterminated"]) {
+  for (const t of [TASK_NOTE, PEER, REMINDER, "  \n" + REMINDER, "[SYSTEM NOTIFICATION - NOT USER INPUT]\nx", "[Request interrupted by user]", "<local-command-stdout></local-command-stdout>", '<relay from="coordinator" id="1">x</relay>', "<system-reminder>unterminated"]) {
     assert.equal(cleanUserText(t), null, t);
   }
 });
@@ -225,4 +228,99 @@ test("RC /history: injected user rows from the fork are dropped, real ones kept"
   } finally {
     server.close();
   }
+});
+
+// ── fix round 1: false drops ───────────────────────────────────────────────
+const USER_TEXTS = [
+  "<my-component> doesn't render",
+  "<v-if> question about the template",
+  "<x-y z> unterminated generic",
+  "<my-notes>buy milk</my-notes>",
+  "<user_profile>\n<name>A</name>\n</user_profile>",
+  "<app-root></app-root> is empty in prod, why",
+  '<div class="card">\n  <p>synthetic pasted html</p>\n</div>\nwhy is the padding off?',
+  '<?xml version="1.0"?>\n<config><item key="a">1</item></config>',
+  "<some-new-tag>x</some-new-tag> and more",
+  "[draft] synthetic draft reply",
+];
+
+for (const t of USER_TEXTS) {
+  test(`false-drop guard (no flags and human): ${JSON.stringify(t.slice(0, 30))}`, () => {
+    assert.equal(cleanUserText(t), t);
+    assert.deepEqual(ccEntriesToWire([u(t)]), [{ type: "user_prompt", text: t }]);
+    assert.deepEqual(ccEntriesToWire([u(t, human)]), [{ type: "user_prompt", text: t }]);
+  });
+}
+
+const QUOTED_BY_HUMAN = [
+  "<system-reminder> leaks to the glasses, why?",
+  'Note: <agent-message from="x">hi</agent-message> why does this show?',
+  "[Request interrupted by user] keeps appearing, why",
+  "[SYSTEM NOTIFICATION] is what my logger prints",
+  "Base directory for this skill: what does that mean?",
+  "<system-reminder>quoted block</system-reminder>\nwhy is this on the glasses",
+  "<task-notification>pasted</task-notification> is this the leak?",
+];
+
+for (const t of QUOTED_BY_HUMAN) {
+  test(`human-typed prompt quoting a marker survives: ${JSON.stringify(t.slice(0, 30))}`, () => {
+    for (const flags of [human, { origin: { kind: "human" } }, { promptSource: "queued" }]) {
+      assert.deepEqual(ccEntriesToWire([u(t, flags)]), [{ type: "user_prompt", text: t }], JSON.stringify(flags));
+      assert.deepEqual(ccEntriesToWire([u([{ type: "text", text: t }], flags)]), [{ type: "user_prompt", text: t }]);
+    }
+  });
+}
+
+test("human-typed: !command renders, appended reminder still stripped", () => {
+  assert.deepEqual(ccEntriesToWire([u("<bash-input>ls -la</bash-input>", human)]), [{ type: "user_prompt", text: "!ls -la" }]);
+  assert.deepEqual(ccEntriesToWire([u(`hello there\n${REMINDER}`, human)]), [{ type: "user_prompt", text: "hello there" }]);
+});
+
+test("unknown origin.kind fails open: plain text kept, marker text still dropped", () => {
+  assert.equal(userTextMode(u("x", { origin: { kind: "voice-fixture" } })), "flagless");
+  assert.deepEqual(ccEntriesToWire([u("synthetic spoken prompt", { origin: { kind: "voice-fixture" } })]), [
+    { type: "user_prompt", text: "synthetic spoken prompt" },
+  ]);
+  assert.deepEqual(ccEntriesToWire([u(TASK_NOTE, { origin: { kind: "voice-fixture" } })]), []);
+});
+
+test("RC /history-only prefaces: slash-command expansion and compact summary", () => {
+  const exp = "# /fixture - Synthetic command expansion\n\nDo the thing.";
+  const compact = "This session is being continued from a previous conversation that ran out of context. Synthetic.";
+  assert.equal(cleanUserText(exp, { history: true }), null);
+  assert.equal(cleanUserText(compact, { history: true }), null);
+  assert.equal(cleanUserText("# /etc/hosts is wrong", { history: true }), "# /etc/hosts is wrong");
+  assert.equal(cleanUserText(exp), exp, "only on the flagless /history path");
+  assert.deepEqual(ccEntriesToWire([u(exp, human)]), [{ type: "user_prompt", text: exp }]);
+});
+
+test("RC /history: expansion and compact rows are dropped by getHistory", async () => {
+  const { server, url } = await startUpstream({
+    history: [
+      { role: "user", text: "real wearer prompt" },
+      { role: "user", text: "# /fixture - Synthetic command expansion" },
+      { role: "user", text: "This session is being continued from a previous conversation. Synthetic." },
+      { role: "user", text: "<my-component> doesn't render" },
+    ],
+  });
+  const p = createClaudeRemoteProvider(() => {}, { hub: new Hub(), baseUrl: url, token: "" });
+  try {
+    assert.deepEqual((await p.getHistory("cse_fixture", 10)).map((h) => h.text), ["real wearer prompt", "<my-component> doesn't render"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("prompt fragments skip bare /command and !command renderings", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cc-injected-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "s.jsonl");
+  const lines = [
+    u("a long enough synthetic prompt", human),
+    u("<command-name>/clear</command-name>\n<command-message>clear</command-message>", human),
+    u("<bash-input>ls</bash-input>", human),
+    u("<command-name>/fixture</command-name><command-args>with args</command-args>", human),
+  ];
+  writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  assert.deepEqual(recentCcPromptFragments(file, 5), ["/fixturewithargs", "alongenoughsyntheticprompt"]);
 });

@@ -203,7 +203,7 @@ export function createClaudeRemoteProvider(emit, { hub, baseUrl, token } = {}) {
         const role = h.role ?? "assistant";
         let text = String(h.text ?? "");
         if (role === "user") {
-          text = cleanUserText(text);
+          text = cleanUserText(text, { history: true });
           if (!text) continue;
         }
         out.push({ role, text });

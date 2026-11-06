@@ -11,15 +11,19 @@
 // (or replayed by /history) they read on the glasses as if the wearer had
 // said them.
 //
-// Two layers, used by every transcript -> wire path:
-//   * isInjectedUserEntry(entry): the flags on a local transcript entry (the
-//     official SDK drops isMeta / isSidechain / teamName entries the same way;
-//     non-human origin kinds are harness turns).
-//   * cleanUserText(text): text-only, for paths where the flags are gone (the
-//     RC fork's /events frames and /history rows). Strips WHOLE harness tag
-//     blocks at the start (and known harness blocks at the end) of the turn;
-//     returns null when nothing the human wrote remains. A real prompt that
-//     merely mentions a tag in its prose is left alone.
+// Every transcript -> wire path classifies a user entry first (userTextMode):
+//   "drop"     the flags say it is injected (isMeta, compact summary,
+//              isSynthetic, a known non-human origin.kind, promptSource
+//              "system") — its text is never shown (tool_results still are);
+//   "human"    the flags say a human typed it (origin.kind "human",
+//              promptSource typed/queued) — never dropped, only RENDERED
+//              (typed /command and !command blocks) and an appended reminder
+//              block stripped;
+//   "flagless" no verdict from the flags (RC fork frames and /history rows,
+//              older transcripts, an unknown origin.kind) — the text-only
+//              rules below drop whole known harness blocks and notices.
+// A real prompt that merely mentions a tag in its prose is left alone, and
+// unknown tags (custom elements, pasted XML) are the user's text.
 
 /** Harness tag names (whole blocks of these are never the human's words). */
 const HARNESS_TAGS = new Set([
@@ -43,27 +47,23 @@ const HARNESS_TAGS = new Set([
   "hook-output",
 ]);
 
-/** Tag blocks the human produced (a paste) — never stripped. */
-const USER_TAGS = new Set(["pasted_content"]);
+/** Blocks that carry what the human typed (rendered, not dropped). */
+const RENDER_TAGS = new Set(["command-name", "command-message", "command-args", "command-contents", "bash-input"]);
 
 /** Inter-agent envelopes: the whole turn is another agent's message. */
 const ENVELOPE_TAGS = ["agent-message", "cross-session-message", "teammate-message", "relay"];
+
+/** origin.kind values Claude Code uses for turns no human typed. */
+const INJECTED_KINDS = new Set(["task-notification", "peer", "coordinator"]);
 
 // Leading notices Claude Code writes in square brackets.
 const NOTICE_RE = /^\s*\[(?:SYSTEM NOTIFICATION\b[^\]]*|Request interrupted by user[^\]]*)\]/;
 // A skill body Claude Code injects when a skill loads (isMeta locally; the RC
 // fork's /history rows have lost that flag, the fixed preface remains).
 const SKILL_BODY_RE = /^\s*Base directory for this skill: /;
-
-// Generic harness-looking tag name: lowercase, hyphen/underscore-joined
-// (system-reminder, local-command-stdout, ...). Plain HTML-ish tags (<b>,
-// <div>) in a prompt are not treated as harness blocks.
-const GENERIC_TAG_RE = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+$/;
-
-function isHarnessTag(name) {
-  if (USER_TAGS.has(name)) return false;
-  return HARNESS_TAGS.has(name) || GENERIC_TAG_RE.test(name);
-}
+// RC /history rows only (no flags at all there): a slash-command expansion
+// header and a compact summary.
+const HISTORY_ONLY_RES = [/^\s*# \/[\w:.-]+(?=[\s]|$)/, /^\s*This session is being continued from a previous conversation/];
 
 /** A whole `<name ...>...</name>` block at the start of `s`, or null. */
 function leadingBlock(s) {
@@ -76,7 +76,7 @@ function leadingBlock(s) {
   return { name, inner: s.slice(m[0].length, end), rest: s.slice(end + close.length) };
 }
 
-/** A whole known harness block at the end of `s` (prompt + appended reminder). */
+/** A whole known harness block appended on its own line at the end of `s`. */
 function stripTrailingHarness(s) {
   for (;;) {
     const m = /<\/([A-Za-z][\w-]*)>\s*$/.exec(s);
@@ -86,59 +86,99 @@ function stripTrailingHarness(s) {
     const ch = s[open + m[1].length + 1];
     if (ch !== ">" && !/\s/.test(ch ?? "")) return s;
     // Only an APPENDED block: it opens on its own line (prose that quotes a tag keeps it).
-    if (open > 0 && !/\n[ \t]*$/.test(s.slice(0, open))) return s;
+    if (open === 0 || !/\n[ \t]*$/.test(s.slice(0, open))) return s;
     s = s.slice(0, open);
   }
+}
+
+/** A turn made only of typed /command or !command blocks -> its rendering, else null. */
+function renderCommand(text) {
+  let s = text;
+  let command = null;
+  let args = "";
+  let bash = null;
+  let any = false;
+  for (;;) {
+    const b = leadingBlock(s);
+    if (!b || !RENDER_TAGS.has(b.name) || b.inner === null) break;
+    any = true;
+    if (b.name === "command-name") command = b.inner.trim();
+    else if (b.name === "command-args") args = b.inner.trim();
+    else if (b.name === "bash-input") bash = b.inner.trim();
+    s = b.rest;
+  }
+  if (!any || s.trim()) return null;
+  if (command) {
+    const name = command.startsWith("/") ? command : `/${command}`;
+    return args ? `${name} ${args}` : name;
+  }
+  if (bash) return `!${bash}`;
+  return null;
 }
 
 /**
  * Text of one Claude Code user turn as the glasses should show it, or null
  * when it is harness-injected / inter-agent content.
- *  - `<command-name>/x</command-name>…<command-args>a</command-args>` -> "/x a"
- *  - `<bash-input>cmd</bash-input>` -> "!cmd" (the wearer's own `!` command)
- *  - other leading harness blocks are stripped; nothing left -> null
+ * @param {string} text
+ * @param {{ human?: boolean, history?: boolean }} [o]
+ *   human: the transcript marks it human-typed — render only, never drop;
+ *   history: an RC /history row (no flags) — also drop the fixed
+ *   slash-command-expansion and compact-summary prefaces.
  */
-export function cleanUserText(text) {
+export function cleanUserText(text, { human = false, history = false } = {}) {
   if (typeof text !== "string") return null;
   if (!text.trim()) return null;
+  const rendered = renderCommand(text);
+  if (rendered) return rendered;
+  if (human) {
+    const s = stripTrailingHarness(text).trim();
+    return s && s !== text.trim() ? s : text;
+  }
   if (NOTICE_RE.test(text) || SKILL_BODY_RE.test(text)) return null;
+  if (history && HISTORY_ONLY_RES.some((re) => re.test(text))) return null;
   // Inter-agent envelope: the turn opens with it, or with a one-line preface
   // ending in ":" ("Message from X: <agent-message from=…>…</agent-message>").
   const env = /^\s*(?:[^\n<]{1,120}:\s*)?<([a-z][\w-]*)\s[^>]*\bfrom=/.exec(text);
   if (env && ENVELOPE_TAGS.includes(env[1]) && text.includes(`</${env[1]}>`)) return null;
 
   let s = text;
-  let command = null;
-  let commandArgs = "";
-  let bash = null;
   for (;;) {
     const b = leadingBlock(s);
-    if (!b || !isHarnessTag(b.name)) break;
+    if (!b || !HARNESS_TAGS.has(b.name)) break;
     if (b.inner === null) return null; // an unterminated harness block: nothing typed follows
-    if (b.name === "command-name") command = b.inner.trim();
-    else if (b.name === "command-args") commandArgs = b.inner.trim();
-    else if (b.name === "bash-input") bash = b.inner.trim();
     s = b.rest;
   }
   s = stripTrailingHarness(s).trim();
-  if (s) return s === text.trim() ? text : s;
-  if (command) return commandArgs ? `${command.startsWith("/") ? "" : "/"}${command} ${commandArgs}` : `${command.startsWith("/") ? "" : "/"}${command}`;
-  if (bash) return `!${bash}`;
-  return null;
+  if (!s) return null;
+  return s === text.trim() ? text : s;
 }
 
 /**
- * True when a local transcript `user` entry's TEXT is not the human's (its
- * tool_result blocks still count — those are tool output, not prompts).
+ * "drop" | "human" | "flagless" for a local transcript `user` entry (see the
+ * header). An unknown origin.kind fails OPEN (flagless: only marker-bearing
+ * text is dropped).
  */
-export function isInjectedUserEntry(e) {
-  if (!e || typeof e !== "object") return false;
-  if (e.isMeta === true || e.isCompactSummary === true || e.isVisibleInTranscriptOnly === true) return true;
-  if (e.isSynthetic === true) return true;
+export function userTextMode(e) {
+  if (!e || typeof e !== "object") return "flagless";
+  if (e.isMeta === true || e.isCompactSummary === true || e.isVisibleInTranscriptOnly === true) return "drop";
+  if (e.isSynthetic === true) return "drop";
   const kind = e.origin && typeof e.origin === "object" ? e.origin.kind : undefined;
-  if (kind !== undefined && kind !== null && kind !== "human") return true;
-  if (e.promptSource === "system") return true;
-  return false;
+  if (INJECTED_KINDS.has(kind)) return "drop";
+  if (e.promptSource === "system") return "drop";
+  if (kind === "human" || e.promptSource === "typed" || e.promptSource === "queued") return "human";
+  return "flagless";
+}
+
+/** True when a local transcript `user` entry's TEXT is not the human's. */
+export function isInjectedUserEntry(e) {
+  return userTextMode(e) === "drop";
+}
+
+/** The glasses text of a local transcript user entry's text, or null. */
+export function entryUserText(e, text) {
+  const mode = userTextMode(e);
+  if (mode === "drop") return null;
+  return cleanUserText(text, { human: mode === "human" });
 }
 
 /** True when a whole transcript entry belongs to another agent's thread. */

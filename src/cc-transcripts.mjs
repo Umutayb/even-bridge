@@ -14,7 +14,7 @@ import { readdirSync, statSync, openSync, fstatSync, readSync, closeSync } from 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { summarizeCcToolCall } from "./providers/pi/summarize.mjs";
-import { cleanUserText, isInjectedUserEntry, isSidechainEntry } from "./cc-injected.mjs";
+import { entryUserText, isSidechainEntry } from "./cc-injected.mjs";
 
 export function ccProjectsBase(override) {
   return override || process.env.EVEN_BRIDGE_CC_DIR || join(homedir(), ".claude", "projects");
@@ -112,8 +112,8 @@ export function ccMeta(file, dirCwd = "") {
   const head = parseCcLines(readHead(file));
   if (!title) {
     for (const e of head) {
-      if (e?.type !== "user" || isInjectedUserEntry(e) || isSidechainEntry(e)) continue;
-      const text = typeof e.message?.content === "string" ? cleanUserText(e.message.content) : null;
+      if (e?.type !== "user" || isSidechainEntry(e)) continue;
+      const text = typeof e.message?.content === "string" ? entryUserText(e, e.message.content) : null;
       if (text) {
         title = text.replace(/\s+/g, " ").trim().slice(0, 60);
         break;
@@ -197,8 +197,11 @@ export function recentCcPromptFragments(file, n = 3) {
   const fr = [];
   for (let i = entries.length - 1; i >= 0 && fr.length < n; i--) {
     const e = entries[i];
-    if (e?.type === "user" && !isInjectedUserEntry(e) && !isSidechainEntry(e) && typeof e.message?.content === "string") {
-      const t = (cleanUserText(e.message.content) ?? "").replace(/\s+/g, "").trim();
+    if (e?.type === "user" && !isSidechainEntry(e) && typeof e.message?.content === "string") {
+      const text = entryUserText(e, e.message.content) ?? "";
+      // A bare rendered "/clear" or "!ls" is on many screens: never a match key.
+      if (/^[/!]\S*$/.test(text.trim())) continue;
+      const t = text.replace(/\s+/g, "").trim();
       if (t) fr.push(t.slice(-40));
     }
   }
@@ -228,9 +231,8 @@ export function ccEntriesToWire(entries, state = {}) {
       // Harness-injected turns (isMeta skill bodies / command expansions /
       // peer hand-backs, task notifications, compact summaries, ...) keep
       // their tool_results but never show their text as a prompt.
-      const injected = isInjectedUserEntry(e);
       if (typeof content === "string") {
-        const text = injected ? null : cleanUserText(content);
+        const text = entryUserText(e, content);
         if (text) out.push({ type: "user_prompt", text });
       } else if (Array.isArray(content)) {
         for (const b of content) {
@@ -245,8 +247,8 @@ export function ccEntriesToWire(entries, state = {}) {
               summary: info ? summarizeCcToolCall(info.name, info.input) : "Tool",
               detail: { input: info?.input ?? {}, output: toolResultText(b) },
             });
-          } else if (!injected && typeof b?.text === "string") {
-            const text = cleanUserText(b.text);
+          } else if (typeof b?.text === "string") {
+            const text = entryUserText(e, b.text);
             if (text) out.push({ type: "user_prompt", text });
           }
         }
