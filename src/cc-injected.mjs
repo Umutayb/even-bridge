@@ -16,7 +16,8 @@
 //              isSynthetic, a known non-human origin.kind, promptSource
 //              "system") — its text is never shown (tool_results still are);
 //   "human"    the flags say a human typed it (origin.kind "human",
-//              promptSource typed/queued) — never dropped, only RENDERED
+//              promptSource typed/queued, or promptSource "sdk" with no
+//              origin: the bridge relaying the wearer) — never dropped, only RENDERED
 //              (typed /command and !command blocks) and an appended reminder
 //              block stripped;
 //   "flagless" no verdict from the flags (RC fork frames and /history rows,
@@ -63,7 +64,8 @@ const NOTICE_RE = /^\s*\[(?:SYSTEM NOTIFICATION\b[^\]]*|Request interrupted by u
 const SKILL_BODY_RE = /^\s*Base directory for this skill: /;
 // RC /history rows only (no flags at all there): a slash-command expansion
 // header and a compact summary.
-const HISTORY_ONLY_RES = [/^\s*# \/[\w:.-]+(?=[\s]|$)/, /^\s*This session is being continued from a previous conversation/];
+// Every real expansion header reads "# /<name> - <description>".
+const HISTORY_ONLY_RES = [/^\s*# \/[\w:.-]+ - /, /^\s*This session is being continued from a previous conversation/];
 
 /** A whole `<name ...>...</name>` block at the start of `s`, or null. */
 function leadingBlock(s) {
@@ -166,6 +168,8 @@ export function userTextMode(e) {
   if (INJECTED_KINDS.has(kind)) return "drop";
   if (e.promptSource === "system") return "drop";
   if (kind === "human" || e.promptSource === "typed" || e.promptSource === "queued") return "human";
+  // A prompt the bridge itself sent through the SDK: the wearer's words, relayed.
+  if (e.promptSource === "sdk" && kind === undefined) return "human";
   return "flagless";
 }
 

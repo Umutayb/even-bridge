@@ -324,3 +324,24 @@ test("prompt fragments skip bare /command and !command renderings", (t) => {
   writeFileSync(file, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
   assert.deepEqual(recentCcPromptFragments(file, 5), ["/fixturewithargs", "alongenoughsyntheticprompt"]);
 });
+
+// ── fix round 2 ────────────────────────────────────────────────────────────
+for (const t of ["# /home layout", "# /home", "# /clear", "# /api endpoints\nlist them", "# /etc/hosts is wrong", "# /r/whatever thread", "# /usr/local/bin is not on PATH"]) {
+  test(`RC /history keeps a real prompt starting with "# /": ${JSON.stringify(t)}`, () => {
+    assert.equal(cleanUserText(t, { history: true }), t);
+  });
+}
+
+test("RC /history still drops a real-shaped expansion header '# /<name> - '", () => {
+  assert.equal(cleanUserText("# /fixture:sub - Synthetic expansion\n\nbody", { history: true }), null);
+});
+
+test("promptSource sdk with no origin is the user's relayed words: render only, never drop", () => {
+  const sdk = { promptSource: "sdk", userType: "external", entrypoint: "sdk-ts" };
+  assert.equal(userTextMode(u("x", sdk)), "human");
+  for (const t of ["[Request interrupted by user] still shows, why?", "<system-reminder> on the glasses?", "plain relayed prompt"]) {
+    assert.deepEqual(ccEntriesToWire([u(t, sdk)]), [{ type: "user_prompt", text: t }]);
+  }
+  assert.deepEqual(ccEntriesToWire([u(`relayed prompt\n${REMINDER}`, sdk)]), [{ type: "user_prompt", text: "relayed prompt" }]);
+  assert.equal(userTextMode(u("x", { promptSource: "sdk", origin: { kind: "task-notification" } })), "drop");
+});
