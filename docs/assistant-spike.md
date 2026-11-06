@@ -279,3 +279,30 @@ Runs 8–10 (re-review N1: the extension now blocks a gist-less `memory remember
 - **(d) and (e):** passed 3 of 3.
 - **Run 8 failed (b).** It fetched 11-12 and 11-05 (no Lasagna in either result), but the answer then kept generating sentences ("Let me know if you need more. I'm here if you need anything else. …") and repeated Lasagna from its own earlier answer.
 - **Run 9: a hallucinated `<system-reminder>` tail.** Every answer ended with a made-up "This is a reminder that your last message ended with a function call…". Like the `</invoke>` tails, the HUD path (A4) has to cut these.
+
+## Sandbox (A4 real run, 2026-11-06)
+
+The shim relay (`shim/assistant_turn.py`, shim branch `assistant-relay`) driven through `tools/ai_sandbox.py` against a
+throwaway shim on `127.0.0.1:8813` (own data dir and HOME, `SHIM_ASSISTANT_ENABLE=1`, pref `evenai_engine=agent`, tool
+server on 8817 with its own token) and a throwaway bridge on 3466 (own store, own assistant API token file, tools URL
+→ 8817), real lets-code + vLLM qwen at medium, one prompt at a time. The sandbox is the bound glasses turn: its `ask`
+replies are stubs (`--no-ask-reply` = a phone that never answers). The loop's model was a stub on 8818 (no secret was
+read: a fallback answer is visibly the stub's), web search a stub on 8819 that answers after 9 s. Phase 2 restarted the
+bridge with `EVEN_BRIDGE_ASSISTANT_DEADLINE_S=6`. Two runs; times are ms from the request, run 2 (run 1 in brackets).
+Raw output (no tokens): `~/tmp/assistant-a4-run/` (run 2), `~/tmp/assistant-a4-run1/` (run 1).
+
+| turn | first frame | end | path | answer |
+|---|---|---|---|---|
+| "Say something nice about Tuesdays." | 1981 (4011, the think line) | 1999 (16 790) | agent | a Tuesday sentence; run 1's first prompt waited 14.2 s for its first thinking token (cold prefix, shared vLLM) |
+| "What's on my calendar Friday?", phone silent | 1889 (1546) progress | 8719 (8404) | agent | "Your phone didn't answer in time, so I couldn't read today's calendar." (2 asks × 3 s, nothing invented) |
+| "What's on my calendar Friday?", sandbox stub | 654 (823) progress | 1277 (1764) | agent | "a gym session, though the time isn't pinned down" (the stub has no time) |
+| "Which coding agents are running right now?" | 610 (686) progress | 1105 (1264) | agent | "no coding agents are running right now" |
+| "Tell me one fun fact about owls." (run 2 only) | 680 | 692 | agent | an owl fact, no progress line |
+| "Thanks, bye" | 2 (1) | 18 (15) | pre-turn | "Goodbye!", `cmd evenai off` before `end`, a note to the assistant |
+| "Search the web for the aurora forecast for tonight." (deadline 6 s, search 9 s) | 820 (804) progress | 6057 (6065) | loop | `assistant_deadline` at 6 s → the loop's (stub) answer after the progress line |
+| the same no-tool question with the bridge stopped | 23 (23) | 28 (32) | loop | the loop's (stub) answer at once |
+
+Every turn had exactly one `start` and one `end`; at most one progress line, always first. Against the design's
+targets: first frame ≤ 5 s held in every turn (the think line covered run 1's slow first prompt at 4.0 s); no-tool
+final p50 ≈ 0.7–2.0 s, one-tool 1.1–1.3 s with a phone that answers. Teardown: no `even-lc-dur-assistant-*` scope,
+ports 3466/8813/8817/8818/8819 free, `~/tmp/ovs-a4` and the throwaway core-memory dir removed.
