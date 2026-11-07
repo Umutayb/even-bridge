@@ -192,29 +192,31 @@ export function renderCoreMemory(entries, { root, archived = 0, now = Date.now()
   return head.concat(lines).join("\n") + "\n";
 }
 
-/** [{ e, raw }] of a store file (unreadable lines are dropped, as lets-code's next save drops them). */
+/** { rows: [{ e, raw }], bad } of a store file (lets-code would drop an unreadable line at its next save). */
 function readCoreMemory(file) {
   let text = "";
   try {
     text = readFileSync(file, "utf8");
   } catch {
-    return [];
+    return { rows: [], bad: 0 };
   }
-  const out = [];
+  const rows = [];
+  let bad = 0;
   for (const raw of text.split("\n")) {
     if (!raw.trim()) continue;
     try {
       const e = JSON.parse(raw);
-      if (e && typeof e.id === "string" && typeof e.gist === "string" && Array.isArray(e.refs)) out.push({ e, raw });
+      if (e && typeof e.id === "string" && typeof e.gist === "string" && Array.isArray(e.refs)) rows.push({ e, raw });
+      else bad += 1;
     } catch {
-      /* lets-code skips it too */
+      bad += 1;
     }
   }
-  return out;
+  return { rows, bad };
 }
 
 function archivedCount(file) {
-  return readCoreMemory(join(dirname(file), "archive.jsonl")).length;
+  return readCoreMemory(join(dirname(file), "archive.jsonl")).rows.length;
 }
 
 function atomicWrite(file, text) {
@@ -225,20 +227,32 @@ function atomicWrite(file, text) {
 }
 
 /**
- * Replace every kb pointer of the store with `pointers` ({ id?, gist, refs }); everything else stays byte-for-byte.
- * Throws 409 when memory.md was edited after memory.jsonl (lets-code reads that edit back at its next start).
- * → { replaced, added } (both 0 when the set is unchanged: nothing written).
+ * Can the store be rewritten? 409 when memory.md was edited after memory.jsonl (lets-code reads that edit back at its
+ * next start) or when a line is unreadable (refused, as the shim's import refuses: nothing is dropped silently).
+ * → the store's rows.
+ */
+export function checkCoreMemory(file) {
+  const md = file.replace(/\.jsonl$/, ".md");
+  let mdNewer = false;
+  try {
+    mdNewer = existsSync(md) && existsSync(file) && statSync(md).mtimeMs > statSync(file).mtimeMs + MD_SLACK_MS;
+  } catch {
+    /* unreadable stats: lets-code keeps the store too */
+  }
+  if (mdNewer) throw httpError(409, "memory.md was edited after memory.jsonl; the assistant reads it back first (restart it), then send the pointers again");
+  const { rows, bad } = readCoreMemory(file);
+  if (bad) throw httpError(409, `${file} has ${bad} unreadable line${bad === 1 ? "" : "s"}; fix or remove ${bad === 1 ? "it" : "them"} first`);
+  return rows;
+}
+
+/**
+ * Replace every kb pointer of the store with `pointers` ({ id?, gist, refs }), keeping the file's line order: the
+ * kb pointer lines are replaced in place (in order), extra ones dropped, new ones appended; every other line keeps its
+ * bytes. A pointer with a `kb:` ref is the KB's (isKbPointer), also one the agent wrote itself: the next set replaces
+ * it. Throws 409 (checkCoreMemory). → { replaced, added } (both 0 when the set is unchanged: nothing written).
  */
 export function writeKbPointers(file, pointers, { root, now = Date.now(), home = homedir() } = {}) {
-  const md = file.replace(/\.jsonl$/, ".md");
-  try {
-    if (existsSync(md) && existsSync(file) && statSync(md).mtimeMs > statSync(file).mtimeMs + MD_SLACK_MS) {
-      throw httpError(409, "memory.md was edited after memory.jsonl; the assistant reads it back first (restart it), then send the pointers again");
-    }
-  } catch (err) {
-    if (err.statusCode) throw err;
-  }
-  const rows = readCoreMemory(file);
+  const rows = checkCoreMemory(file);
   const old = rows.filter(({ e }) => isKbPointer(e));
   const ids = new Set(rows.filter(({ e }) => !isKbPointer(e)).map(({ e }) => e.id));
   const fresh = [];
@@ -250,14 +264,20 @@ export function writeKbPointers(file, pointers, { root, now = Date.now(), home =
     const kept = old.find(({ e }) => e.id === id && e.gist === gist && JSON.stringify(e.refs) === JSON.stringify(p.refs));
     fresh.push(kept ? kept.e : { id, t: now, u: now, kind: "pointer", gist, refs: [...p.refs], by: "harness", n: 1 });
   }
-  const same = old.length === fresh.length && old.every(({ e }) => fresh.includes(e));
+  const same = old.length === fresh.length && old.every(({ e }, i) => fresh[i] === e);
   if (same) return { replaced: 0, added: 0 };
   const rawOf = new Map(rows.map(({ e, raw }) => [e, raw]));
-  const entries = [...rows.filter(({ e }) => !isKbPointer(e)).map(({ e }) => e), ...fresh].sort((a, b) => (a.t || 0) - (b.t || 0));
+  const queue = [...fresh];
+  const entries = [];
+  for (const { e } of rows) {
+    if (!isKbPointer(e)) entries.push(e);
+    else if (queue.length) entries.push(queue.shift());
+  }
+  entries.push(...queue);
   const dir = dirname(file);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   // memory.md first, then the JSONL: lets-code must never find the markdown newer.
-  atomicWrite(md, renderCoreMemory(entries, { root, archived: archivedCount(file), now, home }));
+  atomicWrite(file.replace(/\.jsonl$/, ".md"), renderCoreMemory(entries, { root, archived: archivedCount(file), now, home }));
   atomicWrite(file, entries.map((e) => rawOf.get(e) ?? JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
   return { replaced: old.length, added: fresh.filter((e) => !rawOf.has(e)).length };
 }
@@ -685,6 +705,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
   function applyPointers(entries) {
     if (applying) return applying.then(() => applyPointers(entries));
     applying = (async () => {
+      checkCoreMemory(memoryStore); // refused before the child is stopped for nothing
       const wasUp = running();
       if (wasUp && !o.memoryReread) {
         memoryHold = true;

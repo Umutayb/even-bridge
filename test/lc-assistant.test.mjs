@@ -919,3 +919,75 @@ test("a store with a fresher markdown edit is not overwritten", async (t) => {
   await assert.rejects(p.assistant.memoryPointers(NEW_KB), (err) => err.statusCode === 409 && /memory\.md was edited/.test(err.message));
   assert.equal(storeEntries(file).length, 4);
 });
+
+// ── review round 1 (the A5 review probes; the unreadable-line one inverted) ───────────────────────────────
+
+test("a prompt during a write, with a newer set queued, is answered", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const file = seedStore(c);
+  const first = p.assistant.memoryPointers(NEW_KB.slice(0, 1));
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB), { ok: true, queued: true });
+  let err = null;
+  const pr = p.assistant.prompt("during the write", { requestId: "dw1" }).catch((e) => {
+    err = e;
+  });
+  await first;
+  await pr;
+  assert.equal(err, null, `prompt refused: ${err?.statusCode} ${err?.message}`);
+  await until(() => c.prompts().some((x) => x.message === "during the write"), 8000, "the prompt reached a child");
+  await until(() => storeEntries(file).filter((e) => e.gist.startsWith("KB topic")).length === 3, 8000, "the newer set");
+  await until(() => p.assistant.state().status === "idle", 8000, "idle again");
+});
+
+test("a prompt right after a write while the respawned child starts is answered", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  seedStore(c);
+  await p.assistant.memoryPointers(NEW_KB.slice(0, 1));
+  let err = null;
+  const pr = p.assistant.prompt("right after", { requestId: "ra1" }).catch((e) => {
+    err = e;
+  });
+  await p.assistant.memoryPointers(NEW_KB);
+  await pr;
+  assert.equal(err, null, `prompt refused: ${err?.statusCode} ${err?.message}`);
+  await until(() => c.prompts().some((x) => x.message === "right after"), 8000, "the prompt reached a child");
+});
+
+test("an unreadable line refuses the write (as the shim import does) and leaves the file alone", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const file = join(c.dir, "core-memory", "memory.jsonl");
+  mkdirSync(join(c.dir, "core-memory"), { recursive: true, mode: 0o700 });
+  const raw = [JSON.stringify(FACT), "{not json", JSON.stringify(OLD_KB[0])].join("\n") + "\n";
+  writeFileSync(file, raw, { mode: 0o600 });
+  await assert.rejects(p.assistant.memoryPointers(NEW_KB), (err) => err.statusCode === 409 && /1 unreadable line/.test(err.message));
+  assert.equal(readFileSync(file, "utf8"), raw);
+  assert.equal(p.assistant.state().status, "idle", "the child was not stopped for a write that cannot happen");
+});
+
+test("the file keeps its line order: kb pointers replaced in place, new ones appended", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const later = { ...FACT, id: "zz9999", t: 1_800_000_000_000, gist: "The user asked you to remember: later" };
+  // unsorted on purpose: a newer entry first, a kb pointer between two others
+  const file = seedStore(c, [later, OLD_KB[1], FACT, FILE_PTR, OLD_KB[0]]);
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB), { ok: true, replaced: 2, added: 3 });
+  const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
+  assert.equal(lines[0], line(later));
+  assert.equal(JSON.parse(lines[1]).gist, "KB topic: Garden", "the first kb pointer's place");
+  assert.equal(lines[2], line(FACT));
+  assert.equal(lines[3], line(FILE_PTR));
+  assert.deepEqual(lines.slice(4).map((l) => JSON.parse(l).gist), ["KB topic: Trips", "KB topic: Work"]);
+  // fewer pointers: the extra kb lines go, the others stay where they are
+  await p.assistant.memoryPointers(NEW_KB.slice(0, 1));
+  const after = readFileSync(file, "utf8").split("\n").filter(Boolean);
+  assert.deepEqual(after.map((l) => JSON.parse(l).id), ["zz9999", "aaaa0001", "ab12cd", "fp0001"]);
+  const md = readFileSync(join(c.dir, "core-memory", "memory.md"), "utf8").split("\n").filter((l) => l.startsWith("- "));
+  assert.deepEqual(md.map((l) => l.split(" ")[3]), ["#zz9999", "#aaaa0001", "#ab12cd", "#fp0001"], "md in the file's order");
+});
