@@ -97,7 +97,7 @@ export function assistantEnabled(env = process.env) {
  * child reads the token itself). Optional, only when set: the bin (EVEN_BRIDGE_LC_BIN, else
  * EVEN_BRIDGE_PI_BIN, else lets-code), the extension (EVEN_BRIDGE_ASSISTANT_EXT, default A2's
  * even-assistant.ts), the cwd (EVEN_BRIDGE_ASSISTANT_CWD, default ~/sandbox/assistant; smoke runs) and a
- * run deadline in seconds (EVEN_BRIDGE_ASSISTANT_DEADLINE_S, default 20).
+ * run deadline in seconds (EVEN_BRIDGE_ASSISTANT_DEADLINE_S, 0 < s <= 600; unset: ASSISTANT_RUN_DEADLINE_S = 25).
  */
 export function assistantOptions(env = process.env) {
   if (!assistantEnabled(env)) return null;

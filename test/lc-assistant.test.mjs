@@ -214,10 +214,11 @@ test("constants", () => {
   assert.match(ASSISTANT_HANDOFF, /Do not copy calendar events, notes, quick-list items or any other phone data/, "the summary must not carry phone data (A0, A1 real run)");
   assert.equal(ASSISTANT_NOTE_CMD, "/even-note");
   assert.equal(ASSISTANT_NIGHTLY_TASK, "even.assistant-nightly");
-  assert.equal(ASSISTANT_RUN_DEADLINE_S, 20);
+  assert.equal(ASSISTANT_RUN_DEADLINE_S, 25, "inside the shim's 27 s turn budget, room for the grocery agent's 22 s");
   assert.equal(ASSISTANT_MAX_TOOL_CALLS, 8);
-  assert.equal(ASSISTANT_TOOLS.length, 17);
+  assert.equal(ASSISTANT_TOOLS.length, 18);
   assert.equal(ASSISTANT_TOOLS.at(-1), "memory");
+  assert.ok(ASSISTANT_TOOLS.includes("ask_grocery_agent"));
   assert.equal(ASSISTANT_MODULE_ENV.LETS_CODE_CORE_MEMORY, "true");
   assert.equal(ASSISTANT_MODULE_ENV.LETS_CODE_SUBAGENTS, "false");
   assert.ok(!Object.keys(ASSISTANT_MODULE_ENV).some((k) => k.endsWith("_ON")), "lets-code ignores the _ON names (A0)");
@@ -990,4 +991,26 @@ test("the file keeps its line order: kb pointers replaced in place, new ones app
   assert.deepEqual(after.map((l) => JSON.parse(l).id), ["zz9999", "aaaa0001", "ab12cd", "fp0001"]);
   const md = readFileSync(join(c.dir, "core-memory", "memory.md"), "utf8").split("\n").filter((l) => l.startsWith("- "));
   assert.deepEqual(md.map((l) => l.split(" ")[3]), ["#zz9999", "#aaaa0001", "#ab12cd", "#fp0001"], "md in the file's order");
+});
+
+test("the run deadline defaults to 25 s and the env override still applies", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  assert.equal(p.assistant.profile.deadlineMs, 25000);
+  const c2 = makeCase({ assistant: { deadlineMs: 6000 } });
+  t.after(c2.closeAll);
+  const p2 = await warm(c2);
+  assert.equal(p2.assistant.profile.deadlineMs, 6000);
+});
+
+test("a tool named in --tools that the shim does not offer yet leaves the child working", async (t) => {
+  // ask_grocery_agent is listed before the shim serves it: prompts still run (tools loaded > 0)
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const spawn = c.spawns()[0];
+  assert.ok(spawn.argv[spawn.argv.indexOf("--tools") + 1].split(",").includes("ask_grocery_agent"));
+  await p.assistant.prompt("hi", { requestId: "g1" });
+  await idleAfter(c);
 });

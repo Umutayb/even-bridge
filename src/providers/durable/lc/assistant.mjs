@@ -83,12 +83,19 @@ export const ASSISTANT_TOOLS = Object.freeze([
   "sessions_list",
   "session_read",
   "overseer_outbox",
+  // the grocery bot through the shim (shim branch grocery-route-gaps). Listed before the shim serves it is fine:
+  // pi activates only the --tools names that are registered (the extension registers the shim's schema).
+  "ask_grocery_agent",
   "memory",
 ]);
 export const ASSISTANT_NOTE_CMD = "/even-note";
 export const ASSISTANT_NIGHTLY_TASK = "even.assistant-nightly";
-/** A0: a normal run took ≤ 3.8 s; the degenerate ones 31–180 s. */
-export const ASSISTANT_RUN_DEADLINE_S = 20;
+/**
+ * A0: a normal run took ≤ 3.8 s; the degenerate ones 31–180 s. 25 s (was 20): room for ask_grocery_agent's 22 s tool
+ * timeout, and still under the shim's 27 s turn budget, so the bridge aborts (and the shim hears it) before the shim
+ * gives up on the turn. EVEN_BRIDGE_ASSISTANT_DEADLINE_S overrides it.
+ */
+export const ASSISTANT_RUN_DEADLINE_S = 25;
 /** A0: per run; the extension blocks the 9th call, the host aborts when the model keeps calling. */
 export const ASSISTANT_MAX_TOOL_CALLS = 8;
 /** After the abort of a capped run: a child still busy this long later is stopped and respawned. */

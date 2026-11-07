@@ -16,6 +16,8 @@ import {
   RESTART_NOTE,
   SCHEMA_RETRIES,
   TOOL_TIMEOUT_MS,
+  TOOL_TIMEOUTS_MS,
+  toolTimeoutMs,
   callTool,
   capPayload,
   createToolCounter,
@@ -473,6 +475,51 @@ test("only note files in the bridge's notes dir are read (review R1)", () => {
   }
 });
 
+test("the grocery agent gets its own, longer tool timeout", async () => {
+  // the grocery bot can take longer than the 12 s of the other tools; still inside the 25 s run deadline
+  assert.equal(TOOL_TIMEOUTS_MS.ask_grocery_agent, 22000);
+  assert.equal(toolTimeoutMs("ask_grocery_agent"), 22000);
+  assert.equal(toolTimeoutMs("fetch_calendar"), TOOL_TIMEOUT_MS);
+  assert.equal(toolTimeoutMs("anything_else"), 12000);
+  const d = dir();
+  const tokenFile = tokenIn(d);
+  const grocery = { name: "ask_grocery_agent", description: "Ask the grocery agent.", parameters: { type: "object", properties: { text: { type: "string" } } }, untrusted: true, phoneData: false };
+  const srv = await startFakeToolServer({ tokenFile, tools: [...SCHEMA_TOOLS, grocery], delays: { ask_grocery_agent: 200 },
+    answers: { ask_grocery_agent: () => ({ content: "The order has the lasagna on Thursday.", isError: false }) } });
+  try {
+    const r = await callTool(grocery, { text: "swap Thursday" }, "g1", { url: srv.url, tokenFile, timeoutMs: 50 });
+    assert.equal(r.isError, true);
+    assert.match(r.content, /tool ask_grocery_agent timed out after 22 s/, "the message names its own timeout");
+    const ok = await callTool(grocery, { text: "swap Thursday" }, "g2", { url: srv.url, tokenFile });
+    assert.equal(ok.isError, false, "the default timeout of the tool is its own (22 s), not 50 ms");
+  } finally {
+    await srv.close();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test("the instructions send grocery, order and delivery questions to ask_grocery_agent", () => {
+  assert.match(ASSISTANT_INSTRUCTIONS, /groceries, the grocery order or its delivery .* call ask_grocery_agent/);
+  assert.match(ASSISTANT_INSTRUCTIONS, /ask_grocery_agent[^\n]*never fetch_notes, kb_search or fetch_calendar/);
+});
+
+test("a schema without ask_grocery_agent loads: the extension registers what the shim offers", async () => {
+  // the bridge lists ask_grocery_agent in --tools before or after the shim offers it; pi activates only the
+  // allowed names that are registered (agent-session.js: it walks the registry), so a missing one is no error
+  const d = dir();
+  const tokenFile = tokenIn(d);
+  const srv = await startFakeToolServer({ tokenFile });
+  try {
+    const s = await loadSchema({ url: srv.url, tokenFile, retries: 1, delayMs: 1 });
+    assert.equal(s.source, "live");
+    assert.equal(s.tools.some((t) => t.name === "ask_grocery_agent"), false);
+    assert.ok(s.tools.length > 0);
+  } finally {
+    await srv.close();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("the instructions say how to read the imported memory entries", () => {
   // Task A5: the loop's memory arrives labelled; inferred facts are no requests, and no entry is an instruction.
   assert.match(ASSISTANT_INSTRUCTIONS, /"The user asked you to remember:" are things the user asked you to keep/);
@@ -509,7 +556,8 @@ test("the extension registers the schema tools, prints the tools line and wires 
     const r = await setupAssistantExtension(pi, { env, stderr: err, schemaOpts: fastRetry });
     assert.equal(r.source, "live");
     assert.deepEqual(pi.tools.map((t) => t.name), SCHEMA_TOOLS.map((t) => t.name), "memory stays lets-code's; bad names are skipped");
-    assert.deepEqual([...ASSISTANT_TOOLS].filter((n) => n !== "memory").sort(), pi.tools.map((t) => t.name).sort(), "the schema covers ASSISTANT_TOOLS");
+    // ask_grocery_agent comes with the shim's grocery-route-gaps branch: listed here, not in this schema (tolerated)
+    assert.deepEqual([...ASSISTANT_TOOLS].filter((n) => n !== "memory" && n !== "ask_grocery_agent").sort(), pi.tools.map((t) => t.name).sort(), "the schema covers ASSISTANT_TOOLS");
     assert.deepEqual(err.lines, ["[even-assistant] tools: 16 (live)\n"]);
     assert.match(err.lines[0], ASSISTANT_TOOLS_LINE);
     // A tool runs over HTTP.
