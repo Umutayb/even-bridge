@@ -32,6 +32,8 @@ import {
   ASSISTANT_THINKING,
   ASSISTANT_TITLE,
   ASSISTANT_TOOLS,
+  ASSISTANT_POINTERS_MAX,
+  coreMemoryStore,
   nextResetAt,
   portIsFree,
 } from "../src/providers/durable/lc/assistant.mjs";
@@ -143,6 +145,7 @@ function makeCase({ lc = {}, assistant = {}, env = {}, noLc = false, clock } = {
         bin: FAKE,
         toolsWaitMs: 1500,
         portFree: async () => true,
+        memoryStore: join(dir, "core-memory", "memory.jsonl"),
         ...(noLc ? { engine: engineSeams } : {}),
         ...assistant,
       },
@@ -778,4 +781,141 @@ test("assistant off: no dur-assistant, nothing listed", async (t) => {
   assert.equal(p.probe(ASSISTANT_SID), false);
   assert.deepEqual(p.listSessions(10), []);
   assert.equal(p._lc, null, "no engine is built");
+});
+
+// ── Task A5: KB pointer entries in the assistant's core memory ─────────────────────────────────────────────
+
+test("the core-memory store is lets-code's project dir of the cwd", () => {
+  // A0 ASSISTANT_MEMORY_STORE for the live cwd
+  assert.equal(coreMemoryStore("/home/ay/sandbox/assistant", { PI_CODING_AGENT_DIR: "/a" }), "/a/core-memory/projects/assistant-a15eee30/memory.jsonl");
+  assert.equal(coreMemoryStore("/x/y z!", { PI_CODING_AGENT_DIR: "/a" }).startsWith("/a/core-memory/projects/y-z--"), true);
+  assert.equal(ASSISTANT_POINTERS_MAX, 200);
+});
+
+const FACT = { id: "ab12cd", t: 1_700_000_000_000, u: 1_700_000_000_000, kind: "fact", gist: "The user asked you to remember: my bike is blue", refs: [], by: "user", n: 1 };
+const OLD_KB = [
+  { id: "kb0001", t: 1_700_000_100_000, u: 1_700_000_100_000, kind: "pointer", gist: "KB topic: Release", refs: ["kb:c1"], by: "harness", n: 1 },
+  { id: "kb0002", t: 1_700_000_200_000, u: 1_700_000_200_000, kind: "pointer", gist: "KB topic: Old", refs: ["kb:c2"], by: "harness", n: 1 },
+];
+const FILE_PTR = { id: "fp0001", t: 1_700_000_300_000, u: 1_700_000_300_000, kind: "pointer", gist: "The notes live in notes.md", refs: ["/w/notes.md:3"], by: "model", n: 1 };
+const NEW_KB = [
+  { id: "aaaa0001", kind: "pointer", gist: "KB topic: Garden", refs: ["kb:c4"], by: "harness" },
+  { id: "aaaa0002", kind: "pointer", gist: "KB topic: Trips", refs: ["kb:c5", "kb:c6"] },
+  { kind: "pointer", gist: "KB topic: Work", refs: ["kb:c7"] },
+];
+const line = (e) => JSON.stringify(e);
+function seedStore(c, entries = [FACT, ...OLD_KB, FILE_PTR]) {
+  const file = join(c.dir, "core-memory", "memory.jsonl");
+  mkdirSync(join(c.dir, "core-memory"), { recursive: true, mode: 0o700 });
+  writeFileSync(file, entries.map(line).join("\n") + "\n", { mode: 0o600 });
+  return file;
+}
+const storeEntries = (file) => readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+
+test("pointers replace kb pointers and keep other entries", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const file = seedStore(c);
+  const r = await p.assistant.memoryPointers(NEW_KB);
+  assert.deepEqual(r, { ok: true, replaced: 2, added: 3 });
+  const text = readFileSync(file, "utf8");
+  assert.ok(text.startsWith(line(FACT) + "\n"), "the fact stays byte-for-byte (oldest first)");
+  assert.ok(text.includes(line(FILE_PTR) + "\n"), "a pointer without a kb: ref is not the KB's");
+  const es = storeEntries(file);
+  assert.deepEqual(es.filter((e) => e.kind === "pointer" && e.refs[0].startsWith("kb:")).map((e) => e.gist), ["KB topic: Garden", "KB topic: Trips", "KB topic: Work"]);
+  for (const e of es.filter((x) => x.gist.startsWith("KB topic"))) {
+    assert.deepEqual(Object.keys(e), ["id", "t", "u", "kind", "gist", "refs", "by", "n"]);
+    assert.match(e.id, /^[a-z0-9]{4,8}$/);
+    assert.equal(e.by, "harness");
+    assert.equal(e.n, 1);
+  }
+  assert.equal(es.find((e) => e.gist === "KB topic: Garden").id, "aaaa0001");
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  const md = readFileSync(join(c.dir, "core-memory", "memory.md"), "utf8").split("\n");
+  assert.equal(md[0], `# Core memory: ${join(c.dir, "assistant")} (lets-code)`);
+  assert.equal(md[4], `- 2023-11-14 fact #ab12cd ${FACT.gist}`);
+  assert.ok(md.includes("- 2023-11-14 pointer #fp0001 The notes live in notes.md — /w/notes.md:3"));
+  assert.ok(md.some((l) => /^- \d{4}-\d{2}-\d{2} pointer #aaaa0002 KB topic: Trips — kb:c5, kb:c6$/.test(l)));
+  assert.ok(statSync(join(c.dir, "core-memory", "memory.md")).mtimeMs <= statSync(file).mtimeMs, "lets-code never finds the markdown newer");
+  // the same set again: nothing replaced or added, the file unchanged
+  const before = readFileSync(file, "utf8");
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB), { ok: true, replaced: 0, added: 0 });
+  assert.equal(readFileSync(file, "utf8"), before);
+});
+
+test("pointers respawn the idle child with --session around the write", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  await p.assistant.prompt("hi", { requestId: "m1" });
+  await idleAfter(c);
+  const rec = await recordOf(p);
+  const pid = childPid(p);
+  seedStore(c);
+  await p.assistant.memoryPointers(NEW_KB);
+  assert.ok(gone(pid), "the child that cached the store was stopped before the write");
+  await until(() => c.spawns().length === 2, 8000, "respawn");
+  const again = c.spawns()[1];
+  assert.equal(again.argv[again.argv.indexOf("--session") + 1], rec.piSessionFile, "the same conversation");
+  await until(() => p.assistant.state().status === "idle", 5000, "idle again");
+  assert.equal(c.spawns().length, 2, "one respawn, no backoff loop");
+  await p.assistant.prompt("after", { requestId: "m2" });
+  await idleAfter(c, 2);
+});
+
+test("pointers respawn only when memory is not reread", async (t) => {
+  const c = makeCase({ assistant: { memoryReread: true } });
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const pid = childPid(p);
+  const file = seedStore(c);
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB), { ok: true, replaced: 2, added: 3 });
+  assert.equal(childPid(p), pid, "MEMORY_REREAD: the child reads the store itself");
+  assert.equal(c.spawns().length, 1);
+  assert.equal(storeEntries(file).filter((e) => e.gist.startsWith("KB topic")).length, 3);
+});
+
+test("pointers wait for an idle child", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const file = seedStore(c);
+  const before = readFileSync(file, "utf8");
+  await p.assistant.prompt("HANG", { requestId: "w1" });
+  await until(() => c.prompts().some((x) => x.message === "HANG"), 5000, "HANG");
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB.slice(0, 1)), { ok: true, queued: true });
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB), { ok: true, queued: true }, "the newest set wins");
+  await sleep(200);
+  assert.equal(readFileSync(file, "utf8"), before, "nothing written under a busy child");
+  p.assistant.interrupt();
+  await until(() => storeEntries(file).some((e) => e.gist === "KB topic: Work"), 8000, "written after the run");
+  assert.equal(storeEntries(file).filter((e) => e.gist.startsWith("KB topic")).length, 3);
+  await until(() => p.assistant.state().status === "idle", 8000, "idle again");
+});
+
+test("a set sent during a write is written after it", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const file = seedStore(c);
+  const first = p.assistant.memoryPointers(NEW_KB.slice(0, 1));
+  assert.deepEqual(await p.assistant.memoryPointers(NEW_KB), { ok: true, queued: true }, "the child is being stopped for the first");
+  assert.deepEqual(await first, { ok: true, replaced: 2, added: 1 });
+  await until(() => storeEntries(file).filter((e) => e.gist.startsWith("KB topic")).length === 3, 8000, "the newer set");
+  await until(() => p.assistant.state().status === "idle", 8000, "idle again");
+});
+
+test("a store with a fresher markdown edit is not overwritten", async (t) => {
+  const c = makeCase();
+  t.after(c.closeAll);
+  const p = await warm(c);
+  const file = seedStore(c);
+  const md = join(c.dir, "core-memory", "memory.md");
+  writeFileSync(md, "- fact edited by hand\n");
+  const later = new Date(Date.now() + 10_000);
+  const { utimesSync } = await import("node:fs");
+  utimesSync(md, later, later);
+  await assert.rejects(p.assistant.memoryPointers(NEW_KB), (err) => err.statusCode === 409 && /memory\.md was edited/.test(err.message));
+  assert.equal(storeEntries(file).length, 4);
 });

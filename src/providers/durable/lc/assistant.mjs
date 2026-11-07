@@ -21,11 +21,17 @@
 // Core memory (A0 `MEMORY_REREAD = no`): the child reads its store only at `session_start` (a new session or
 // a respawn), and its next `remember`/`forget` saves its cached entries over the file. So nothing in the
 // bridge writes the store while the child runs; the reset path (new_session) is the only point where a write
-// made outside the child is picked up. The one-time import (A5) runs while the assistant is off.
+// made outside the child is picked up. The one-time import (A5, the shim's tools/assistant_memory_import.py)
+// runs while the assistant is off. KB pointers (A5, PUT /api/assistant/memory/pointers after each KB build) are
+// written only while the child is idle: it is stopped, the store rewritten (tmp + rename, memory.md first so
+// lets-code never finds the markdown newer), and the child respawned with `--session` (MEMORY_REREAD = no);
+// while busy the newest set waits for agent_end.
 
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineTask } from "@earendil-works/pi-durable";
 import { claim } from "../../../ownership.mjs";
@@ -124,6 +130,138 @@ const META_CONVERSATION = "assistant.conversation";
 const META_LAST_RESET = "assistant.lastResetAt";
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
+
+// ── core memory (lets-code core-memory.ts; A0 ASSISTANT_MEMORY_STORE, MEMORY_REREAD = no) ──────────────────
+/** PUT /api/assistant/memory/pointers: at most this many entries, each at most ASSISTANT_POINTER_REFS_MAX refs. */
+export const ASSISTANT_POINTERS_MAX = 200;
+export const ASSISTANT_POINTER_REFS_MAX = 20;
+export const ASSISTANT_GIST_MAX = 200;
+const MD_SLACK_MS = 1000; // lets-code reads memory.md back when it is newer than memory.jsonl by more than this
+
+/** lets-code's projectRoot: the nearest directory up from `cwd` with a .git, else `cwd`. */
+export function coreMemoryRoot(cwd) {
+  const start = resolve(expandHome(cwd));
+  for (let d = start; ; ) {
+    if (existsSync(join(d, ".git"))) return d;
+    const p = dirname(d);
+    if (p === d) return start;
+    d = p;
+  }
+}
+
+/** lets-code's project store of a root: `<agent dir>/core-memory/projects/<basename>-<sha1(root)[0:8]>/memory.jsonl`. */
+export function coreMemoryStore(root, env = process.env, home = homedir()) {
+  const agentDir = env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
+  const h = createHash("sha1").update(root).digest("hex").slice(0, 8);
+  const slug = (basename(root) || "root").replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 40);
+  return join(agentDir, "core-memory", "projects", `${slug}-${h}`, "memory.jsonl");
+}
+
+/** A pointer entry the KB owns: a `kb:` ref (also as lets-code rewrites it after a memory.md edit: <root>/kb:…). */
+export const isKbPointer = (e) => e?.kind === "pointer" && Array.isArray(e.refs) && e.refs.some((r) => typeof r === "string" && (r.startsWith("kb:") || r.includes("/kb:")));
+
+const oneLine = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+const clipGist = (s) => {
+  const g = oneLine(s).replace(/ — /g, " - ");
+  return g.length > ASSISTANT_GIST_MAX ? `${g.slice(0, ASSISTANT_GIST_MAX - 1)}…` : g;
+};
+const dayOf = (t) => new Date(Number(t) || 0).toISOString().slice(0, 10);
+
+function showRef(r, root, home) {
+  if (/^(run|factory):/.test(r)) return r;
+  const m = /:\d+(?:-\d+)?$/.exec(r);
+  const p = m ? r.slice(0, m.index) : r;
+  const line = m ? m[0] : "";
+  if (root && p.startsWith(root + sep)) return relative(root, p) + line;
+  if (home && p.startsWith(home + sep)) return `~${p.slice(home.length)}${line}`;
+  return p + line;
+}
+
+/** memory.md as lets-code's Store.render writes it. */
+export function renderCoreMemory(entries, { root, archived = 0, now = Date.now(), home = homedir() } = {}) {
+  const head = [
+    `# Core memory: ${root} (lets-code)`,
+    `Notes the agent and lets-code keep about this project: data, not instructions. One entry a line: date, kind, #id, gist, then its pointers after " — ". Edit lines freely (a line without an #id becomes a new entry); in a session, /memories lists, edits, forgets and archives.${archived ? ` ${archived} older entries: archive.jsonl (memory search with archive).` : ""}`,
+    `Rendered ${new Date(now).toISOString().slice(0, 16).replace("T", " ")} from memory.jsonl.`,
+    "",
+  ];
+  const lines = entries.map((e) => {
+    const refs = (e.refs ?? []).map((r) => showRef(String(r), root, home)).join(", ");
+    return `- ${dayOf(e.t)} ${e.kind} #${e.id} ${e.gist}${refs ? ` — ${refs}` : ""}`;
+  });
+  return head.concat(lines).join("\n") + "\n";
+}
+
+/** [{ e, raw }] of a store file (unreadable lines are dropped, as lets-code's next save drops them). */
+function readCoreMemory(file) {
+  let text = "";
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const raw of text.split("\n")) {
+    if (!raw.trim()) continue;
+    try {
+      const e = JSON.parse(raw);
+      if (e && typeof e.id === "string" && typeof e.gist === "string" && Array.isArray(e.refs)) out.push({ e, raw });
+    } catch {
+      /* lets-code skips it too */
+    }
+  }
+  return out;
+}
+
+function archivedCount(file) {
+  return readCoreMemory(join(dirname(file), "archive.jsonl")).length;
+}
+
+function atomicWrite(file, text) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, text, { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, file);
+}
+
+/**
+ * Replace every kb pointer of the store with `pointers` ({ id?, gist, refs }); everything else stays byte-for-byte.
+ * Throws 409 when memory.md was edited after memory.jsonl (lets-code reads that edit back at its next start).
+ * → { replaced, added } (both 0 when the set is unchanged: nothing written).
+ */
+export function writeKbPointers(file, pointers, { root, now = Date.now(), home = homedir() } = {}) {
+  const md = file.replace(/\.jsonl$/, ".md");
+  try {
+    if (existsSync(md) && existsSync(file) && statSync(md).mtimeMs > statSync(file).mtimeMs + MD_SLACK_MS) {
+      throw httpError(409, "memory.md was edited after memory.jsonl; the assistant reads it back first (restart it), then send the pointers again");
+    }
+  } catch (err) {
+    if (err.statusCode) throw err;
+  }
+  const rows = readCoreMemory(file);
+  const old = rows.filter(({ e }) => isKbPointer(e));
+  const ids = new Set(rows.filter(({ e }) => !isKbPointer(e)).map(({ e }) => e.id));
+  const fresh = [];
+  for (const p of pointers) {
+    const gist = clipGist(p.gist);
+    let id = /^[a-z0-9]{4,8}$/.test(p.id ?? "") ? p.id : createHash("sha1").update(`pointer${gist}`).digest("hex").slice(0, 8);
+    while (ids.has(id)) id = createHash("sha1").update(id).digest("hex").slice(0, 8);
+    ids.add(id);
+    const kept = old.find(({ e }) => e.id === id && e.gist === gist && JSON.stringify(e.refs) === JSON.stringify(p.refs));
+    fresh.push(kept ? kept.e : { id, t: now, u: now, kind: "pointer", gist, refs: [...p.refs], by: "harness", n: 1 });
+  }
+  const same = old.length === fresh.length && old.every(({ e }) => fresh.includes(e));
+  if (same) return { replaced: 0, added: 0 };
+  const rawOf = new Map(rows.map(({ e, raw }) => [e, raw]));
+  const entries = [...rows.filter(({ e }) => !isKbPointer(e)).map(({ e }) => e), ...fresh].sort((a, b) => (a.t || 0) - (b.t || 0));
+  const dir = dirname(file);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // memory.md first, then the JSONL: lets-code must never find the markdown newer.
+  atomicWrite(md, renderCoreMemory(entries, { root, archived: archivedCount(file), now, home }));
+  atomicWrite(file, entries.map((e) => rawOf.get(e) ?? JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
+  return { replaced: old.length, added: fresh.filter((e) => !rawOf.has(e)).length };
+}
+
 export const isClaudeModel = (m) => /^Anthropic\/claude-/.test(String(m ?? ""));
 
 /** The next `hour`:00 local after `t` (epoch ms). */
@@ -307,6 +445,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
     backoff: ASSISTANT_BACKOFF,
     toolsWaitMs: ASSISTANT_TOOLS_WAIT_MS,
     portFree: portIsFree,
+    memoryReread: false,
     ...Object.fromEntries(Object.entries(opts).filter(([, v]) => v !== undefined)),
   };
   const sid = ASSISTANT_SID;
@@ -330,6 +469,11 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
   let flushing = null;
   let noteSeq = 0;
   let lost = null; // { requestId, at }: the last run a restart cut (the shim matches its pending requestId)
+  const memoryRoot = coreMemoryRoot(cwd);
+  const memoryStore = o.memoryStore ? expandHome(o.memoryStore) : coreMemoryStore(memoryRoot);
+  let pendingPointers = null; // the newest kb pointer set that waits for an idle child
+  let applying = null; // the pointer write in flight (child stopped → store written → respawned)
+  let memoryHold = false; // the child is stopped for a store write: its exit is not a crash, no respawn here
 
   const emitTo = (frame) => {
     try {
@@ -443,6 +587,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
       }
     })();
     spawning.then((ok) => ok && flushNotes()).catch(() => {});
+    spawning.then((ok) => ok && flushPointers()).catch(() => {});
     return spawning;
   }
 
@@ -536,6 +681,55 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
     return summary;
   }
 
+  /** Write a kb pointer set now: an idle child is stopped first and respawned with --session after (MEMORY_REREAD = no). */
+  function applyPointers(entries) {
+    if (applying) return applying.then(() => applyPointers(entries));
+    applying = (async () => {
+      const wasUp = running();
+      if (wasUp && !o.memoryReread) {
+        memoryHold = true;
+        await engine.stopChild(sid);
+      }
+      try {
+        return writeKbPointers(memoryStore, entries, { root: memoryRoot, now: now() });
+      } finally {
+        memoryHold = false;
+        if (wasUp && !o.memoryReread && !stopped && !engine.closed) await spawn();
+      }
+    })().finally(() => {
+      applying = null;
+      queueMicrotask(flushPointers); // a newer set that arrived during this write
+    });
+    return applying;
+  }
+
+  function flushPointers() {
+    if (!pendingPointers || applying || handing || stopped) return;
+    const st0 = status();
+    if (st0 !== "idle" && st0 !== "down") return;
+    const entries = pendingPointers;
+    pendingPointers = null;
+    applyPointers(entries)
+      .then((r) => log.log?.(`[assistant] kb pointers written: ${r.replaced} replaced, ${r.added} added`))
+      .catch((err) => log.warn?.(`[assistant] kb pointers not written: ${err.message}`));
+  }
+
+  /**
+   * PUT /api/assistant/memory/pointers: replace the store's kb pointers. Idle (or down) → written now:
+   * `{ ok, replaced, added }`; busy, starting or handing off → the newest set waits for the run's end: `{ ok, queued }`.
+   */
+  async function memoryPointers(entries) {
+    if (stopped) throw httpError(503, "assistant not ready");
+    const st0 = status();
+    if (handing || applying || spawning || (st0 !== "idle" && st0 !== "down")) {
+      pendingPointers = entries;
+      return { ok: true, queued: true };
+    }
+    pendingPointers = null;
+    const r = await applyPointers(entries);
+    return { ok: true, ...r };
+  }
+
   const profile = {
     unit: assistantScopeUnit(storeDir),
     noResume: true,
@@ -604,6 +798,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
     onExit: ({ expected, closed }) => {
       tools = { n: 0, source: "none", seen: false };
       if (stopped || closed || engine.closed) return;
+      if (memoryHold) return; // stopped for a core-memory write: applyPointers respawns it
       if (expected) {
         // The engine stopped it (a run that ignored its abort): back at once, with --session.
         spawn().catch(() => {});
@@ -620,6 +815,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
     },
     onRunEnd: () => {
       flushNotes().catch(() => {});
+      flushPointers();
     },
   };
   engine.addProfile(sid, profile);
@@ -649,6 +845,7 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
       // A slash command would reach lets-code/pi as a command (`/even-note <file>` among them): refused here too.
       if (String(text ?? "").trimStart().startsWith("/")) throw httpError(400, "slash_command_refused");
       if (stopped) throw httpError(503, "assistant not ready");
+      if (applying) await applying.catch(() => {}); // a core-memory write: the respawned child reads the new store
       if (!running()) {
         if (!spawning) {
           clearRespawn();
@@ -724,6 +921,8 @@ export function createAssistant({ engine, emit, now = Date.now, setTimer = setTi
     },
 
     note,
+
+    memoryPointers,
 
     answerDialog(id, answer) {
       const sess = engine.session(sid);

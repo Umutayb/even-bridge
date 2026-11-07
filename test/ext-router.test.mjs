@@ -1016,6 +1016,10 @@ function stubAssistant() {
       if (id === "nope") throw Object.assign(new Error("no such dialog"), { statusCode: 404 });
       return { ok: true };
     },
+    memoryPointers: async (entries) => {
+      calls.pointers = [...(calls.pointers ?? []), entries];
+      return entries.length > 1 ? { ok: true, replaced: 1, added: entries.length } : { ok: true, queued: true };
+    },
     state: () => ({ status: "idle", model: "lets-code/qwen3.8-27b", thinking: "medium", toolsLoaded: 17, toolsSource: "live", sessionFile: "/s/f.jsonl", lastResetAt: null }),
   };
 }
@@ -1199,4 +1203,47 @@ test("assistant read routes are 404 when the assistant is off", async (t) => {
   }
   assert.equal(fellThrough.length, 3);
   assert.deepEqual(assistantHost.calls, { inventory: [], read: [] });
+});
+
+const putJson = (url, body) =>
+  fetch(url, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+test("assistant memory pointers are 404 when the assistant is off", async (t) => {
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable() });
+  const base = await listen(t, app);
+  const r = await putJson(`${base}/api/assistant/memory/pointers`, { entries: [] });
+  assert.deepEqual(await r.json(), { fellThrough: true, path: "/api/assistant/memory/pointers" });
+});
+
+test("assistant memory pointers validate kb pointer entries", async (t) => {
+  const assistant = stubAssistant();
+  const { app } = await buildApp(t, { rc: stubRc(), pi: stubPi(), durable: stubDurable(), assistant });
+  const base = await listen(t, app);
+  const ok = { kind: "pointer", gist: "KB topic: Garden", refs: ["kb:c4"] };
+  for (const [body, error] of [
+    [{}, "'entries' must be an array of at most 200 entries"],
+    [{ entries: Array(201).fill(ok) }, "'entries' must be an array of at most 200 entries"],
+    [{ entries: [{ ...ok, kind: "fact" }] }, "entry 0: 'kind' must be pointer"],
+    [{ entries: [{ ...ok, gist: " " }] }, "entry 0: 'gist' must be 1-200 characters"],
+    [{ entries: [ok, { ...ok, refs: ["/home/x"] }] }, "entry 1: every ref must start with kb: (1-20 refs)"],
+    [{ entries: [{ ...ok, refs: [] }] }, "entry 0: every ref must start with kb: (1-20 refs)"],
+    [{ entries: [{ ...ok, id: "NOT-AN-ID" }] }, "entry 0: 'id' must be 4-8 of a-z0-9"],
+  ]) {
+    const r = await putJson(`${base}/api/assistant/memory/pointers`, body);
+    assert.equal(r.status, 400, JSON.stringify(body).slice(0, 80));
+    assert.deepEqual(await r.json(), { error }, JSON.stringify(body).slice(0, 80));
+  }
+  assert.equal(assistant.calls.pointers, undefined);
+  let r = await putJson(`${base}/api/assistant/memory/pointers`, { entries: [ok, { ...ok, gist: "KB topic: Trips", id: "aaaa0002", by: "user" }] });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true, replaced: 1, added: 2 });
+  assert.deepEqual(assistant.calls.pointers[0], [
+    { kind: "pointer", gist: "KB topic: Garden", refs: ["kb:c4"] },
+    { kind: "pointer", gist: "KB topic: Trips", refs: ["kb:c4"], id: "aaaa0002" },
+  ], "by is the bridge's to set (harness)");
+  r = await putJson(`${base}/api/assistant/memory/pointers`, { entries: [ok] });
+  assert.equal(r.status, 202);
+  assert.deepEqual(await r.json(), { ok: true, queued: true });
+  r = await putJson(`${base}/api/assistant/memory/pointers`, { entries: [] });
+  assert.equal(r.status, 202, "an empty set clears the kb pointers");
 });

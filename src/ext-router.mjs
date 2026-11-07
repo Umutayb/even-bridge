@@ -230,6 +230,30 @@ export function assistantDialogOpts({ id, value, confirmed, cancelled } = {}) {
   return { id, answer: value !== undefined ? { value } : confirmed !== undefined ? { confirmed } : { cancelled: true } };
 }
 
+/** PUT /api/assistant/memory/pointers limits (Task A5; the shim's ASSISTANT_POINTERS_MAX / REFS_MAX). */
+export const ASSISTANT_POINTER_LIMITS = Object.freeze({ entriesMax: 200, refsMax: 20, gistMax: 200, refMax: 512 });
+
+/**
+ * Validate PUT /api/assistant/memory/pointers: `{ entries: [{ kind: "pointer", gist, refs: ["kb:…"], id? }] }` →
+ * `{ entries }` (only those fields; `by` is the bridge's: harness) or `{ error }`. Only KB pointers come this way.
+ */
+export function assistantPointersOpts({ entries } = {}) {
+  const L = ASSISTANT_POINTER_LIMITS;
+  if (!Array.isArray(entries) || entries.length > L.entriesMax) return { error: `'entries' must be an array of at most ${L.entriesMax} entries` };
+  const out = [];
+  for (const [i, e] of entries.entries()) {
+    if (!e || typeof e !== "object" || e.kind !== "pointer") return { error: `entry ${i}: 'kind' must be pointer` };
+    if (typeof e.gist !== "string" || !e.gist.trim() || e.gist.length > L.gistMax) return { error: `entry ${i}: 'gist' must be 1-${L.gistMax} characters` };
+    const refs = e.refs;
+    if (!Array.isArray(refs) || refs.length < 1 || refs.length > L.refsMax || !refs.every((r) => typeof r === "string" && /^kb:\S+$/.test(r) && r.length <= L.refMax)) {
+      return { error: `entry ${i}: every ref must start with kb: (1-${L.refsMax} refs)` };
+    }
+    if (e.id !== undefined && (typeof e.id !== "string" || !/^[a-z0-9]{4,8}$/.test(e.id))) return { error: `entry ${i}: 'id' must be 4-8 of a-z0-9` };
+    out.push({ kind: "pointer", gist: e.gist, refs: [...refs], ...(e.id !== undefined ? { id: e.id } : {}) });
+  }
+  return { entries: out };
+}
+
 const seqParam = (v) => {
   if (v == null || v === "") return 0;
   const n = typeof v === "number" ? v : /^\d+$/.test(String(v)) ? Number(v) : NaN;
@@ -833,6 +857,19 @@ export function createExtRouter({ hub, providers, getDefaultLocalProvider, rcTra
     try {
       const box = await overseer.outbox({ since });
       res.json({ seq: box.seq ?? 0, items: box.items ?? [] });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  // KB pointer entries of the assistant's core memory (Task A5): replaced when idle (200), queued while busy (202).
+  router.put("/assistant/memory/pointers", async (req, res, next) => {
+    if (!assistant) return next();
+    const checked = assistantPointersOpts(req.body ?? {});
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    try {
+      const r = await assistant.memoryPointers(checked.entries);
+      res.status(r?.queued ? 202 : 200).json(r);
     } catch (err) {
       fail(res, err);
     }
