@@ -355,7 +355,7 @@ test("assistant options only with EVEN_BRIDGE_ASSISTANT_ENABLE=1 and durable on"
   );
   assert.equal(assistantOptions({ ...on, EVEN_BRIDGE_LC_BIN: "/a", EVEN_BRIDGE_PI_BIN: "/b" }).bin, "/a");
   assert.equal("deadlineMs" in assistantOptions({ ...on, EVEN_BRIDGE_ASSISTANT_DEADLINE_S: "x" }), false);
-  assert.equal(assistantOptions({ ...on, EVEN_BRIDGE_ASSISTANT_DEADLINE_S: "25" }).deadlineMs, 25000);
+  assert.equal(assistantOptions({ ...on, EVEN_BRIDGE_ASSISTANT_DEADLINE_S: "21" }).deadlineMs, 21000);
   assert.equal("deadlineMs" in assistantOptions(on), false, "unset: the profile's own default (ASSISTANT_RUN_DEADLINE_S)");
 });
 

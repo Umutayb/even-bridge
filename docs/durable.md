@@ -63,7 +63,7 @@ Code: `src/providers/durable/` (`provider.mjs` contract, `harness.mjs` store,
 | `EVEN_BRIDGE_ASSISTANT_EXT` | `src/providers/durable/lc/even-assistant.ts` (Task A2) | the assistant extension; smoke runs point it at a probe |
 | `EVEN_BRIDGE_ASSISTANT_CWD` | `~/sandbox/assistant` | the assistant's cwd (keys its core-memory store); smoke runs use their own |
 | `EVEN_BRIDGE_ASSISTANT_API_TOKEN_FILE` | `~/.even-terminal/assistant-api.token` | the only token `/api/assistant/*` accepts (created 0600 when missing; the shim reads it); the bridge token gets 403 there |
-| `EVEN_BRIDGE_ASSISTANT_DEADLINE_S` | `25` | per-run deadline (A0 `ASSISTANT_RUN_DEADLINE_S`, 20 before the grocery tool); smoke runs lower it. Keep it under the shim's 27 s turn budget |
+| `EVEN_BRIDGE_ASSISTANT_DEADLINE_S` | `21` | per-run deadline (A0 `ASSISTANT_RUN_DEADLINE_S`, 20 before the grocery tool); smoke runs lower it. Deadline + the 2 s abort grace must stay under the shim relay's `RELAY_MAX_S` (24 s) |
 | `EVEN_BRIDGE_OVERSEER_HANDOFF` | off | `1` accepts overnight hand-offs (`POST /api/overseer/ask {mode:"tell", handoff}`); off: `400 hand-offs are off`. Leave off until a producer (Ideate) exists |
 
 All of them are read at startup only. With every flag of this table unset the behavior and the wire output
@@ -390,13 +390,15 @@ Code: `src/providers/durable/lc/assistant.mjs` (profile, routes' backend, nightl
   to it (they behave as on `main` with the flag off), and the engine refuses agent prompts and resumed agent
   runs (`agentsOff`); its sandbox setting stays on.
 - **Tool timeouts.** Each shim tool call times out after `TOOL_TIMEOUT_MS = 12000` (a tool error the model reads);
-  `ask_grocery_agent` (the grocery bot through the shim) gets 22 s (`TOOL_TIMEOUTS_MS`). It is in `ASSISTANT_TOOLS`
+  `ask_grocery_agent` (the grocery bot through the shim) gets 18 s (`TOOL_TIMEOUTS_MS`; the shim caps its grocery budget at 17 s). The tool takes no arguments: the shim
+  sends the owner's own words of the turn. It is in `ASSISTANT_TOOLS`
   whether or not the shim serves it yet: pi activates only the `--tools` names that are registered, and the
   extension registers what the shim's `/tools/schema` offers, so either deploy order works (until the shim serves
   it the tool is simply absent). The instructions send grocery, order and delivery questions to it, never to
   notes, KB or calendar searches.
-- **Per-run caps (A0).** Deadline `ASSISTANT_RUN_DEADLINE_S = 25` (was 20; `EVEN_BRIDGE_ASSISTANT_DEADLINE_S`; 22 s for
-  the grocery tool plus the answer, under the shim's 27 s turn budget)
+- **Per-run caps (A0).** Deadline `ASSISTANT_RUN_DEADLINE_S = 21` (was 20; `EVEN_BRIDGE_ASSISTANT_DEADLINE_S`; 18 s for
+  the grocery tool plus the answer; 21 s + the 2 s grace = 23 s, under the shim relay's 24 s `RELAY_MAX_S`, so the bridge's
+  abort always lands first)
   and `ASSISTANT_MAX_TOOL_CALLS = 8` (the 9th `tool_execution_start` trips it; A2's extension blocks
   the 9th call itself): RPC `abort`, an error frame `code: "assistant_deadline" | "assistant_tool_cap"`,
   the run task fails; a child still busy `ASSISTANT_ABORT_GRACE_MS = 2000` later is stopped and respawned

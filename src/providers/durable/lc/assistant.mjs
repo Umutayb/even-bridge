@@ -91,11 +91,13 @@ export const ASSISTANT_TOOLS = Object.freeze([
 export const ASSISTANT_NOTE_CMD = "/even-note";
 export const ASSISTANT_NIGHTLY_TASK = "even.assistant-nightly";
 /**
- * A0: a normal run took ≤ 3.8 s; the degenerate ones 31–180 s. 25 s (was 20): room for ask_grocery_agent's 22 s tool
- * timeout, and still under the shim's 27 s turn budget, so the bridge aborts (and the shim hears it) before the shim
- * gives up on the turn. EVEN_BRIDGE_ASSISTANT_DEADLINE_S overrides it.
+ * A0: a normal run took ≤ 3.8 s; the degenerate ones 31–180 s. 21 s (was 20): room for ask_grocery_agent's 18 s tool
+ * timeout. The deadline plus ASSISTANT_ABORT_GRACE_MS (21 + 2 = 23 s) stays under the shim relay's RELAY_MAX_S = 24 s
+ * (B25-1), so the bridge aborts, and the shim hears it, before the shim falls back to the loop while a tool is still
+ * in flight (the loop could then re-ask the grocery bot). EVEN_BRIDGE_ASSISTANT_DEADLINE_S overrides it; keep
+ * deadline + 2 s under 24 s.
  */
-export const ASSISTANT_RUN_DEADLINE_S = 25;
+export const ASSISTANT_RUN_DEADLINE_S = 21;
 /** A0: per run; the extension blocks the 9th call, the host aborts when the model keeps calling. */
 export const ASSISTANT_MAX_TOOL_CALLS = 8;
 /** After the abort of a capped run: a child still busy this long later is stopped and respawned. */

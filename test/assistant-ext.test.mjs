@@ -476,9 +476,9 @@ test("only note files in the bridge's notes dir are read (review R1)", () => {
 });
 
 test("the grocery agent gets its own, longer tool timeout", async () => {
-  // the grocery bot can take longer than the 12 s of the other tools; still inside the 25 s run deadline
-  assert.equal(TOOL_TIMEOUTS_MS.ask_grocery_agent, 22000);
-  assert.equal(toolTimeoutMs("ask_grocery_agent"), 22000);
+  // the grocery bot can take longer than the 12 s of the other tools; still inside the 21 s run deadline
+  assert.equal(TOOL_TIMEOUTS_MS.ask_grocery_agent, 18000);
+  assert.equal(toolTimeoutMs("ask_grocery_agent"), 18000);
   assert.equal(toolTimeoutMs("fetch_calendar"), TOOL_TIMEOUT_MS);
   assert.equal(toolTimeoutMs("anything_else"), 12000);
   const d = dir();
@@ -489,9 +489,9 @@ test("the grocery agent gets its own, longer tool timeout", async () => {
   try {
     const r = await callTool(grocery, { text: "swap Thursday" }, "g1", { url: srv.url, tokenFile, timeoutMs: 50 });
     assert.equal(r.isError, true);
-    assert.match(r.content, /tool ask_grocery_agent timed out after 22 s/, "the message names its own timeout");
+    assert.match(r.content, /tool ask_grocery_agent timed out after 18 s/, "the message names its own timeout");
     const ok = await callTool(grocery, { text: "swap Thursday" }, "g2", { url: srv.url, tokenFile });
-    assert.equal(ok.isError, false, "the default timeout of the tool is its own (22 s), not 50 ms");
+    assert.equal(ok.isError, false, "the default timeout of the tool is its own (18 s), not 50 ms");
   } finally {
     await srv.close();
     rmSync(d, { recursive: true, force: true });
@@ -500,6 +500,8 @@ test("the grocery agent gets its own, longer tool timeout", async () => {
 
 test("the instructions send grocery, order and delivery questions to ask_grocery_agent", () => {
   assert.match(ASSISTANT_INSTRUCTIONS, /groceries, the grocery order or its delivery .* call ask_grocery_agent/);
+  assert.match(ASSISTANT_INSTRUCTIONS, /ask_grocery_agent takes no arguments: it sends the user's own words/);
+  assert.doesNotMatch(ASSISTANT_INSTRUCTIONS, /ask_grocery_agent with the user's own words/, "no argument to fill in");
   assert.match(ASSISTANT_INSTRUCTIONS, /ask_grocery_agent[^\n]*never fetch_notes, kb_search or fetch_calendar/);
 });
 

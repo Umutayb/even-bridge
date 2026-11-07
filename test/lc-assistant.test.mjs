@@ -214,7 +214,9 @@ test("constants", () => {
   assert.match(ASSISTANT_HANDOFF, /Do not copy calendar events, notes, quick-list items or any other phone data/, "the summary must not carry phone data (A0, A1 real run)");
   assert.equal(ASSISTANT_NOTE_CMD, "/even-note");
   assert.equal(ASSISTANT_NIGHTLY_TASK, "even.assistant-nightly");
-  assert.equal(ASSISTANT_RUN_DEADLINE_S, 25, "inside the shim's 27 s turn budget, room for the grocery agent's 22 s");
+  assert.equal(ASSISTANT_RUN_DEADLINE_S, 21, "room for the grocery agent's 18 s");
+  // B25-1: the bridge's abort (deadline + grace) must land before the shim's relay gives up (RELAY_MAX_S = 24)
+  assert.ok(ASSISTANT_RUN_DEADLINE_S * 1000 + ASSISTANT_ABORT_GRACE_MS < 24000);
   assert.equal(ASSISTANT_MAX_TOOL_CALLS, 8);
   assert.equal(ASSISTANT_TOOLS.length, 18);
   assert.equal(ASSISTANT_TOOLS.at(-1), "memory");
@@ -993,11 +995,11 @@ test("the file keeps its line order: kb pointers replaced in place, new ones app
   assert.deepEqual(md.map((l) => l.split(" ")[3]), ["#zz9999", "#aaaa0001", "#ab12cd", "#fp0001"], "md in the file's order");
 });
 
-test("the run deadline defaults to 25 s and the env override still applies", async (t) => {
+test("the run deadline defaults to 21 s and the env override still applies", async (t) => {
   const c = makeCase();
   t.after(c.closeAll);
   const p = await warm(c);
-  assert.equal(p.assistant.profile.deadlineMs, 25000);
+  assert.equal(p.assistant.profile.deadlineMs, 21000);
   const c2 = makeCase({ assistant: { deadlineMs: 6000 } });
   t.after(c2.closeAll);
   const p2 = await warm(c2);
