@@ -505,6 +505,15 @@ test("the instructions send grocery, order and delivery questions to ask_grocery
   assert.match(ASSISTANT_INSTRUCTIONS, /ask_grocery_agent[^\n]*never fetch_notes, kb_search or fetch_calendar/);
 });
 
+test("the instructions never offer grocery actions, they tell the user what to say", () => {
+  // a yes to the assistant's own offer cannot be passed on to the grocery bot: the user says the exact words instead
+  assert.ok(ASSISTANT_INSTRUCTIONS.includes(
+    "Never offer to approve, place, skip or change anything for the groceries yourself, and never ask 'want me to …?' about it: a yes to your offer can't be passed on to the grocery bot. Instead tell the user the exact words to say, naming the order by its date, for example: Say 'approve the November 15 order' and I'll pass it on."));
+  const lines = ASSISTANT_INSTRUCTIONS.split("\n");
+  const i = lines.findIndex((l) => l.includes("call ask_grocery_agent"));
+  assert.match(lines[i + 1], /^Never offer to approve, place, skip or change anything for the groceries/, "right after the ask_grocery_agent line");
+});
+
 test("a schema without ask_grocery_agent loads: the extension registers what the shim offers", async () => {
   // the bridge lists ask_grocery_agent in --tools before or after the shim offers it; pi activates only the
   // allowed names that are registered (agent-session.js: it walks the registry), so a missing one is no error
